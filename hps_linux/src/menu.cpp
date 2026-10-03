@@ -86,6 +86,8 @@ enum MENU
 	MENU_GROOVYBTNS2,
 	MENU_GROOVYCAP1,
 	MENU_GROOVYCAP2,
+	MENU_PHANTOM1,
+	MENU_PHANTOM2,
 	MENU_MISC1,
 	MENU_MISC2,
 
@@ -479,6 +481,7 @@ static int gctrl_player = 1;           // 1-based player shown on the detail pag
 static char gctrl_nick[17] = {};       // name-editor buffer
 static int gctrl_pos = 0;              // name-editor cursor
 static unsigned long gctrl_timer = 0;  // list live-refresh timer
+static unsigned long phantom_timer = 0; // Phantom Arcade page: Host/State/Titles are live
 static const char gctrl_chars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#-_";
 
 static char gctrl_edit_mode = 0;       // name editor target: 0 = nickname, 1 = profile name
@@ -2580,6 +2583,102 @@ void HandleUI(void)
 		}
 		break;
 
+	// ---- Phantom Arcade page (fork) ------------------------------------------------
+	// Built here rather than in Groovy.sv's CONF_STR so the launcher ships as an HPS
+	// binary alone: a CONF_STR change would mean recompiling the .rbf in Quartus and
+	// every user reflashing the core for what is a menu string. The Controllers page
+	// above is built the same way, for the same reason.
+	case MENU_PHANTOM1:
+		{
+			OsdSetSize(16);
+			helptext_idx = 0;
+			OsdSetTitle("Phantom Arcade", 0);
+			menustate = MENU_PHANTOM2;
+			parentstate = MENU_PHANTOM1;
+			phantom_timer = GetTimer(500);
+
+			int n = 0;
+			menumask = 0x2f;   // rows 0,1,2,3 and Exit at 5; 4 is not a selectable row
+
+			static const char *idle_name[3] = { "Launcher", "Logo", "Off" };
+			sprintf(s, " Idle screen:  < %s >", idle_name[phantom_get_idle_mode() % 3]);
+			MenuWrite(n++, s, menusub == 0, 0);
+
+			sprintf(s, " Exit hotkey:  < %s >", phantom_get_exit_hotkey() ? "On" : "Off");
+			MenuWrite(n++, s, menusub == 1, 0);
+
+			MenuWrite(n++);
+			sprintf(s, " Host:   %s", phantom_host_text());
+			MenuWrite(n++, s, 0, 1);
+			sprintf(s, " State:  %s", phantom_state_text());
+			MenuWrite(n++, s, 0, 1);
+			sprintf(s, " Titles: %d", phantom_title_count());
+			MenuWrite(n++, s, 0, 1);
+
+			MenuWrite(n++);
+			MenuWrite(n++, " Search for host now", menusub == 2, 0);
+			MenuWrite(n++, " Stop host emulator", menusub == 3, 0);
+
+			MenuWrite(n++);
+			MenuWrite(n++, " Start+Select held for 1.2s", 0, 1);
+			MenuWrite(n++, " also stops the emulator.", 0, 1);
+
+			while (n < OsdGetSize() - 1) MenuWrite(n++);
+			MenuWrite(n++, STD_EXIT, menusub == 5, 0, OSD_ARROW_LEFT);
+		}
+		break;
+
+	case MENU_PHANTOM2:
+		if (menu)
+		{
+			menustate = MENU_COMMON1;
+			menusub = 8;
+			break;
+		}
+		if (select || left || right)
+		{
+			switch (menusub)
+			{
+			case 0:
+				{
+					int m = phantom_get_idle_mode();
+					m = left ? (m ? m - 1 : 2) : ((m < 2) ? m + 1 : 0);
+					phantom_set_idle_mode(m);
+					menustate = MENU_PHANTOM1;
+				}
+				break;
+
+			case 1:
+				phantom_set_exit_hotkey(!phantom_get_exit_hotkey());
+				menustate = MENU_PHANTOM1;
+				break;
+
+			case 2:
+				if (select)
+				{
+					phantom_request_refresh();
+					menustate = MENU_PHANTOM1;
+				}
+				break;
+
+			case 3:
+				if (select)
+				{
+					phantom_send_kill();
+					menustate = MENU_PHANTOM1;
+				}
+				break;
+
+			default:
+				if (select) menustate = MENU_NONE1;
+				break;
+			}
+			break;
+		}
+		// the Host/State/Titles rows are live, so the page refreshes on a timer
+		if (CheckTimer(phantom_timer)) menustate = MENU_PHANTOM1;
+		break;
+
 	case MENU_GROOVY1:
 		{
 			OsdSetSize(16);
@@ -2999,6 +3098,10 @@ void HandleUI(void)
 					// index 7 must follow index 6 visually so up/down order matches the screen
 					menumask |= 0x80;
 					MenuWrite(n++, " Controllers               \x16", menusub == 7, 0);
+					// 8 was the next free bit in menumask; it keeps the launcher's page
+					// adjacent to Controllers, which is where the other fork-added page is
+					menumask |= 0x100;
+					MenuWrite(n++, " Phantom Arcade            \x16", menusub == 8, 0);
 				}
 
 				if (audio_filter_en() >= 0)
@@ -3120,6 +3223,11 @@ void HandleUI(void)
 
 			case 7:
 				menustate = MENU_GROOVY1;
+				menusub = 0;
+				break;
+
+			case 8:
+				menustate = MENU_PHANTOM1;
 				menusub = 0;
 				break;
 
