@@ -54,3 +54,9 @@ sim/aclk_sta/sta_results.txt
 # they are 613 MB of binaries nothing in the repo references.
 test-builds/
 old-builds/
+
+# Written beside PhantomArcadeManager.exe at runtime, not source. The catalog is
+# rebuilt by Auto-Scan and mame_titles.txt is a cache of "mame -listfull".
+build_output/games_catalog.json
+build_output/mame_titles.txt
+build_output/phantom_config.json
