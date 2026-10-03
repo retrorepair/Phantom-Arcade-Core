@@ -807,14 +807,13 @@ static void draw_busy(ph_ui *u)
 	text_n_clip(u, bx + 20, by + 56, u->busy_title, C_TEXT, bw - 40);
 	text_n_clip(u, bx + 20, by + 80, u->status, C_CYAN, bw - 40);
 
-	/* An indeterminate sweep, 8px tall. It conveys "alive", not "progress". */
-	int tw = bw - 40;
-	rect(u, bx + 20, by + 114, tw, 8, 0x0A0B12);
-	int seg = tw / 4;
-	int pos = (int)((u->tick_ms / 8) % (uint32_t)(tw + seg)) - seg;
-	int sx = pos < 0 ? bx + 20 : bx + 20 + pos;
-	int sw = pos < 0 ? seg + pos : (pos + seg > tw ? tw - pos : seg);
-	if (sw > 0) rect(u, sx, by + 114, sw, 8, C_AMBER);
+	/* A static rule, not a progress bar. There used to be an animated sweep here, which
+	 * meant redrawing and recopying the whole canvas every tick for the entire time the
+	 * host was starting an emulator - a megabyte of uncached writes into the DDR region
+	 * the arriving video is about to use. The launcher now stops animating once a launch
+	 * is out (phantom.cpp), and a bar frozen part-way across would read as stuck, so
+	 * there is nothing here that pretends to measure progress. */
+	rect(u, bx + 20, by + 114, bw - 40, 4, C_AMBER_DK);
 }
 
 void ph_ui_render(ph_ui *u)

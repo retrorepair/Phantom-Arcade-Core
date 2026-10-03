@@ -870,6 +870,27 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
     if (ok) {
         g_activePid = pi.dwProcessId;
         CloseHandle(pi.hThread);
+
+        // Spawning successfully is not the same as running. MAME exits within a second
+        // or two when it cannot find or run the set - a ROM that is missing, a parent
+        // romset, or an entry that is not a playable game at all (plenty of things in a
+        // roms folder are devices or unsupported drivers). That used to look exactly
+        // like a core or network fault from the cabinet: the launcher sat on "starting
+        // stream" and eventually gave up with nothing to say. This waits long enough to
+        // catch that case and reports it.
+        //
+        // We are on the launch worker thread, so blocking here costs nothing.
+        DWORD waited = WaitForSingleObject(pi.hProcess, 6000);
+        if (waited == WAIT_OBJECT_0) {
+            DWORD code = 0;
+            GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hProcess);
+            g_activePid = 0;
+            std::wstring stat = L"Status: [FAILED] " + wStem + L" exited immediately (code " +
+                                std::to_wstring(code) + L"). ROM missing, or not a playable set?";
+            SetWindowText(hStaticStatus, stat.c_str());
+            return false;
+        }
         CloseHandle(pi.hProcess);
 
         std::wstring stat = L"Status: [RUNNING] GroovyMAME (" + wStem + L") -> Streaming to MiSTer (" + misterIp + L":" + std::to_wstring(port) + L")";

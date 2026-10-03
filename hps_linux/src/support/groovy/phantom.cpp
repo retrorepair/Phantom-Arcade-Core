@@ -642,12 +642,18 @@ void phantom_idle_poll(void)
 
 	repeat_tick();
 
-	if (ph_ui_animate(&ui, t)) ui.dirty = 1;
+	/* Go quiet once a launch is out. The busy screen's sweep asks for a redraw every
+	 * tick, and each one is a megabyte of uncached writes into the very DDR region the
+	 * arriving video stream is about to fill - about 60MB/s of contention during the
+	 * exact handover it is decorating. The screen is still drawn once, when the view
+	 * changes; it simply stops animating until the host either sends video or the
+	 * launch times out. A moving progress bar is not worth competing with the thing
+	 * the user actually asked for. */
+	if (!awaiting_video && ph_ui_animate(&ui, t)) ui.dirty = 1;
 
-	/* Frame pacing. groovy_poll() spins as fast as it can, and without this the busy
-	 * view - whose sweep asks for a redraw on every tick - rebuilt and recopied a
-	 * megabyte thousands of times a second. Capped at the 480i field rate, which is
-	 * as often as the CRT can show a new frame anyway. */
+	/* Frame pacing. groovy_poll() spins as fast as it can, and without this even an
+	 * idle list rebuilt and recopied a megabyte thousands of times a second. Capped at
+	 * the 480i field rate, which is as often as the CRT can show a new frame anyway. */
 	if (ui.dirty && (int32_t)(t - t_presented) >= PH_FRAME_MS)
 	{
 		ph_ui_render(&ui);
