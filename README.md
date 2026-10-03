@@ -68,7 +68,7 @@ Three things, and one line of configuration.
    stock Groovy install too.)
 
 Then on the PC, run `build_output/PhantomArcadeManager.exe`, point it at your emulators and
-ROM folders, press **Auto-Scan ROMs**, and press **Start Background Daemon**.
+ROM folders, press **1. Scan ROMs**, and press **Start Background Daemon**.
 
 Nothing else — there is no address to configure at either end. The cabinet opens every
 conversation, so the daemon takes the MiSTer's address from the datagrams it receives and
@@ -82,7 +82,7 @@ because changing it on one side alone silently breaks discovery — a far likeli
 than a clash on 1999. If something else really does own that port, change it in both
 `phantom_config.json` (`udp_port`) and `phantom.ini` (`UDP_PORT`) together.
 
-Auto-Scan asks MAME which sets will actually start, and lists only those. Incomplete
+Scan ROMs asks MAME which sets will actually start, and lists only those. Incomplete
 romsets (`mame -verifyroms` calls them bad) and entries that are not games at all —
 devices and BIOS images like `hd44780` or `model1io`, which live in roms folders quite
 legitimately — are left out. They would otherwise sit in the menu and fail the instant

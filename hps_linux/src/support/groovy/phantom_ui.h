@@ -41,7 +41,9 @@ typedef struct
 	char     title[PH_TITLE_LEN]; /* display name */
 	char     system[PH_SYS_LEN];  /* emulator key: groovymame/flycast/pcsx2/dolphin/model2 */
 	char     sysname[PH_SYS_LEN]; /* hardware name for display: "Capcom CPS-3" */
-	char     mode[PH_SYS_LEN];    /* "240p @ 59.6Hz", host-supplied, may be empty */
+	char     mode[PH_SYS_LEN];    /* "320x240 @ 59.64Hz TATE", host-supplied, may be empty */
+	char     year[8];             /* "1996", from MAME; empty when the host did not send it */
+	char     maker[48];           /* "Raizing / Eighting" */
 	uint32_t hsync_hz;            /* 15734, 0 = unknown */
 	uint32_t vsync_chz;           /* centi-Hz: 5994 = 59.94Hz, 0 = unknown */
 } ph_game;

@@ -733,11 +733,19 @@ static void draw_detail(ph_ui *u)
 		return;
 	}
 
-	/* Left: the launch key, which is what actually gets sent, so showing it makes a
-	 * mismatch between core and host catalog visible instead of mysterious. */
-	char left[128];
-	snprintf(left, sizeof(left), "ID %s", g->id);
-	text_n_clip(u, x + 12, DETAIL_Y + 4, left, C_TEXT_DIM, w / 2 - 20);
+	/* Left: year and manufacturer, which is what somebody standing at a cabinet
+	 * actually wants to know. This used to print the launch id - useful exactly once,
+	 * while the catalog plumbing was being debugged, and noise for ever after. The id
+	 * is still visible in the host's log if a set ever needs chasing down.
+	 *
+	 * Falls back to the system name rather than inventing anything: a host that sends
+	 * no year is a host that does not know it. */
+	char left[160];
+	if (g->year[0] && g->maker[0])      snprintf(left, sizeof(left), "%s   %s", g->year, g->maker);
+	else if (g->year[0])                snprintf(left, sizeof(left), "%s", g->year);
+	else if (g->maker[0])               snprintf(left, sizeof(left), "%s", g->maker);
+	else                                snprintf(left, sizeof(left), "%s", g->sysname[0] ? g->sysname : g->system);
+	text_n_clip(u, x + 12, DETAIL_Y + 4, left, C_TEXT_DIM, w - 24 - 40 * PH_NARROW_W);
 
 	/* Right: the timing the host reported. Omitted entirely when unknown rather than
 	 * filled in with a stock 15.734kHz that may be wrong for this title. */

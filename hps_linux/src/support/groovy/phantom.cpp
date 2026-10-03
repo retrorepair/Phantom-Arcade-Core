@@ -196,7 +196,8 @@ static void cache_save(void)
 	for (int i = 0; i < ui.count; i++)
 	{
 		const ph_game *g = &ui.games[i];
-		fprintf(f, "%s\t%s\t%s\t%s\t%s\n", g->id, g->title, g->system, g->sysname, g->mode);
+		fprintf(f, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		        g->id, g->title, g->system, g->sysname, g->mode, g->year, g->maker);
 	}
 	fclose(f);
 }
@@ -213,10 +214,10 @@ static void cache_load(void)
 		if (line[0] == '#' || line[0] == '\n') continue;
 		trim(line);
 
-		char *fld[5] = { 0 };
+		char *fld[7] = { 0 };
 		int n = 0;
 		char *p = line;
-		while (n < 5 && p)
+		while (n < 7 && p)
 		{
 			fld[n++] = p;
 			char *t = strchr(p, '\t');
@@ -233,6 +234,9 @@ static void cache_load(void)
 		snprintf(g->system, sizeof(g->system), "%s", fld[2] ? fld[2] : "");
 		if (n > 3 && fld[3]) snprintf(g->sysname, sizeof(g->sysname), "%s", fld[3]);
 		if (n > 4 && fld[4]) snprintf(g->mode, sizeof(g->mode), "%s", fld[4]);
+		/* older caches stop at mode; the rest simply stay empty */
+		if (n > 5 && fld[5]) snprintf(g->year, sizeof(g->year), "%s", fld[5]);
+		if (n > 6 && fld[6]) snprintf(g->maker, sizeof(g->maker), "%s", fld[6]);
 	}
 	fclose(f);
 	if (ui.count) LOGP("loaded %d cached titles\n", ui.count);
@@ -314,6 +318,8 @@ static void parse_catalog(const char *buf, int len)
 		json_str(rec, rec_end, "systemName", g->sysname, sizeof(g->sysname));
 		if (!json_str(rec, rec_end, "videoMode", g->mode, sizeof(g->mode)))
 			json_str(rec, rec_end, "resolution", g->mode, sizeof(g->mode));
+		json_str(rec, rec_end, "year", g->year, sizeof(g->year));
+		json_str(rec, rec_end, "manufacturer", g->maker, sizeof(g->maker));
 
 		if (!g->title[0]) snprintf(g->title, sizeof(g->title), "%s", g->id);
 		if (!g->system[0]) snprintf(g->system, sizeof(g->system), "%s", "groovymame");

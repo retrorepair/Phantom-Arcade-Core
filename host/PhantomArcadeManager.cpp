@@ -81,12 +81,10 @@ namespace fs = std::filesystem;
 #define IDC_STATIC_STATUS           127
 #define IDC_LIST_GAMES              128
 #define IDC_BTN_LAUNCH_GAME         129
-#define IDC_EDIT_LAUNCH_DELAY       130
 
 // Global State
 HINSTANCE hInst = NULL;
 HWND hMainWnd = NULL;
-HWND hEditLaunchDelay;
 HWND hStaticMisterIp = NULL;   // read-only: the address we discovered
 HWND hEditMameExe, hEditMameRoms;
 HWND hEditRetroarchExe, hEditRetroarchRoms;
@@ -392,12 +390,6 @@ void LoadConfiguration() {
     g_udpPort = ExtractJsonInt(json, "udp_port", RegReadInt(L"udp_port", PHANTOM_DEFAULT_PORT));
     if (g_udpPort <= 0 || g_udpPort > 65535) g_udpPort = PHANTOM_DEFAULT_PORT;
 
-    // 2b. PC-side launch delay. Zero by default - the merged Phantom Arcade core does not
-    // reconfigure the FPGA at launch time, so there is nothing to wait for.
-    int delaySec = ExtractJsonInt(json, "launch_delay_sec", RegReadInt(L"launch_delay_sec", 0));
-    if (delaySec < 0) delaySec = 0;
-    SetWindowText(hEditLaunchDelay, std::to_wstring(delaySec).c_str());
-
     // 3. GroovyMAME Executable & ROMs
     std::string mameExe = ExtractJsonString(json, "mame_exe");
     if (mameExe.empty()) mameExe = ExtractJsonString(json, "exe");
@@ -467,15 +459,6 @@ void SaveConfiguration() {
     RegWriteString(L"mister_client_ip", misterIp);
     RegWriteInt(L"udp_port", port);
 
-    int launchDelay = 0;
-    if (hEditLaunchDelay != NULL) {
-        std::wstring dStr = GetText(hEditLaunchDelay);
-        if (!dStr.empty()) {
-            try { launchDelay = std::stoi(dStr); } catch (...) {}
-        }
-    }
-    if (launchDelay < 0) launchDelay = 0;
-    RegWriteInt(L"launch_delay_sec", launchDelay);
     RegWriteString(L"mame_exe", mameExe);
     RegWriteString(L"mame_roms", mameRoms);
     RegWriteString(L"retroarch_exe", raExe);
@@ -495,7 +478,6 @@ void SaveConfiguration() {
         out << "  \"server\": {\n";
         out << "    \"listen_ip\": \"0.0.0.0\",\n";
         out << "    \"udp_port\": " << port << ",\n";
-        out << "    \"launch_delay_sec\": " << launchDelay << ",\n";
         out << "    \"http_port\": 8088,\n";
         out << "    \"mister_client_ip\": \"" << ToJsonString(misterIp) << "\"\n";
         out << "  },\n";
@@ -725,9 +707,45 @@ static std::map<std::string, std::string> LoadMameTitles(const std::wstring& mam
 // Both answers come from the user's own MAME, asked once per scan, and a set is listed
 // only if it passes both. Anything we cannot get an answer about is kept rather than
 // hidden, so a parsing failure cannot silently empty somebody's library.
+// What MAME knows about a set beyond its name. All of it comes out of the same -listxml
+// pass that decides runnability, so it costs nothing extra.
+struct MameMeta {
+    std::string year;
+    std::string manufacturer;
+    int width = 0, height = 0, rotate = 0;
+    double refresh = 0.0;
+};
+
+// Pull one <tag>text</tag> out of a bounded slice.
+static std::string XmlTag(const std::string& block, const char* tag) {
+    std::string open = std::string("<") + tag + ">";
+    std::string close = std::string("</") + tag + ">";
+    size_t a = block.find(open);
+    if (a == std::string::npos) return "";
+    size_t b = block.find(close, a);
+    if (b == std::string::npos) return "";
+    std::string v = block.substr(a + open.size(), b - a - open.size());
+    // the few entities MAME emits in these fields
+    for (size_t p; (p = v.find("&amp;")) != std::string::npos; ) v.replace(p, 5, "&");
+    for (size_t p; (p = v.find("&apos;")) != std::string::npos; ) v.replace(p, 6, "'");
+    for (size_t p; (p = v.find("&quot;")) != std::string::npos; ) v.replace(p, 6, "\"");
+    return v;
+}
+
+static std::string XmlAttr(const std::string& block, const char* attr) {
+    std::string pat = std::string(attr) + "=\"";
+    size_t a = block.find(pat);
+    if (a == std::string::npos) return "";
+    a += pat.size();
+    size_t b = block.find('"', a);
+    if (b == std::string::npos) return "";
+    return block.substr(a, b - a);
+}
+
 static void FilterRunnableSets(const std::wstring& mameExe,
                                const std::vector<std::string>& stems,
-                               std::set<std::string>& outRunnable) {
+                               std::set<std::string>& outRunnable,
+                               std::map<std::string, MameMeta>& outMeta) {
     outRunnable.insert(stems.begin(), stems.end());   // default to keeping everything
     if (mameExe.empty() || stems.empty()) return;
 
@@ -751,7 +769,10 @@ static void FilterRunnableSets(const std::wstring& mameExe,
         if (line.find(" is bad") != std::string::npos) outRunnable.erase(name);
     }
 
-    // 2. devices and other non-runnable machines
+    // 2. devices and other non-runnable machines, plus everything worth showing on the
+    //    cabinet. Each machine's block is bounded at </machine> before anything is read
+    //    out of it: a driver's block is followed by blocks for every device it
+    //    references, which carry <description> tags of their own.
     std::string xml = RunCapture(L"\"" + mameExe + L"\" -listxml" + names, dir);
     if (xml.size() > 64) {
         size_t at = 0;
@@ -760,11 +781,32 @@ static void FilterRunnableSets(const std::wstring& mameExe,
             size_t e = xml.find('"', q);
             if (e == std::string::npos) break;
             std::string name = xml.substr(q, e - q);
+
             size_t tagEnd = xml.find('>', e);
             if (tagEnd == std::string::npos) break;
-            std::string tag = xml.substr(e, tagEnd - e);
-            if (tag.find("runnable=\"no\"") != std::string::npos) outRunnable.erase(name);
-            at = tagEnd;
+            std::string openTag = xml.substr(e, tagEnd - e);
+            if (openTag.find("runnable=\"no\"") != std::string::npos) outRunnable.erase(name);
+
+            size_t blockEnd = xml.find("</machine>", tagEnd);
+            if (blockEnd == std::string::npos) blockEnd = xml.size();
+            std::string block = xml.substr(tagEnd, blockEnd - tagEnd);
+
+            MameMeta m;
+            m.year = XmlTag(block, "year");
+            m.manufacturer = XmlTag(block, "manufacturer");
+
+            size_t disp = block.find("<display ");
+            if (disp != std::string::npos) {
+                size_t dEnd = block.find('>', disp);
+                std::string d = block.substr(disp, (dEnd == std::string::npos ? block.size() : dEnd) - disp);
+                try { m.width   = std::stoi(XmlAttr(d, "width")); }   catch (...) {}
+                try { m.height  = std::stoi(XmlAttr(d, "height")); }  catch (...) {}
+                try { m.rotate  = std::stoi(XmlAttr(d, "rotate")); }  catch (...) {}
+                try { m.refresh = std::stod(XmlAttr(d, "refresh")); } catch (...) {}
+            }
+            if (!m.year.empty() || !m.manufacturer.empty() || m.width) outMeta[name] = m;
+
+            at = blockEnd;
         }
     }
 }
@@ -809,6 +851,7 @@ void ScanRomDirectories() {
     // Ask MAME which of the arcade sets on disk will actually start, before listing any
     // of them. See FilterRunnableSets.
     std::set<std::string> runnable;
+    std::map<std::string, MameMeta> mameMeta;
     {
         std::vector<std::string> stems;
         std::wstring mameRoms = GetText(hEditMameRoms);
@@ -824,7 +867,7 @@ void ScanRomDirectories() {
         }
         if (!stems.empty()) {
             SetWindowText(hStaticStatus, L"Status: Checking which sets MAME can run...");
-            FilterRunnableSets(mameExeForScan, stems, runnable);
+            FilterRunnableSets(mameExeForScan, stems, runnable, mameMeta);
         }
     }
     int skipped = 0;
@@ -881,7 +924,35 @@ void ScanRomDirectories() {
                         catOut << "      \"systemName\": \"" << target.systemName << "\",\n";
                         catOut << "      \"romName\": \"" << filename << "\",\n";
                         catOut << "      \"romPath\": \"" << cleanRomPath << "\",\n";
-                        catOut << "      \"videoMode\": \"" << target.videoMode << "\",\n";
+                        // Real numbers for arcade sets, straight out of MAME's own -listxml:
+                        // the actual screen geometry, refresh and orientation, plus year and
+                        // manufacturer. The per-system strings below are only a fallback for
+                        // the emulators that have no equivalent to ask.
+                        std::string videoMode = target.videoMode;
+                        std::string year, maker;
+                        if (target.system == "groovymame") {
+                            auto mi = mameMeta.find(stem);
+                            if (mi != mameMeta.end()) {
+                                year = mi->second.year;
+                                maker = mi->second.manufacturer;
+                                if (mi->second.width && mi->second.height) {
+                                    char buf[96];
+                                    if (mi->second.refresh > 0.0)
+                                        snprintf(buf, sizeof(buf), "%dx%d @ %.2fHz%s",
+                                                 mi->second.width, mi->second.height, mi->second.refresh,
+                                                 (mi->second.rotate == 90 || mi->second.rotate == 270) ? " TATE" : "");
+                                    else
+                                        snprintf(buf, sizeof(buf), "%dx%d%s",
+                                                 mi->second.width, mi->second.height,
+                                                 (mi->second.rotate == 90 || mi->second.rotate == 270) ? " TATE" : "");
+                                    videoMode = buf;
+                                }
+                            }
+                        }
+
+                        catOut << "      \"videoMode\": \"" << JsonEscape(videoMode) << "\",\n";
+                        catOut << "      \"year\": \"" << JsonEscape(year) << "\",\n";
+                        catOut << "      \"manufacturer\": \"" << JsonEscape(maker) << "\",\n";
                         catOut << "      \"resolution\": \"" << target.resolution << "\"\n";
                         catOut << "    }";
                         totalFound++;
@@ -1062,23 +1133,13 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
 struct LaunchTaskParams {
     std::string gameId;
     std::wstring misterIp;
-    int delaySec;
 };
 
 static DWORD WINAPI DelayedLaunchWorker(LPVOID lpParam) {
     LaunchTaskParams* params = (LaunchTaskParams*)lpParam;
-    int delay = params->delaySec;
     std::string gid = params->gameId;
     std::wstring ip = params->misterIp;
     delete params;
-
-    if (delay > 0) {
-        for (int s = delay; s > 0; --s) {
-            std::wstring st = L"Status: Launching PC stream in " + std::to_wstring(s) + L"s...";
-            SetWindowText(hStaticStatus, st.c_str());
-            Sleep(1000);
-        }
-    }
 
     SetWindowText(hStaticStatus, L"Status: Launching GroovyMAME stream to MiSTer GroovyNLC core...");
     ExecuteLaunchProcess(gid, ip);
@@ -1103,20 +1164,11 @@ bool LaunchGame(const std::string& gameId, const std::wstring& targetMisterIp) {
     g_launchInProgress.store(true);
     LeaveCriticalSection(&cs);
 
-    // Default 0. The delay existed because the old flow switched the FPGA to Groovy.rbf at
-    // launch time and the PC had to wait for reconfiguration. The merged core never switches:
-    // it is already loaded, already listening, and sits on the launcher until video arrives.
-    // The setting stays for anyone still driving this daemon from the old scripts.
-    int delaySec = 0;
-    if (hEditLaunchDelay != NULL) {
-        std::wstring dStr = GetText(hEditLaunchDelay);
-        if (!dStr.empty()) {
-            try { delaySec = std::stoi(dStr); } catch (...) {}
-        }
-    }
-    if (delaySec < 0) delaySec = 0;
-
-    LaunchTaskParams* params = new LaunchTaskParams{ gameId, targetMisterIp, delaySec };
+    // No delay. It existed because the old flow switched the FPGA to Groovy.rbf at
+    // launch time and the PC had to wait out the reconfiguration. The merged core never
+    // switches - it is already loaded, already listening, and sits on the launcher until
+    // video arrives - so there is nothing left to wait for.
+    LaunchTaskParams* params = new LaunchTaskParams{ gameId, targetMisterIp };
     HANDLE hThread = CreateThread(NULL, 0, DelayedLaunchWorker, params, 0, NULL);
     if (hThread) {
         CloseHandle(hThread);
@@ -1345,8 +1397,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                       WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP, 80, y + 2, 280, 20,
                                       hWnd, NULL, hInst, NULL);
 
-        CreateWindow(L"STATIC", L"Launch Delay (s):", WS_CHILD | WS_VISIBLE, 365, y, 110, 20, hWnd, NULL, hInst, NULL);
-        hEditLaunchDelay = CreateWindow(L"EDIT", L"0", WS_CHILD | WS_VISIBLE | WS_BORDER, 480, y, 40, 22, hWnd, (HMENU)IDC_EDIT_LAUNCH_DELAY, hInst, NULL);
 
         // 1. GroovyMAME
         y += 32;
