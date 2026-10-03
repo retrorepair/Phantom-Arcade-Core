@@ -482,6 +482,7 @@ static char gctrl_nick[17] = {};       // name-editor buffer
 static int gctrl_pos = 0;              // name-editor cursor
 static unsigned long gctrl_timer = 0;  // list live-refresh timer
 static unsigned long phantom_timer = 0; // Phantom Arcade page: Host/State/Titles are live
+static int phantom_main_sub = -1;       // its row on the core's own page, -1 when absent
 static const char gctrl_chars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#-_";
 
 static char gctrl_edit_mode = 0;       // name editor target: 0 = nickname, 1 = profile name
@@ -2047,6 +2048,22 @@ void HandleUI(void)
 
 			if (!entry) break;
 
+			// Phantom Arcade belongs on the core's own page, with the core's own
+			// options, not buried in the shared System menu a page further in. It is
+			// appended here rather than declared in Groovy.sv's CONF_STR because that
+			// would mean recompiling the bitstream in Quartus and every user reflashing
+			// the core to add a menu entry. Same numbering as a real CONF_STR item:
+			// one row, one bit in menumask, one selentry.
+			phantom_main_sub = -1;
+			if (!page && is_groovy())
+			{
+				phantom_main_sub = (int)selentry;
+				MenuWrite(entry, " Phantom Arcade            \x16", menusub == selentry, 0);
+				menumask = (menumask << 1) | 1;
+				entry++;
+				selentry++;
+			}
+
 			for (; entry < OsdGetSize() - 1; entry++) MenuWrite(entry, "", 0, 0);
 
 			// exit row
@@ -2130,6 +2147,11 @@ void HandleUI(void)
 		else if (menu)
 		{
 			menustate = MENU_NONE1;
+		}
+		else if (select && phantom_main_sub >= 0 && menusub == (uint32_t)phantom_main_sub)
+		{
+			menustate = MENU_PHANTOM1;
+			menusub = 0;
 		}
 		else if(back || (left && page) || (menusub == menusub_last && select))
 		{
@@ -2633,8 +2655,8 @@ void HandleUI(void)
 	case MENU_PHANTOM2:
 		if (menu)
 		{
-			menustate = MENU_COMMON1;
-			menusub = 8;
+			menustate = MENU_GENERIC_MAIN1;
+			menusub = (phantom_main_sub >= 0) ? (uint32_t)phantom_main_sub : 0;
 			break;
 		}
 		if (select || left || right)
@@ -3103,10 +3125,9 @@ void HandleUI(void)
 					// index 7 must follow index 6 visually so up/down order matches the screen
 					menumask |= 0x80;
 					MenuWrite(n++, " Controllers               \x16", menusub == 7, 0);
-					// 8 was the next free bit in menumask; it keeps the launcher's page
-					// adjacent to Controllers, which is where the other fork-added page is
-					menumask |= 0x100;
-					MenuWrite(n++, " Phantom Arcade            \x16", menusub == 8, 0);
+					// Phantom Arcade used to sit here too. It belongs with the core's own
+					// options on the first page, not a page deeper in the shared System
+					// menu, so it now lives in MENU_GENERIC_MAIN1 and is not duplicated.
 				}
 
 				if (audio_filter_en() >= 0)
@@ -3228,11 +3249,6 @@ void HandleUI(void)
 
 			case 7:
 				menustate = MENU_GROOVY1;
-				menusub = 0;
-				break;
-
-			case 8:
-				menustate = MENU_PHANTOM1;
 				menusub = 0;
 				break;
 

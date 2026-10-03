@@ -970,8 +970,19 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
     //
     // The address is the one the launch request arrived from, so a cabinet on DHCP needs
     // nothing typed in anywhere; the GUI field is only the fallback for a manual launch.
+    // -joystickprovider mister is what makes the cabinet's controls reach the game. The
+    // core forwards pad state on UDP 32101 (its Server > Joysticks option, Digital or
+    // Analog), but MAME only reads it when told to; with the default provider it polls
+    // the PC's own devices instead, so a stick plugged into the MiSTer does nothing and
+    // only a keyboard attached to the PC works.
+    //
+    // -keyboardprovider is deliberately NOT set to mister. That one depends on the
+    // core's Server > PS2 option, which is Off by default, and switching MAME over to a
+    // keyboard the core is not sending would take away the working PC keyboard and
+    // leave no input at all. Turn PS2 on in the OSD first if you want cabinet keys.
     std::wstring wStem = StringToWstring(stem);
-    std::wstring misterArgs = L" -video mister -mister_ip " + misterIp + L" -skip_gameinfo -nokeepaspect";
+    std::wstring misterArgs = L" -video mister -mister_ip " + misterIp +
+                              L" -joystickprovider mister -skip_gameinfo -nokeepaspect";
     std::wstring cmd = L"\"" + mameExe + L"\" " + wStem + misterArgs;
 
     STARTUPINFO si = { sizeof(si) };
