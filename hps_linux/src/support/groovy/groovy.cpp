@@ -1081,6 +1081,20 @@ extern "C" int groovy_idle_begin(void)
 
 	rgbMode = 0;   /* RGB888: three bytes per pixel, matching the launcher's canvas */
 
+	/* cmd_init must be HIGH before the modeline goes out, and this ordering is not
+	 * cosmetic. Groovy.sv only services cmd_switchres from S_Dispatcher, and it only
+	 * reaches S_Dispatcher once cmd_init is high (S_Reset: "if (cmd_init) state <=
+	 * S_Dispatcher"); while cmd_init is low it sits in S_Defaults, which is the core's
+	 * 256x240 reset geometry. setClose() drops cmd_init just before the idle screen is
+	 * raised, so issuing switchres first had it discarded in silence - the core kept
+	 * PoC_H=256 and scanned this 720-wide framebuffer 256 pixels at a time, which puts
+	 * a sheared, repeating version of the launcher on the CRT while the DDR contents
+	 * are perfectly correct.
+	 *
+	 * This is the order a real client already produces: CMD_INIT, then CMD_SWITCHRES,
+	 * then CMD_BLIT (see setInit). */
+	groovy_FPGA_init(1, 0, 0, 0);
+
 	/* Build the CMD_SWITCHRES payload the host would have sent for this mode and feed
 	 * it through the normal parser, so the PLL maths, the ce_pix ladder and the FPGA
 	 * handshake are the shared, tested ones. Layout per setSwitchres(). */
@@ -1106,6 +1120,11 @@ extern "C" int groovy_idle_begin(void)
 
 	setSwitchres((char *)sr);
 
+	/* Give the modeline a moment to land before the first blit. Waiting on vga_frame is
+	 * no good here - nothing is blitting yet, so the frame counter does not advance at
+	 * idle and such a wait only ever times out. */
+	for (int i = 0; i < 500; i++) groovy_FPGA_status(0);
+
 	/* Blit header: frame 1, one blit, the whole frame's worth of pixels. */
 	uint32_t px = (uint32_t)PH_W * PH_H;
 	buffer[0] = 1;
@@ -1119,7 +1138,6 @@ extern "C" int groovy_idle_begin(void)
 
 	memset(&buffer[HEADER_OFFSET], 0x00, (size_t)px * 3);
 
-	groovy_FPGA_init(1, 0, 0, 0);
 	groovy_FPGA_blit();
 	/* cmd_logo is the core's auto-reblit: it keeps re-reading this framebuffer every
 	 * frame instead of waiting for a new one, which is precisely what a static menu
@@ -1128,8 +1146,30 @@ extern "C" int groovy_idle_begin(void)
 	groovy_FPGA_logo(1);
 	groovyLogo = 1;
 
-	LOG(1, "[PHANTOM][mode %dx%d interlace=2 pclock=%.4f ce_pix=%d]\n",
-	    PH_W, PH_H, PH_PCLOCK, poc->PoC_ce_pix);
+	/* Confirm the mode the core is actually scanning, not the one the HPS asked for.
+	 * This has to come after the blit: Groovy.sv parks the beam in vblank until VRAM
+	 * is primed, so before the first blit vcount sits still at V+2 and says nothing.
+	 *
+	 * vcount's range and f1 are what distinguish this mode from the core's 256x240
+	 * reset geometry, and f1 is the sharp one - it only alternates when the output is
+	 * genuinely interlaced, so it is stuck at 0 in the default progressive mode. This
+	 * is the check that would have caught the modeline being discarded: reading the
+	 * framebuffer out of DDR never could, because the pixels in it were correct the
+	 * whole time and only the scan-out was wrong. Severity 0 so it reaches the console
+	 * without Verbose being on. */
+	{
+		uint16_t vmin = 0xffff, vmax = 0;
+		int f1_set = 0, f1_clr = 0;
+		for (int i = 0; i < 4000; i++)
+		{
+			groovy_FPGA_status(0);
+			if (fpga_vga_vcount < vmin) vmin = fpga_vga_vcount;
+			if (fpga_vga_vcount > vmax) vmax = fpga_vga_vcount;
+			if (fpga_vga_f1) f1_set = 1; else f1_clr = 1;
+		}
+		LOG(0, "[PHANTOM][mode %dx%d pclock=%.4f ce_pix=%d][scanning vcount %u..%u interlaced=%d]\n",
+		    PH_W, PH_H, PH_PCLOCK, poc->PoC_ce_pix, vmin, vmax, (f1_set && f1_clr));
+	}
 	return 1;
 }
 
