@@ -28,6 +28,21 @@
 #define MTU_HEADER 28
 #define BUFFER_MTU 1500 - MTU_HEADER
 
+// RIO send-side buffer lifetime (Windows). Each send is tagged with the registered
+// buffer it reads so that buffer is never rewritten while a send of it is in flight.
+#define RIO_CMD_SLOTS      32   // command ring depth; the longest command is 26 bytes
+#define RIO_CMD_SLOT_SIZE  32
+#define RIO_TAG_AUDIO      0
+#define RIO_TAG_BLIT0      1    // m_pBufsBlit[0] (m_pBufferLZ4[0], or m_pBufferBlit[0] when raw)
+#define RIO_TAG_BLIT1      2    // m_pBufsBlit[1]
+#define RIO_TAG_CMD0       3    // + slot, one tag per command-ring slot
+#define RIO_TAG_COUNT      (RIO_TAG_CMD0 + RIO_CMD_SLOTS)
+// How long a send may wait for the queue, or a fence for its buffer, before it is
+// abandoned and logged. Only reached if the network stack has genuinely stopped -
+// in normal running a fence returns at once - and it exists so a dead link cannot
+// hang the emulator's sender thread forever.
+#define RIO_STALL_LIMIT_MS 250
+
 //joystick map
 #define GM_JOY_RIGHT (1 << 0)
 #define GM_JOY_LEFT  (1 << 1)
@@ -258,6 +273,15 @@ class GroovyMister
 	RIO_BUFFERID m_sendRioBufferAudioId;
 	RIO_BUF m_sendRioBufferAudio;
 	RIO_BUF *m_pBufsAudio;
+	// Commands go out through a ring of registered slots rather than one shared buffer:
+	// RIO reads registered memory when it transmits, not when RIOSend returns, so a single
+	// buffer let CMD_BLIT's header overwrite CMD_AUDIO's before it left the PC (seen on the
+	// core as 3-byte datagrams carrying opcode 7, and 12-byte ones carrying opcode 4).
+	char m_cmdRing[RIO_CMD_SLOTS * RIO_CMD_SLOT_SIZE];
+	RIO_BUFFERID m_cmdRingId;
+	RIO_BUF m_cmdRingBufs[RIO_CMD_SLOTS];
+	uint32_t m_cmdRingNext;
+	int rioPost(RIO_BUF *buf, DWORD flags, int tag);
 	SOCKET m_sockInputsFD;
 
 	LARGE_INTEGER m_tickStart;
@@ -340,12 +364,22 @@ class GroovyMister
 	// RIO completion-path telemetry (root-caused a field audio-load stall:
 	// the send CQ was never drained, so once it filled RIOSend failed
 	// silently). Reset at CmdInit; summarized from WaitSync at LOG level 1.
-	uint64_t m_rioSendPosted;        // data RIOSend calls attempted (blit + audio)
-	uint64_t m_rioSendFailed;        // ... that returned FALSE
+	uint64_t m_rioSendPosted;        // sends posted via rioPost (commands, blit and audio)
+	uint64_t m_rioSendFailed;        // sends that could not be posted at all: a non-queue error, or a stack stalled past RIO_STALL_LIMIT_MS
 	uint64_t m_rioSendDrained;       // send completions reaped from m_sendQueue
 	uint64_t m_rioRecvRepostFailed;  // per-ACK RIOReceive re-post that returned FALSE
 	uint64_t m_rioAckTimeout;        // getACK(>0) waits that timed out
 	uint64_t m_rioLastSummaryMs;     // rate-limit for the telemetry summary line
+
+	// Buffer-lifetime accounting. Every send is tagged with the registered buffer it
+	// reads (RIO_TAG_*); completions decrement the count, and rioFence() waits for a
+	// buffer's count to reach zero before anything rewrites it.
+	uint64_t m_rioOutstanding[RIO_TAG_COUNT];
+	uint64_t m_rioSendRetried;       // RIOSend found the queue full and was retried, not dropped
+	uint64_t m_rioFenceWaits;        // a buffer was about to be rewritten while still on the wire
+	uint64_t m_rioFenceTimeouts;     // ... and its sends never completed within RIO_STALL_LIMIT_MS
+	uint64_t m_rioSendErrors;        // completions reporting a failed transmit
+	void rioFence(int tag);
 
 	void teardownVideo(void);
 	void resetSessionState(void); // zero the per-session raster state (fpga.* + m_frame); constructor + every CmdInit

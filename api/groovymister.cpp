@@ -206,8 +206,14 @@ GroovyMister::GroovyMister()
 	m_rioRecvRepostFailed = 0;
 	m_rioAckTimeout = 0;
 	m_rioLastSummaryMs = 0;
+	memset(m_rioOutstanding, 0, sizeof(m_rioOutstanding));
+	m_rioSendRetried = 0;
+	m_rioFenceWaits = 0;
+	m_rioFenceTimeouts = 0;
+	m_rioSendErrors = 0;
 
 #ifdef _WIN32
+	m_cmdRingNext = 0;
 	m_sockFD = INVALID_SOCKET;
 	m_sockInputsFD = INVALID_SOCKET;
 #else
@@ -279,13 +285,21 @@ void GroovyMister::resetSessionState(void)
 	m_frame = 0;
 }
 
+// The accessors below hand the caller a buffer it is about to overwrite, so each one first
+// waits for any send still reading that buffer (see rioFence). m_pBufferBlit is only a send
+// buffer when frames go out raw; compressed, it is just the encoder's input.
 char* GroovyMister::getPBufferBlit(uint8_t field)
 {
+	if (!m_lz4Frames)
+	{
+		rioFence(RIO_TAG_BLIT0 + field);
+	}
 	return m_pBufferBlit[field];
 }
 
 char* GroovyMister::getPBufferPreEncoded(void)
 {
+	rioFence(RIO_TAG_BLIT0);
 	return m_pBufferLZ4[0];
 }
 
@@ -322,6 +336,7 @@ char* GroovyMister::getPBufferBlitDelta(void)
 
 char* GroovyMister::getPBufferAudio(void)
 {
+	rioFence(RIO_TAG_AUDIO);
 	return m_pBufferAudio;
 }
 
@@ -371,6 +386,7 @@ void GroovyMister::teardownVideo(void)
 		m_rio.RIOCloseCompletionQueue(m_sendQueue);
 		m_rio.RIOCloseCompletionQueue(m_receiveQueue);
 		m_rio.RIODeregisterBuffer(m_sendRioBufferId);
+		m_rio.RIODeregisterBuffer(m_cmdRingId);
 		m_rio.RIODeregisterBuffer(m_sendRioBufferAudioId);
 		for (int i=0;i<2;i++)
 		{
@@ -635,6 +651,20 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		m_sendRioBuffer.Offset = 0;
 		m_sendRioBuffer.Length = 26;
 
+		m_cmdRingId = m_rio.RIORegisterBuffer(m_cmdRing, sizeof(m_cmdRing));
+		if (m_cmdRingId == RIO_INVALID_BUFFERID)
+		{
+			LOG(0,"[MiSTer] RIORegisterBuffer m_cmdRing Error: %lu\n", ::GetLastError());
+			return -1;
+		}
+		for (DWORD i = 0; i < RIO_CMD_SLOTS; ++i)
+		{
+			m_cmdRingBufs[i].BufferId = m_cmdRingId;
+			m_cmdRingBufs[i].Offset = i * RIO_CMD_SLOT_SIZE;
+			m_cmdRingBufs[i].Length = 0;
+		}
+		m_cmdRingNext = 0;
+
 		m_receiveRioBufferId = m_rio.RIORegisterBuffer(m_bufferReceive, 17);
 		if (m_receiveRioBufferId == RIO_INVALID_BUFFERID)
 		{
@@ -795,6 +825,12 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 	m_rioSendDrained = 0;
 	m_rioRecvRepostFailed = 0;
 	m_rioAckTimeout = 0;
+	// new queues: nothing from a previous session can still be in flight on them
+	memset(m_rioOutstanding, 0, sizeof(m_rioOutstanding));
+	m_rioSendRetried = 0;
+	m_rioFenceWaits = 0;
+	m_rioFenceTimeouts = 0;
+	m_rioSendErrors = 0;
 
 	// Caps negotiation: a len-6 CMD_INIT is silently DISCARDED by cores older
 	// than GROOVY_VERSION 2 (their length check rejects it, no ACK), so probe
@@ -1083,6 +1119,18 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 	uint32_t cSizeDelta = 0;
 	uint32_t bytesToSend = 0;
 	double ratio_delta = 1.0;
+
+	// The encoders below write straight into the registered send buffers (m_pBufferLZ4[0],
+	// and [1] for a delta frame). If the previous frame's tail is still being transmitted
+	// from them, encoding now puts this frame's bytes on the wire under that frame's
+	// datagrams - a corrupt frame with every length and count still correct, so nothing
+	// on the core can detect it.
+	if (m_lz4Frames)
+	{
+		rioFence(RIO_TAG_BLIT0);
+		rioFence(RIO_TAG_BLIT1);
+	}
+
 	if (m_lz4Frames == GM_CODEC_NLC_TILED)
 	{
 		// NLC tiled (block-adaptive near-lossless): encodes the RAW frame (its own colour transform +
@@ -1352,6 +1400,19 @@ uint32_t GroovyMister::drainSendCompletions(void)
 			{
 				break;
 			}
+			for (ULONG k = 0; k < n; k++)
+			{
+				// RequestContext is the RIO_TAG_* the send was posted with (see rioPost)
+				const ULONG_PTR tag = results[k].RequestContext;
+				if (tag < RIO_TAG_COUNT && m_rioOutstanding[tag])
+				{
+					m_rioOutstanding[tag]--;
+				}
+				if (results[k].Status != 0)
+				{
+					m_rioSendErrors++;
+				}
+			}
 			total += n;
 			if (n < 256)
 			{
@@ -1363,6 +1424,102 @@ uint32_t GroovyMister::drainSendCompletions(void)
 	}
 #endif
 	return 0;
+}
+
+#ifdef _WIN32
+// Post one send and never silently lose it. RIOSend fails when the request queue has no
+// free send slot (WSAENOBUFS). This used to be counted and then skipped - SendStream still
+// advanced past the datagram - so the frame arrived short with nothing on either machine
+// recording a loss: the PC's NIC never saw the packet, so neither did anything after it.
+// Commit what is deferred so the queued sends can go out, reap their completions to free
+// slots, and post again.
+int GroovyMister::rioPost(RIO_BUF *buf, DWORD flags, int tag)
+{
+	uint64_t startMs = 0;
+	for (;;)
+	{
+		if (m_rio.RIOSend(m_requestQueue, buf, 1, flags, (PVOID)(ULONG_PTR)tag))
+		{
+			m_rioSendPosted++;
+			m_rioOutstanding[tag]++;
+			return 0;
+		}
+
+		const int err = ::WSAGetLastError();
+		if (err != WSAENOBUFS)
+		{
+			// not a full queue: retrying cannot help, and this is a bug worth seeing
+			m_rioSendFailed++;
+			LOG(0,"[MiSTer][RIO] RIOSend failed (err %d, tag %d, len %lu) - datagram not sent\n", err, tag, buf->Length);
+			return -1;
+		}
+
+		m_rioSendRetried++;
+		if (startMs == 0)
+		{
+			startMs = monotonicMs();
+		}
+		else if (monotonicMs() - startMs > RIO_STALL_LIMIT_MS)
+		{
+			m_rioSendFailed++;
+			LOG(0,"[MiSTer][RIO] send queue full for %d ms - network stack stalled, datagram not sent (tag %d)\n", RIO_STALL_LIMIT_MS, tag);
+			return -1;
+		}
+		m_rio.RIOSend(m_requestQueue, NULL, 0, RIO_MSG_COMMIT_ONLY, NULL);
+		if (!drainSendCompletions())
+		{
+			::SwitchToThread();
+		}
+	}
+}
+#endif
+
+// Wait until no send still reads the buffer behind `tag`. RIO transmits from registered
+// memory asynchronously, after RIOSend has returned, so rewriting a buffer with a send of
+// it still outstanding puts the NEW bytes on the wire under the OLD datagram - and, as the
+// core logged it, with the old datagram's length or the new one's depending on which got
+// there first: two consecutive frames whose tail chunks came out with each other's sizes,
+// audio headers paired with the next call's payload. Normally the previous frame went out
+// long ago and this returns at once; it only waits when Windows has stalled transmission,
+// which is exactly when the old code corrupted a frame.
+void GroovyMister::rioFence(int tag)
+{
+#ifdef _WIN32
+	if (!USE_RIO || !m_rioOutstanding[tag])
+	{
+		return;
+	}
+	m_rio.RIOSend(m_requestQueue, NULL, 0, RIO_MSG_COMMIT_ONLY, NULL);
+	drainSendCompletions();
+	if (!m_rioOutstanding[tag])
+	{
+		return;   // already transmitted, just not yet reaped
+	}
+
+	m_rioFenceWaits++;
+	const uint64_t startMs = monotonicMs();
+	while (m_rioOutstanding[tag])
+	{
+		if (drainSendCompletions())
+		{
+			continue;
+		}
+		if (monotonicMs() - startMs > RIO_STALL_LIMIT_MS)
+		{
+			// The completions are not coming (a stalled stack, or a corrupt CQ). Writing
+			// the buffer now is the corruption this exists to prevent, but hanging the
+			// sender thread forever is worse; say so loudly and stop waiting on these.
+			m_rioFenceTimeouts++;
+			LOG(0,"[MiSTer][RIO] fence: %llu sends on tag %d still in flight after %d ms - buffer reused anyway\n",
+				(unsigned long long)m_rioOutstanding[tag], tag, RIO_STALL_LIMIT_MS);
+			m_rioOutstanding[tag] = 0;
+			return;
+		}
+		::SwitchToThread();
+	}
+#else
+	(void)tag;
+#endif
 }
 
 void GroovyMister::WaitSync(void)
@@ -1406,10 +1563,15 @@ void GroovyMister::WaitSync(void)
 		if (m_rioLastSummaryMs == 0 || (nowMs - m_rioLastSummaryMs) >= 2000)
 		{
 			m_rioLastSummaryMs = nowMs;
-			LOG(1,"[MiSTer][RIO] frame=%u sendPosted=%llu sendFailed=%llu sendDrained=%llu recvRepostFailed=%llu ackTimeout=%llu noAck=%u\n",
+			// retried = queue was full and the send waited instead of dropping; fenceWaits =
+			// a buffer was about to be rewritten while still on the wire (each one is a frame
+			// the old code would have corrupted). sendFailed and fenceTimeouts should be 0.
+			LOG(1,"[MiSTer][RIO] frame=%u sendPosted=%llu sendFailed=%llu sendDrained=%llu retried=%llu fenceWaits=%llu fenceTimeouts=%llu sendErrors=%llu recvRepostFailed=%llu ackTimeout=%llu noAck=%u\n",
 				m_frame,
 				(unsigned long long)m_rioSendPosted, (unsigned long long)m_rioSendFailed,
-				(unsigned long long)m_rioSendDrained, (unsigned long long)m_rioRecvRepostFailed,
+				(unsigned long long)m_rioSendDrained, (unsigned long long)m_rioSendRetried,
+				(unsigned long long)m_rioFenceWaits, (unsigned long long)m_rioFenceTimeouts,
+				(unsigned long long)m_rioSendErrors, (unsigned long long)m_rioRecvRepostFailed,
 				(unsigned long long)m_rioAckTimeout, m_noAckBlitCount);
 		}
 	}
@@ -1627,8 +1789,15 @@ void GroovyMister::Send(void *cmd, int cmdSize)
 #ifdef _WIN32
 if (USE_RIO)
 {
-	m_sendRioBuffer.Length = cmdSize;
-	m_rio.RIOSend(m_requestQueue, &m_sendRioBuffer, 1, RIO_MSG_DONT_NOTIFY, &m_sendRioBuffer);
+	// Each command gets its own registered slot, copied in here, so the next command
+	// cannot rewrite this one before RIO has transmitted it. Callers still build commands
+	// in m_bufferSend, which is now only scratch.
+	const uint32_t slot = m_cmdRingNext;
+	m_cmdRingNext = (m_cmdRingNext + 1) % RIO_CMD_SLOTS;
+	rioFence(RIO_TAG_CMD0 + slot);
+	memcpy(&m_cmdRing[slot * RIO_CMD_SLOT_SIZE], cmd, cmdSize);
+	m_cmdRingBufs[slot].Length = cmdSize;
+	rioPost(&m_cmdRingBufs[slot], RIO_MSG_DONT_NOTIFY, RIO_TAG_CMD0 + slot);
 	return;
 }
 #endif
@@ -1642,26 +1811,23 @@ void GroovyMister::SendStream(uint8_t whichBuffer, uint8_t field, uint32_t bytes
 if (USE_RIO)
 {
 	DWORD flags = RIO_MSG_DONT_NOTIFY | RIO_MSG_DEFER;
+	const int tag = (whichBuffer == 0) ? RIO_TAG_BLIT0 + field : RIO_TAG_AUDIO;
+	RIO_BUF *bufs = (whichBuffer == 0) ? m_pBufsBlit[field] : m_pBufsAudio;
+
+	// The slice descriptors are rewritten in place below; the buffer's data was already
+	// fenced by its accessor or by CmdBlit, so this is normally a no-op.
+	rioFence(tag);
+
 	int i=0;
 	while (bytesSended < bytesToSend)
 	{
-		if (whichBuffer == 0)
+		bufs[i].Length = (bytesToSend - bytesSended >= m_mtu) ? m_mtu : bytesToSend - bytesSended;
+		if (rioPost(&bufs[i], flags, tag) != 0)
 		{
-			m_pBufsBlit[field][i].Length = (bytesToSend - bytesSended >= m_mtu) ? m_mtu : bytesToSend - bytesSended;
-			m_rioSendPosted++;
-			if (!m_rio.RIOSend(m_requestQueue, &m_pBufsBlit[field][i], 1, flags, &m_pBufsBlit[field][i]))
-			{
-				m_rioSendFailed++;
-			}
-		}
-		else
-		{
-			m_pBufsAudio[i].Length = (bytesToSend - bytesSended >= m_mtu) ? m_mtu : bytesToSend - bytesSended;
-			m_rioSendPosted++;
-			if (!m_rio.RIOSend(m_requestQueue, &m_pBufsAudio[i], 1, flags, &m_pBufsAudio[i]))
-			{
-				m_rioSendFailed++;
-			}
+			// rioPost only gives up on a stack that has stopped for RIO_STALL_LIMIT_MS (and
+			// has logged it). Abandon the rest of this transfer rather than wait that long
+			// again for every remaining chunk.
+			break;
 		}
 		bytesSended += m_mtu;
 		i++;
