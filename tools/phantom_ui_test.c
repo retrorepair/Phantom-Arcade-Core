@@ -111,7 +111,7 @@ static void test_tabs(void)
 	ui.tab = PH_TAB_ALL;   CHECK(filtered_count() == 9, "ALL shows everything, got %d", filtered_count());
 	ui.tab = PH_TAB_MAME;  CHECK(filtered_count() == 2, "MAME tab matches groovymame and mame, got %d", filtered_count());
 	ui.tab = PH_TAB_FBNEO; CHECK(filtered_count() == 1, "FBNeo tab, got %d", filtered_count());
-	ui.tab = PH_TAB_NAOMI; CHECK(filtered_count() == 1, "NAOMI tab, got %d", filtered_count());
+	ui.tab = PH_TAB_DC;    CHECK(filtered_count() == 1, "Dreamcast tab, got %d", filtered_count());
 	ui.tab = PH_TAB_PS2;   CHECK(filtered_count() == 1, "PS2 tab, got %d", filtered_count());
 	ui.tab = PH_TAB_PS3;   CHECK(filtered_count() == 1, "PS3 tab, got %d", filtered_count());
 	ui.tab = PH_TAB_XBOX;  CHECK(filtered_count() == 1, "Xbox tab, got %d", filtered_count());
@@ -150,7 +150,7 @@ static void test_tab_switch_resets_selection(void)
 
 	/* Step to NAOMI by name rather than by "the next tab along": inserting a tab in
 	 * between is a routine change and should not break this. */
-	while (ui.tab != PH_TAB_NAOMI) ph_ui_tab(&ui, 1);
+	while (ui.tab != PH_TAB_DC) ph_ui_tab(&ui, 1);
 	CHECK(ui.sel == 0, "changing tab returns to the first row, got %d", ui.sel);
 	CHECK(ph_ui_selected(&ui) != 0, "a one-entry tab still has a selection");
 

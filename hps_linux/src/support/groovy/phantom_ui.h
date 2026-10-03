@@ -74,7 +74,7 @@ typedef enum
 #define PH_TAB_ALL    0
 #define PH_TAB_MAME   1
 #define PH_TAB_FBNEO  2
-#define PH_TAB_NAOMI  3
+#define PH_TAB_DC     3
 #define PH_TAB_PS2    4
 #define PH_TAB_PS3    5
 #define PH_TAB_XBOX   6

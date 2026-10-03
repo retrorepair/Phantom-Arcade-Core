@@ -112,7 +112,7 @@ static EmulatorDef g_emus[] = {
       L"\"{rom}\"",
       "15kHz Native", NULL, NULL },
 
-    { "flycast", L"Flycast (Dojo)", "Sega NAOMI / Dreamcast",
+    { "flycast", L"Flycast (Dojo)", "Sega Dreamcast / NAOMI",
       L"C:\\Emulators\\flycast\\flycast.exe", L"C:\\Games\\Naomi",
       L".zip,.7z,.chd,.gdi,.cdi,.cue,.lst",
       L"\"{rom}\"",

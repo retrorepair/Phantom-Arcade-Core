@@ -6386,4 +6386,27 @@ void parse_buttons()
 		if (!joy_bnames[n][0]) break;
 		joy_bcount++;
 	}
+
+	// Groovy.sv's CONF_STR declares the ten positions as "Button 1" .. "Button 10",
+	// which is no help at all while you are holding a DualShock trying to work out
+	// which one position 7 is meant to be. The wire format pins down what each
+	// position means (api/groovymister.h), so name them properly: MiSTer's SNES-style
+	// order, with the DualShock label alongside where the two differ.
+	//
+	// Done here rather than in the bitstream because a CONF_STR change means a Quartus
+	// rebuild and everyone reflashing the core to relabel a menu, and here it covers
+	// every route into the button-define flow at once.
+	if (is_groovy())
+	{
+		static const char *groovy_btns[10] = {
+			"A / Cross",   "B / Circle", "X / Square", "Y / Triangle",
+			"L / L1",      "R / R1",     "Select",     "Start",
+			"L2",          "R2"
+		};
+		joy_bcount = 10;
+		for (int n = 0; n < 10; n++)
+		{
+			snprintf(joy_bnames[n], sizeof(joy_bnames[n]), "%s", groovy_btns[n]);
+		}
+	}
 }

@@ -319,7 +319,7 @@ static int tab_match(int tab, const char *sys)
 		return ieq(sys, "groovymame") || ieq(sys, "mame") || ieq(sys, "arcade");
 	case PH_TAB_FBNEO:
 		return ieq(sys, "fbneo") || ieq(sys, "fightcade");
-	case PH_TAB_NAOMI:
+	case PH_TAB_DC:
 		return ieq(sys, "flycast") || ieq(sys, "naomi") || ieq(sys, "dreamcast");
 	case PH_TAB_PS2:
 		return ieq(sys, "pcsx2") || ieq(sys, "ps2");
@@ -558,7 +558,7 @@ static void draw_tabs(ph_ui *u)
 	/* Kept short: eight tabs plus the position counter have to fit 720px at 8px a
 	 * character, and a tab strip that wraps or clips is worse than an abbreviation. */
 	static const char *tabs[PH_TAB_COUNT] =
-		{ "ALL", "MAME", "FBNEO", "NAOMI", "PS2", "PS3", "XBOX", "RETROARCH" };
+		{ "ALL", "MAME", "FBNEO", "DREAMCAST", "PS2", "PS3", "XBOX", "RETROARCH" };
 
 	rect(u, 0, TAB_Y, u->w, TAB_H, C_TABBAR);
 
