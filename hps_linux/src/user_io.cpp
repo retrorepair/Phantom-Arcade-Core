@@ -1782,7 +1782,15 @@ void user_io_digital_joystick(unsigned char joystick, uint64_t map, int newdir)
 	
 	if (is_groovy())
 	{
-		groovy_send_joystick(joystick, bitmask);
+		// The Phantom Arcade launcher gets first refusal. While it is on screen it
+		// consumes everything: forwarding as well would type menu navigation into
+		// whatever the host has focused. While a stream is running it only watches
+		// for the Start+Select exit hold, and the pad still reaches the host.
+		if (!phantom_joystick(joystick, bitmask))
+		{
+			phantom_exit_hotkey(joystick, bitmask);
+			groovy_send_joystick(joystick, bitmask);
+		}
 	}
 }
 
@@ -3721,7 +3729,10 @@ static void send_keycode(unsigned short key, int press)
 	{
 		if (is_groovy())
 		{
-			groovy_send_keyboard(key, press);
+			if (!phantom_keyboard(key, press))
+			{
+				groovy_send_keyboard(key, press);
+			}
 		}
 		
 		uint32_t code = get_ps2_code(key);

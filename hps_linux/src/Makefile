@@ -41,6 +41,9 @@ else
 PRJ = MiSTer_groovy
 endif
 
+# support/*/*.c is globbed as well as the .cpp below: phantom_ui.c is deliberately plain
+# C with no SDK dependency so tools/phantom_preview.c can build it with the host
+# compiler and render the launcher off-target.
 C_SRC =   $(wildcard *.c) \
           $(wildcard ./lib/miniz/*.c) \
           $(wildcard ./lib/md5/*.c) \
@@ -48,7 +51,8 @@ C_SRC =   $(wildcard *.c) \
 	  $(wildcard ./lib/zstd/lib/common/*.c) \
 	  $(wildcard ./lib/zstd/lib/decompress/*.c) \
           $(wildcard ./lib/libchdr/*.c) \
-          lib/libco/arm.c 
+          lib/libco/arm.c \
+          $(wildcard ./support/*/*.c)
 
 CPP_SRC = $(wildcard *.cpp) \
           $(wildcard ./lib/serial_server/library/*.cpp) \

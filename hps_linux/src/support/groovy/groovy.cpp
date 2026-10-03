@@ -38,6 +38,7 @@
 #include "logo.h"
 #include "pll.h"
 #include "utils.h"
+#include "phantom.h"
 
 // fork (input.cpp): route client-requested rumble to a player's pad (1-based player)
 void input_rumble_player(int player, uint16_t rumble_val);
@@ -1036,6 +1037,178 @@ static void setSwitchres(char *recvbuf)
 }
 
 
+/* ---- Phantom Arcade launcher bridge ------------------------------------------- *
+ *
+ * The launcher draws its own screen, so it needs a framebuffer and a video mode. Both
+ * come from the paths this file already has: the canvas is the same DDR blit region a
+ * streaming client writes into, and the mode is programmed through setSwitchres(), the
+ * very same call CMD_SWITCHRES uses. Nothing here is a new route to the FPGA.
+ *
+ * The mode is 720x480 with interlace=2, which the core reads as "interlaced output,
+ * progressive framebuffer": the HPS hands over one whole 720x480 frame and the FPGA
+ * scans it out as two fields. That matters because the alternative, a genuinely
+ * interlaced framebuffer, would make the launcher maintain two field buffers and
+ * alternate them - for a static menu that is all cost and no benefit.
+ *
+ * The geometry is the repo's own 480i test mode (sim/compare_nlc_modes.sh: 720x480,
+ * hfp 29 / hs 69 / hbp 117, vfp 3 / vs 6 / vbp 34, ce_pix 4), so it is a timing this
+ * core is already exercised against rather than one invented here. At 14.655MHz that
+ * is 935 x 523 => 15.67kHz horizontal, 59.92Hz field rate: an ordinary 15kHz 480i
+ * signal that an arcade monitor or a consumer TV will both lock to.
+ */
+
+#define PH_W 720
+#define PH_H 480
+#define PH_PCLOCK 14.655470   /* MHz: 935 * 523/2 * 59.94 */
+
+extern "C" uint32_t groovy_idle_canvas_bytes(void)
+{
+	return (uint32_t)PH_W * PH_H * 3;
+}
+
+extern "C" int groovy_idle_begin(void)
+{
+	if (!buffer || !poc) return 0;
+
+	/* Wait for the blit FSM to be back at S_Idle before reprogramming it, exactly as
+	 * loadLogo() does. fpga_init mirrors "FSM state != S_Idle". */
+	int guard = 0;
+	do
+	{
+		groovy_FPGA_status(0);
+		if (++guard > 100000) { LOG(0, "[PHANTOM][%s]\n", "FPGA did not return to idle"); return 0; }
+	} while (fpga_init != 0);
+
+	rgbMode = 0;   /* RGB888: three bytes per pixel, matching the launcher's canvas */
+
+	/* Build the CMD_SWITCHRES payload the host would have sent for this mode and feed
+	 * it through the normal parser, so the PLL maths, the ce_pix ladder and the FPGA
+	 * handshake are the shared, tested ones. Layout per setSwitchres(). */
+	union { double d; uint64_t i; } pc;
+	pc.d = PH_PCLOCK;
+
+	uint8_t sr[26];
+	memset(sr, 0, sizeof(sr));
+	uint16_t hactive = PH_W, hbegin = PH_W + 29, hend = PH_W + 29 + 69, htotal = PH_W + 29 + 69 + 117;
+	uint16_t vactive = PH_H, vbegin = PH_H + 3, vend = PH_H + 3 + 6, vtotal = PH_H + 3 + 6 + 34;
+	uint8_t  interlace = 2;
+
+	memcpy(&sr[1],  &pc.i,     8);
+	memcpy(&sr[9],  &hactive,  2);
+	memcpy(&sr[11], &hbegin,   2);
+	memcpy(&sr[13], &hend,     2);
+	memcpy(&sr[15], &htotal,   2);
+	memcpy(&sr[17], &vactive,  2);
+	memcpy(&sr[19], &vbegin,   2);
+	memcpy(&sr[21], &vend,     2);
+	memcpy(&sr[23], &vtotal,   2);
+	memcpy(&sr[25], &interlace, 1);
+
+	setSwitchres((char *)sr);
+
+	/* Blit header: frame 1, one blit, the whole frame's worth of pixels. */
+	uint32_t px = (uint32_t)PH_W * PH_H;
+	buffer[0] = 1;
+	buffer[1] = 0;
+	buffer[2] = 0;
+	buffer[3] = (uint8_t)(px & 0xff);
+	buffer[4] = (uint8_t)((px >> 8) & 0xff);
+	buffer[5] = (uint8_t)((px >> 16) & 0xff);
+	buffer[6] = 1;
+	buffer[7] = 0;
+
+	memset(&buffer[HEADER_OFFSET], 0x00, (size_t)px * 3);
+
+	groovy_FPGA_init(1, 0, 0, 0);
+	groovy_FPGA_blit();
+	/* cmd_logo is the core's auto-reblit: it keeps re-reading this framebuffer every
+	 * frame instead of waiting for a new one, which is precisely what a static menu
+	 * needs. Nothing about it is logo-specific (Groovy.sv only uses it to gate the
+	 * frameskip path), so the launcher reuses it rather than adding a second flag. */
+	groovy_FPGA_logo(1);
+	groovyLogo = 1;
+
+	LOG(1, "[PHANTOM][mode %dx%d interlace=2 pclock=%.4f ce_pix=%d]\n",
+	    PH_W, PH_H, PH_PCLOCK, poc->PoC_ce_pix);
+	return 1;
+}
+
+extern "C" void groovy_idle_present(const uint8_t *src)
+{
+	/* The launcher renders into ordinary cached RAM and hands the finished frame here
+	 * to be copied in one go. It does NOT draw into this buffer directly, for two
+	 * reasons:
+	 *
+	 *   The DDR window is mapped uncached (shmem_map, O_SYNC). Every byte a renderer
+	 *   writes goes straight out to memory, so building a screen out of thousands of
+	 *   small rectangle and glyph writes costs orders of magnitude more than the same
+	 *   drawing into cached RAM followed by one linear copy.
+	 *
+	 *   cmd_logo has the core re-reading this buffer every frame. Drawing in place
+	 *   therefore puts half-finished frames on the CRT - the clear, then the widgets
+	 *   appearing one at a time. A single memcpy still tears, but only ever between
+	 *   two complete frames, and only on a frame where something actually changed.
+	 */
+	if (!buffer || !src) return;
+	memcpy(&buffer[HEADER_OFFSET], src, (size_t)PH_W * PH_H * 3);
+}
+
+extern "C" void groovy_idle_end(void)
+{
+	groovy_FPGA_logo(0);
+	groovyLogo = 0;
+}
+
+/* The idle screen, in one place. Every site that used to switch the bouncing logo on
+ * now calls this, so "what the core shows with no client" is a single decision:
+ *
+ *   Launcher  the Phantom Arcade game list (the default)
+ *   Logo      the original screensaver, still gated by Server > Screensaver
+ *   Off       nothing
+ */
+static void idleScreenEnter()
+{
+	if (phantom_get_idle_mode() == PHANTOM_IDLE_LAUNCHER)
+	{
+		if (phantom_idle_enter()) return;
+		/* falling through on failure is deliberate: a core that cannot program the
+		 * launcher mode should still show something rather than a black screen. */
+	}
+
+	if (phantom_get_idle_mode() == PHANTOM_IDLE_OFF) return;
+
+	if (doScreensaver)
+	{
+		loadLogo(1);
+		groovy_FPGA_init(1, 0, 0, 0);
+		groovy_FPGA_blit();
+		groovy_FPGA_logo(1);
+		groovyLogo = 1;
+	}
+}
+
+static void idleScreenLeave()
+{
+	phantom_idle_leave();
+
+	if (groovyLogo)
+	{
+		groovy_FPGA_logo(0);
+		groovyLogo = 0;
+	}
+}
+
+static void idleScreenTick()
+{
+	phantom_idle_poll();
+
+	if (!phantom_owns_screen() && doScreensaver && groovyLogo)
+	{
+		loadLogo(0);
+	}
+}
+
+
 static void setClose()
 {
 	groovy_FPGA_init(0, 0, 0, 0);
@@ -1059,15 +1232,8 @@ static void setClose()
 	input_rumble_player(1, 0);
 	input_rumble_player(2, 0);
 
-	// load LOGO
-	if (doScreensaver)
-	{
-		loadLogo(1);
-		groovy_FPGA_init(1, 0, 0, 0);
-		groovy_FPGA_blit();
-		groovy_FPGA_logo(1);
-		groovyLogo = 1;
-	}
+	// idle screen: launcher, logo or nothing (see idleScreenEnter)
+	idleScreenEnter();
 	
 	user_io_status_set(AUDIO_RATE_OPT, (uint32_t)0);
  	user_io_status_set(AUDIO_CHANNELS_OPT, (uint32_t)0);
@@ -1442,12 +1608,8 @@ static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan,
 	// stale cmd_init would otherwise spin that poll forever instead of just this one frame.
 	groovy_FPGA_init(0, 0, 0, 0);
 
-	// load LOGO
-	if (doScreensaver)
-	{
-		groovy_FPGA_logo(0);
-		groovyLogo = 0;
-	}
+	// idle screen off: the client's first frame owns the display now
+	idleScreenLeave();
 
 	if (!isConnected)
 	{
@@ -2856,16 +3018,11 @@ static void groovy_start()
 	}	
 	
 	user_io_status_set(SERVER_TYPE_OPT, (uint32_t)doXDPServer);
+
+	phantom_init();
 		
-	// load LOGO
-	if (doScreensaver)
-	{
-		loadLogo(1);
-		groovy_FPGA_init(1, 0, 0, 0);
-		groovy_FPGA_blit();
-		groovy_FPGA_logo(1);
-		groovyLogo = 1;
-	}
+	// idle screen: launcher, logo or nothing (see idleScreenEnter)
+	idleScreenEnter();
 
     	printf("Groovy-Server %d started\n", GROOVY_VERSION);
 
@@ -2875,6 +3032,8 @@ start_error:
 
 void groovy_stop()
 {
+	phantom_stop();
+
 	if (doARMClock)
 	{
 		setARMClock(0);
@@ -3100,10 +3259,7 @@ void groovy_poll()
 		}
 	} while (isCorePriority);
 
-	if (doScreensaver && groovyLogo)
-	{
-		loadLogo(0);
-	}
+	idleScreenTick();
 
 	// idle timeout (once per poll). Two separate jobs, and they are NOT gated alike:
 	//   * the deadline refresh runs for EVERY client. idleDeadline is written only here and in

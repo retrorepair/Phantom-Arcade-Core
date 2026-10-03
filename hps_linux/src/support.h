@@ -55,3 +55,4 @@
 
 // GROOVY support
 #include "support/groovy/groovy.h"
+#include "support/groovy/phantom.h"
