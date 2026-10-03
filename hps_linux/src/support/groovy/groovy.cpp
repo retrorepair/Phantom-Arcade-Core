@@ -1001,7 +1001,18 @@ static void setSwitchres(char *recvbuf)
     poc->PoC_buffer_offset = 0;
     
     LOG(1,"[MODELINE][%f %d %d %d %d %d %d %d %d %s(%d)][FPGA %d %d %d %d %d %d %d %d]\n",udp_pclock,udp_hactive,udp_hbegin,udp_hend,udp_htotal,udp_vactive,udp_vbegin,udp_vend,udp_vtotal,udp_interlace?"interlace":"progressive",udp_interlace, poc->PoC_H,poc->PoC_HFP, poc->PoC_HS,poc->PoC_HBP,poc->PoC_V,poc->PoC_VFP, poc->PoC_VS,poc->PoC_VBP);
-    LOG(1,"[PLL][ce_pix=%d M0=%d M1=%d C0=%d C1=%d K=%d]\n", poc->PoC_ce_pix,poc->PoC_pll_M0,poc->PoC_pll_M1,poc->PoC_pll_C0,poc->PoC_pll_C1,poc->PoC_pll_K);    
+    LOG(1,"[PLL][ce_pix=%d M0=%d M1=%d C0=%d C1=%d K=%d]\n", poc->PoC_ce_pix,poc->PoC_pll_M0,poc->PoC_pll_M1,poc->PoC_pll_C0,poc->PoC_pll_C1,poc->PoC_pll_K);
+
+    /* The one line that matters when a picture is juddering: what geometry, and which
+     * of the three interlace arrangements. Severity 0 so it is in the log without
+     * Verbose, since by the time anyone asks, the session is long gone.
+     *   0 = progressive
+     *   1 = interlaced output, interlaced framebuffer (client sends fields separately)
+     *   2 = interlaced output, progressive framebuffer (core splits the fields) */
+    LOG(0,"[MODE][%dx%d @ %.3fMHz][interlace=%d %s][ce_pix=%d]\n",
+        poc->PoC_H, poc->PoC_V, udp_pclock, udp_interlace,
+        (udp_interlace == 0) ? "progressive" : (udp_interlace == 1) ? "fields-from-client" : "fields-from-core",
+        poc->PoC_ce_pix);
      
     //clean pixels on ddr (auto_blit)
     buffer[4] = 0x00;
@@ -1642,6 +1653,20 @@ static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan,
 	nlcPack         = (compression >> 7) & 0x1;   // entropy pack -> FPGA init word [8]
 	if (codecMode > 2) codecMode = 0;
 	blitCompression = (codecMode >= 1) ? 1 : 0;   // LZ4 AND NLC use the LZ DDR zones + compressed blit path
+
+	/* Say what the client negotiated, at severity 0 so it lands in the log without
+	 * Verbose. Which codec and NLC display path a session picked is the first thing
+	 * anyone needs when chasing a picture fault, and until now it could only be
+	 * inferred from the emulator's own settings file - which is the wrong side of the
+	 * link to be trusting. The interlace mode is logged by setSwitchres when the
+	 * modeline arrives, just after this. */
+	{
+		static const char *codec_name[3] = { "raw", "LZ4", "NLC" };
+		LOG(0, "[CLIENT][codec=%s][nlc disp=%d near=%d pack=%s colour=%s][rgb=%d]\n",
+		    codec_name[codecMode], nlcDispMode, nlcNear,
+		    nlcPack ? "rice" : "tiled", nlcColor ? "ycocg" : "rgb",
+		    (rgb_mode <= 2) ? rgb_mode : 0);
+	}
 	audioRate = (audio_rate <= 3) ? audio_rate : 0;
 	audioChannels = (audio_chan <= 2) ? audio_chan : 0;
 	rgbMode = (rgb_mode <= 2) ? rgb_mode : 0;
