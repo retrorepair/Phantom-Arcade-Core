@@ -129,6 +129,10 @@ int main(int argc, char **argv)
 		const ph_game *g = ph_ui_selected(&ui);
 		snprintf(ui.busy_title, sizeof(ui.busy_title), "%s", g ? g->title : "-");
 		snprintf(ui.status, sizeof(ui.status), "Waiting for host video...");
+		/* --time is how long the launch has been waiting, so the elapsed clock and
+		 * the activity strip can be looked at at any point in the wait. */
+		ui.busy_t0 = 1;
+		ui.tick_ms = 1 + t;
 	}
 
 	ph_ui_render(&ui);

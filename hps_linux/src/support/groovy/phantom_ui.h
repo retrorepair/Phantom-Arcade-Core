@@ -102,8 +102,9 @@ typedef struct
 	int           host_port;
 
 	/* transient view state */
-	ph_view view;
-	char    busy_title[PH_TITLE_LEN];
+	ph_view  view;
+	char     busy_title[PH_TITLE_LEN];
+	uint32_t busy_t0;    /* tick_ms when the launch went out, for the elapsed counter */
 	char    status[96];
 
 	/* animation. tick_ms is monotonic milliseconds, supplied by the caller so this

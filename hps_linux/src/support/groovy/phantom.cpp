@@ -66,7 +66,10 @@ int      groovy_ps2_inputs_enabled(void);
 #define T_GIVE_UP       12000   /* searching -> offline */
 #define T_PING           5000   /* liveness probe while online */
 #define T_PING_LOST     16000   /* no reply for this long -> offline */
-#define T_LAUNCH_WAIT   25000   /* no video after a LAUNCH -> back to the list */
+/* How long to sit on the loading screen before giving up. Generous on purpose: a
+ * first RPCS3 boot compiles shaders and can run for minutes, and the screen shows a
+ * running clock so the wait is visible rather than a guess. B cancels it sooner. */
+#define T_LAUNCH_WAIT  180000
 #define T_EXIT_HOLD      1200   /* Start+Select hold to kill the host emulator */
 #define T_STATUS_SHOW    6000   /* how long a transient message sits in the detail bar */
 
@@ -94,6 +97,7 @@ static uint32_t  t_search_began = 0;
 static uint32_t  t_last_reply = 0;
 static uint32_t  t_launch_sent = 0;
 static uint32_t  t_status_set = 0;   /* transient message in the detail bar */
+static uint32_t  t_busy_tick = 0;    /* loading screen redraw, once a second */
 static int       awaiting_video = 0;
 static char      last_id[PH_ID_LEN] = "";
 
@@ -471,6 +475,9 @@ static void do_launch(void)
 	snprintf(ui.busy_title, sizeof(ui.busy_title), "%s", g->title);
 	snprintf(ui.status, sizeof(ui.status), "Waiting for host video...");
 	ui.view = PH_VIEW_BUSY;
+	ui.busy_t0 = now_ms();
+	ui.tick_ms = ui.busy_t0;
+	t_busy_tick = 0;
 	ui.dirty = 1;
 
 	awaiting_video = 1;
@@ -681,7 +688,20 @@ void phantom_idle_poll(void)
 	 * changes; it simply stops animating until the host either sends video or the
 	 * launch times out. A moving progress bar is not worth competing with the thing
 	 * the user actually asked for. */
-	if (!awaiting_video && ph_ui_animate(&ui, t)) ui.dirty = 1;
+	if (awaiting_video)
+	{
+		/* Loading screen: one redraw a second, enough for the clock and the activity
+		 * strip, and cheap enough not to compete with the video about to arrive. */
+		if (!t_busy_tick || (int32_t)(t - t_busy_tick) >= 1000)
+		{
+			t_busy_tick = t;
+			/* ph_ui_animate is what normally advances the clock, and it is skipped
+			 * here, so the elapsed counter has to be told the time directly. */
+			ui.tick_ms = t;
+			ui.dirty = 1;
+		}
+	}
+	else if (ph_ui_animate(&ui, t)) ui.dirty = 1;
 
 	/* Frame pacing. groovy_poll() spins as fast as it can, and without this even an
 	 * idle list rebuilt and recopied a megabyte thousands of times a second. Capped at

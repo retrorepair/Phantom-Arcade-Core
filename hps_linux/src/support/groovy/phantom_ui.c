@@ -822,15 +822,34 @@ static void draw_busy(ph_ui *u)
 
 	text(u, bx + 20, by + 16, "STARTING STREAM", C_AMBER, 2);
 	text_n_clip(u, bx + 20, by + 56, u->busy_title, C_TEXT, bw - 40);
-	text_n_clip(u, bx + 20, by + 80, u->status, C_CYAN, bw - 40);
+	text_n_clip(u, bx + 20, by + 80, u->status, C_CYAN, bw - 44 - 7 * PH_NARROW_W);
 
-	/* A static rule, not a progress bar. There used to be an animated sweep here, which
-	 * meant redrawing and recopying the whole canvas every tick for the entire time the
-	 * host was starting an emulator - a megabyte of uncached writes into the DDR region
-	 * the arriving video is about to use. The launcher now stops animating once a launch
-	 * is out (phantom.cpp), and a bar frozen part-way across would read as stuck, so
-	 * there is nothing here that pretends to measure progress. */
-	rect(u, bx + 20, by + 114, bw - 40, 4, C_AMBER_DK);
+	/* Elapsed time, not a progress bar. Starting an emulator takes as long as it takes -
+	 * RPCS3 compiling shaders on a first boot can run for minutes - and a bar that
+	 * pretends to know how far along it is would be a lie. A clock counting up says the
+	 * same useful thing ("it is still working") and is true.
+	 *
+	 * phantom.cpp redraws this once a second rather than every tick. That matters: at
+	 * the full field rate it was a megabyte of uncached writes into the DDR region the
+	 * arriving video is about to fill, 60 times a second, for the whole wait. Once a
+	 * second it is nothing, and a clock does not need to tick faster than that. */
+	uint32_t secs = (u->busy_t0 && u->tick_ms >= u->busy_t0) ? (u->tick_ms - u->busy_t0) / 1000 : 0;
+	char clock[16];
+	snprintf(clock, sizeof(clock), "%u:%02u", secs / 60, secs % 60);
+	text_n_right(u, bx + bw - 20, by + 80, clock, C_TEXT_DIM);
+
+	/* Activity strip: one cell per second, cycling. Reads as "working" without
+	 * claiming to measure anything. */
+	int cells = 24;
+	int cw = (bw - 40) / cells;
+	int lit = (int)(secs % (uint32_t)cells);
+	for (int i = 0; i < cells; i++)
+	{
+		rect(u, bx + 20 + i * cw, by + 112, cw - 2, 6,
+		     (i <= lit) ? C_AMBER : C_AMBER_DK);
+	}
+
+	text_n(u, bx + 20, by + 126, "B cancels", C_TEXT_MUTE);
 }
 
 void ph_ui_render(ph_ui *u)
