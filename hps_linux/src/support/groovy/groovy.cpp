@@ -368,6 +368,17 @@ static uint8_t rgbMode = 0;
 
 static int isBlitting = 0;
 static int isCorePriority = 0;
+
+// Interleaved-command suspend. The client's audio runs on its own cadence on the same
+// socket as video, so CMD_AUDIO lands in the middle of a video frame's chunk stream as a
+// matter of course. PoC_bytes_recv and PoC_buffer_offset are shared by both transfers, so
+// servicing that command used to destroy the frame in flight. These hold the interrupted
+// video cursor while the command (and any transfer of its own) runs; the exact offset is
+// saved rather than recomputed because video streams to FIELD_OFFSET or one of
+// LZ4_OFFSET_A..D depending on mode (see setBlit).
+static uint8_t  blitSuspended      = 0;
+static uint32_t blitSuspendBytes   = 0;
+static uint32_t blitSuspendOffset  = 0;
 static int usingOldBlit = 0;
 
 static uint8_t hpsBlit = 0;
@@ -1265,6 +1276,7 @@ static void setClose()
 	groovy_FPGA_init(0, 0, 0, 0);
 	isBlitting = 0;
 	isCorePriority = 0;   // defensive: a mid-blit caller (idle timeout) leaves this 1; the poll loop would spin
+	blitSuspended = 0;    // likewise: a suspend outstanding across a close must not resume into the new session
 	usingOldBlit = 0;
 	numBlit = 0;
 	blitCompression = 0;
@@ -1753,6 +1765,12 @@ static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan,
 
 static void setBlit(uint32_t udp_frame, uint8_t udp_field, uint32_t udp_lz4_size, uint8_t udp_frame_delta)
 {
+	// A new frame retires any pending suspend. One can still be outstanding here: if the next
+	// frame's CMD_BLIT arrives while a nested audio transfer is mid-flight, that frame is
+	// genuinely gone and its saved cursor must not be handed back to this one when the audio
+	// completes.
+	blitSuspended = 0;
+
 	poc->PoC_frame_recv = udp_frame;
 	poc->PoC_bytes_recv = (!blitCompression && udp_frame_delta) ? poc->PoC_bytes_len : 0; //on raw, only duplicated frame supported
 	poc->PoC_bytes_lz4_ddr = 0;
@@ -1867,6 +1885,37 @@ static void setBlit(uint32_t udp_frame, uint8_t udp_field, uint32_t udp_lz4_size
  	}		
 }
 
+/* Which commands may interrupt a transfer without ending it. CMD_BLIT*, CMD_INIT,
+ * CMD_SWITCHRES and CMD_CLOSE are deliberately absent: those do mean the client has moved
+ * on or torn the session down, so abandoning the frame in flight is the right answer for
+ * them and keeps the original behaviour. Lengths mirror the dispatch switch exactly, so a
+ * genuinely lost tail chunk whose first byte happens to look like an opcode is not
+ * mistaken for a command. */
+static int cmdSuspendsBlit(const char *p, int len)
+{
+	switch (p[0])
+	{
+		case CMD_AUDIO:       return len == 3;
+		case CMD_GET_STATUS:  return len == 1;
+		case CMD_GET_VERSION: return len == 1;
+	}
+	return 0;
+}
+
+/* Put the interrupted video transfer back exactly where it was. The command's own bytes
+ * were written into the framebuffer by recv() (see the recvbufPtr choice in groovy_poll),
+ * but the FPGA was never told they were there and the next chunk overwrites them, so
+ * resuming at the same cursor is clean. */
+static void resumeSuspendedBlit(void)
+{
+	poc->PoC_bytes_recv    = blitSuspendBytes;
+	poc->PoC_buffer_offset = blitSuspendOffset;
+
+	isBlitting     = 1;
+	isCorePriority = 1;
+	blitSuspended  = 0;
+}
+
 static void setBlitAudio(uint16_t udp_bytes_samples)
 {
 	poc->PoC_bytes_audio_len = udp_bytes_samples;
@@ -1888,8 +1937,20 @@ static void setBlitRawAudio(uint16_t len)
 	{
 		uint16_t sound_samples = (audioChannels == 0) ? 0 : (audioChannels == 1) ? poc->PoC_bytes_audio_len >> 1 : poc->PoC_bytes_audio_len >> 2;
 		groovy_FPGA_audio(sound_samples);
-		poc->PoC_buffer_offset = 0;
-		isCorePriority = 0;
+
+		/* Audio nested inside a video frame: hand the cursor back rather than zeroing the
+		 * offset, or the rest of the frame lands at the top of the framebuffer. */
+		if (blitSuspended)
+		{
+			resumeSuspendedBlit();
+			LOG(2, "[DDR_BLIT][resumed at %d/%d after audio]\n", poc->PoC_bytes_recv,
+			    blitCompression ? poc->PoC_bytes_lz4_len : poc->PoC_bytes_len);
+		}
+		else
+		{
+			poc->PoC_buffer_offset = 0;
+			isCorePriority = 0;
+		}
 	}
 }
 
@@ -2540,6 +2601,41 @@ static inline void process_packet(char *recvbufPtr, int len)
 			//udp error lost detection (jumbo to do)
 			if (len > 0 && len < 1472)
 			{
+				/* A short datagram during a transfer is one of two things, and this used to
+				 * assume the first: the transfer's final chunk, or a command the client
+				 * interleaved into the chunk stream. Only the first means the transfer ended.
+				 * Treating an interleaved CMD_AUDIO as loss abandoned a frame that was still
+				 * arriving and then fed the audio buffer the rest of it - which is what the
+				 * hundreds of [UDP_ERROR][RECONFIG ... len=3] lines were, with every NIC and
+				 * socket counter on both ends reading zero loss. Classify first, then act. */
+				const uint32_t blitWant = blitCompression ? poc->PoC_bytes_lz4_len : poc->PoC_bytes_len;
+
+				int suspendedNow = 0;
+
+				/* If the datagram is exactly as long as this frame's final chunk, read it as
+				 * that chunk arriving after a hole rather than as a command - upstream's own
+				 * discrimination, kept because it is the safer reading: acting on a bogus
+				 * CMD_AUDIO length is worse than losing one frame. */
+				if (isBlitting == 1 && cmdSuspendsBlit(recvbufPtr, len) &&
+				    (uint32_t) len != blitWant % 1472 &&
+				    poc->PoC_bytes_recv + len != blitWant)
+				{
+					suspendedNow      = 1;
+					blitSuspended     = 1;
+					blitSuspendBytes  = poc->PoC_bytes_recv;
+					blitSuspendOffset = poc->PoC_buffer_offset;
+					isBlitting        = 0;   // let the dispatch below see a command
+
+					/* recv() wrote it into the framebuffer, so lift it out before the
+					 * framebuffer pointer is reused. */
+					memcpy((char *) &recvbuf[0], recvbufPtr, len);
+					recvbufPtr = (char *) &recvbuf[0];
+
+					LOG(2, "[BLIT_SUSPEND][cmd=%d len=%d][fr=%d at %d/%d]\n", recvbufPtr[0], len,
+					    poc->PoC_frame_ddr, blitSuspendBytes,
+					    blitCompression ? poc->PoC_bytes_lz4_len : poc->PoC_bytes_len);
+				}
+
 				int prev_len = len;
 				int tota_len = 0;
 				if (isBlitting == 1 && !blitCompression && poc->PoC_bytes_recv + len != poc->PoC_bytes_len) // raw rgb
@@ -2568,7 +2664,10 @@ static inline void process_packet(char *recvbufPtr, int len)
 					prev_len = poc->PoC_bytes_audio_len % 1472;
 					tota_len = poc->PoC_bytes_audio_len;
 				}
-				if (!isBlitting)
+				/* suspendedNow already cleared isBlitting so the dispatch runs; it must not
+				 * also take the loss path below, which would drop the command (len = -1) and
+				 * clear isCorePriority out from under a transfer that is still live. */
+				if (!isBlitting && !suspendedNow)
 				{
 					isCorePriority = 0;
 					if (len != prev_len && len <= 26)
@@ -2741,6 +2840,15 @@ static inline void process_packet(char *recvbufPtr, int len)
 					// signal (UDP_ERROR/RECONFIG) is severity 0 and always logged regardless.
 					LOG(2,"command: %i (len=%d)\n", recvbufPtr[0], len);
 				}
+			}
+
+			/* An interleaved command that started no transfer of its own (CMD_GET_STATUS,
+			 * CMD_GET_VERSION) is finished with, so the suspended video blit resumes here.
+			 * CMD_AUDIO leaves isBlitting at 2 and is resumed by setBlitRawAudio instead,
+			 * once its own bytes have all arrived. */
+			if (blitSuspended && !isBlitting)
+			{
+				resumeSuspendedBlit();
 			}
 		}
 		else
