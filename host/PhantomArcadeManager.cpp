@@ -119,7 +119,7 @@ static EmulatorDef g_emus[] = {
       "15kHz 240p / 480i", NULL, NULL },
 
     { "pcsx2", L"PCSX2", "Sony PlayStation 2",
-      L"C:\\Emulators\\pcsx2\\pcsx2-qt.exe", L"C:\\Games\\PS2",
+      L"C:\\Emulators\\pcsx2\\pcsx2-qtx64.exe", L"C:\\Games\\PS2",
       L".iso,.chd,.cso,.gz,.bin",
       L"-batch -nogui \"{rom}\"",
       "15kHz 240p / 480i", NULL, NULL },
@@ -982,6 +982,8 @@ void ScanRomDirectories() {
 }
 
 std::atomic<bool> g_launchInProgress(false);
+// Set from the LAUNCH datagram: true when the core says it is sending a keyboard.
+std::atomic<bool> g_misterKeyboard(false);
 
 // Fill {rom}, {rom_stem} and {mister_ip} in an emulator's argument template.
 static std::wstring ExpandArgs(const std::wstring& tmpl, const std::wstring& rom,
@@ -1075,6 +1077,14 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
     if (romPath.empty()) romPath = roms + L"\\" + wStem;
 
     std::wstring args = ExpandArgs(emu->defArgs, romPath, wStem, misterIp);
+
+    // Cabinet keyboard, only when the core told us it is sending one. MAME is the
+    // only one of these that takes it on the command line; the rest have it in their
+    // own MiSTer settings page alongside the address.
+    if (g_misterKeyboard.load() && std::string(emu->key) == "groovymame" &&
+        args.find(L"-keyboardprovider") == std::wstring::npos) {
+        args += L" -keyboardprovider mister";
+    }
     std::wstring cmd  = L"\"" + exe + L"\" " + args;
 
     std::wstring exeDir;
@@ -1301,12 +1311,18 @@ DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
                     gameId.pop_back();
                 }
 
-                size_t dPos = gameId.find(":delay=");
-                if (dPos != std::string::npos) {
-                    gameId = gameId.substr(0, dPos);
+                // The core appends :kbd=1 when its Server > PS2 option is sending a
+                // keyboard. Only then is it safe to point MAME at -keyboardprovider
+                // mister: doing it unconditionally would take away the PC keyboard and
+                // replace it with a keyboard the core is not transmitting, leaving no
+                // input at all. Older cores send no suffix and simply get the default.
+                g_misterKeyboard.store(gameId.find(":kbd=1") != std::string::npos);
+
+                size_t sfx = gameId.find(':');
+                if (sfx != std::string::npos) {
+                    gameId = gameId.substr(0, sfx);
                 }
 
-                // Call LaunchGame directly — LaunchGame handles the single unified delayed worker thread safely
                 LaunchGame(gameId, misterClientIp);
 
                 std::string reply = "ACK:LAUNCH:OK:" + gameId;

@@ -1296,6 +1296,15 @@ extern "C" void groovy_force_close(void)
 	setClose();
 }
 
+/* Is the core transmitting a keyboard right now? (Server > PS2: Off / Keyboard /
+ * Keyboard & Mouse.) The launcher passes this to the host so it only points an emulator
+ * at the MiSTer keyboard when there is actually one coming - otherwise the emulator
+ * would drop the PC's keyboard in favour of a stream that never arrives. */
+extern "C" int groovy_ps2_inputs_enabled(void)
+{
+	return doPs2Inputs ? 1 : 0;
+}
+
 #ifdef _AF_XDP
 static void complete_tx(struct xsk_socket_info *xsk)
 {

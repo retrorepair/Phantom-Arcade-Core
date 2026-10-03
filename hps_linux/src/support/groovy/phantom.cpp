@@ -52,6 +52,7 @@ int      groovy_idle_begin(void);
 void     groovy_idle_present(const uint8_t *src);
 void     groovy_idle_end(void);
 void     groovy_force_close(void);
+int      groovy_ps2_inputs_enabled(void);
 }
 
 #define PH_INI       "/media/fat/config/phantom.ini"
@@ -459,8 +460,11 @@ static void do_launch(void)
 		return;
 	}
 
-	char msg[160];
-	snprintf(msg, sizeof(msg), "LAUNCH:%s", g->id);
+	/* The :kbd= suffix tells the host whether this core is sending a keyboard, so it
+	 * can decide whether to point the emulator at the MiSTer one. A host that does not
+	 * understand the suffix takes everything up to the first colon as the id. */
+	char msg[192];
+	snprintf(msg, sizeof(msg), "LAUNCH:%s:kbd=%d", g->id, groovy_ps2_inputs_enabled());
 	send_to(live_host, msg);
 
 	snprintf(last_id, sizeof(last_id), "%s", g->id);
