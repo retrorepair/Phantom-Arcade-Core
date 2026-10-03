@@ -8,6 +8,12 @@
 #   ./tools/build_phantom_hps.sh          # MiSTer_phantom (UDP)
 #   ./tools/build_phantom_hps.sh xdp      # also MiSTer_phantom_XDP (AF_XDP)
 #
+# RUN THIS UNDER WSL, not Git Bash:
+#   wsl -- bash -lc "cd /mnt/c/.../Phantom-Arcade-NLC-main && bash tools/build_phantom_hps.sh"
+# The toolchain is x86_64 Linux ELF, so Git Bash cannot execute it ("Exec format error")
+# and the -x test below then fails every time, re-downloading 100MB on each run and
+# extracting it without exec bits or symlinks. WSL keeps its own copy in /root/xtools.
+#
 # Toolchain: ARM's 10.2-2020.11 arm-none-linux-gnueabihf, downloaded on first run to
 # ~/xtools. The version is pinned, not incidental - 10.3 miscompiles Main_MiSTer's
 # fpga_io.cpp, where the 32-byte RBF copy loop clobbers r0-r7 while asking for four
