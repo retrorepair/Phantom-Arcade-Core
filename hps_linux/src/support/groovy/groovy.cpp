@@ -2674,11 +2674,15 @@ static inline void process_packet(char *recvbufPtr, int len)
 					{
 						memcpy((char *) &recvbuf[0], recvbufPtr, len);
 						recvbufPtr = (char *) &recvbuf[0];
-						LOG(0,"[UDP_ERROR][RECONFIG fr=%d recv=%d/%d prev_len=%d len=%d]\n", poc->PoC_frame_ddr, poc->PoC_bytes_recv, tota_len, prev_len, len);
+						/* cmd is the discriminator: a short datagram here is either a command
+						 * the client interleaved (which cmdSuspendsBlit should have absorbed
+						 * before reaching this path) or a tail chunk after a hole, and
+						 * without the opcode the two are indistinguishable in the log. */
+						LOG(0,"[UDP_ERROR][RECONFIG fr=%d recv=%d/%d prev_len=%d len=%d cmd=%d]\n", poc->PoC_frame_ddr, poc->PoC_bytes_recv, tota_len, prev_len, len, (uint8_t) recvbufPtr[0]);
 					}
 					else
 					{
-						LOG(0,"[UDP_ERROR][fr=%d recv=%d/%d len=%d]\n", poc->PoC_frame_ddr, poc->PoC_bytes_recv, tota_len, len);
+						LOG(0,"[UDP_ERROR][fr=%d recv=%d/%d len=%d cmd=%d]\n", poc->PoC_frame_ddr, poc->PoC_bytes_recv, tota_len, len, (uint8_t) recvbufPtr[0]);
 						len = -1;
 					}
 				}
