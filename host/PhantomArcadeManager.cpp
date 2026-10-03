@@ -54,26 +54,6 @@ namespace fs = std::filesystem;
 // Control IDs
 #define IDC_EDIT_MISTER_IP          101
 #define IDC_EDIT_UDP_PORT           102
-#define IDC_EDIT_GROOVYMAME_EXE     103
-#define IDC_BTN_BROWSE_MAME_EXE     104
-#define IDC_EDIT_MAME_ROMS          105
-#define IDC_BTN_BROWSE_MAME_ROMS    106
-#define IDC_EDIT_RETROARCH_EXE      107
-#define IDC_BTN_BROWSE_RA_EXE       108
-#define IDC_EDIT_RETROARCH_ROMS     109
-#define IDC_BTN_BROWSE_RA_ROMS      110
-#define IDC_EDIT_DOLPHIN_EXE        111
-#define IDC_BTN_BROWSE_DOLPHIN      112
-#define IDC_EDIT_GC_ROMS            113
-#define IDC_BTN_BROWSE_GCROMS       114
-#define IDC_EDIT_FLYCAST_EXE        115
-#define IDC_BTN_BROWSE_FLYCAST      116
-#define IDC_EDIT_NAOMI_ROMS         117
-#define IDC_BTN_BROWSE_NAOMI        118
-#define IDC_EDIT_PCSX2_EXE          119
-#define IDC_BTN_BROWSE_PCSX2        120
-#define IDC_EDIT_PS2_ROMS           121
-#define IDC_BTN_BROWSE_PS2ROMS      122
 #define IDC_BTN_SCAN_ROMS           123
 #define IDC_BTN_TEST_MISTER         124
 #define IDC_BTN_SAVE_CONFIG         125
@@ -86,13 +66,96 @@ namespace fs = std::filesystem;
 HINSTANCE hInst = NULL;
 HWND hMainWnd = NULL;
 HWND hStaticMisterIp = NULL;   // read-only: the address we discovered
-HWND hEditMameExe, hEditMameRoms;
-HWND hEditRetroarchExe, hEditRetroarchRoms;
-HWND hEditDolphinExe, hEditGcRoms;
-HWND hEditFlycastExe, hEditNaomiRoms;
-HWND hEditPcsx2Exe, hEditPs2Roms;
 HWND hStaticStatus, hListGames;
 HWND hBtnToggleDaemon, hBtnLaunchGame;
+
+// ---- the emulators -----------------------------------------------------------------
+//
+// One row here is one emulator: its UI, its config keys, its scan pass and its launch
+// command all come from this table, so adding or removing one is a single edit rather
+// than the same change made in six places.
+//
+// The set is the GroovyNLC-capable emulators from https://github.com/verbst/repositories,
+// plus GroovyMAME, which is Calamity's and is where the arcade support comes from.
+// Dolphin was dropped: there is no GroovyNLC fork of it, so a GameCube tab could only
+// ever have listed games that cannot stream.
+//
+// Only GroovyMAME takes the MiSTer's address on the command line. The rest are
+// configured in their own GUI once - xemu has Settings > MiSTer, RetroArch has
+// Settings > Groovy MiSTer, rpcs3 and pcsx2 have their own MiSTer settings pages - so
+// the launcher only has to start them with the right file.
+//
+// args placeholders: {rom} full path, {rom_stem} bare name, {mister_ip} discovered address.
+struct EmulatorDef {
+    const char*    key;       // catalog "system" value, and the config key prefix
+    const wchar_t* label;     // UI label
+    const char*    sysName;   // SYSTEM column on the cabinet
+    const wchar_t* defExe;
+    const wchar_t* defRoms;
+    const wchar_t* exts;      // lower-case, dot-prefixed, comma separated
+    const wchar_t* defArgs;
+    const char*    videoMode; // fallback only; MAME sets its own from -listxml
+    HWND           exeEdit;
+    HWND           romsEdit;
+};
+
+static EmulatorDef g_emus[] = {
+    { "groovymame", L"GroovyMAME", "GroovyMAME Arcade",
+      L"C:\\Emulators\\GroovyMAME\\groovymame64.exe", L"C:\\Emulators\\GroovyMAME\\roms",
+      L".zip,.7z,.chd",
+      L"{rom_stem} -video mister -mister_ip {mister_ip} -joystickprovider mister -skip_gameinfo -nokeepaspect",
+      "15kHz Native", NULL, NULL },
+
+    { "fbneo", L"FBNeo (Fightcade)", "FBNeo Arcade",
+      L"C:\\Emulators\\fbneo\\fcadefbneo.exe", L"C:\\Emulators\\fbneo\\ROMs",
+      L".zip,.7z",
+      L"\"{rom}\"",
+      "15kHz Native", NULL, NULL },
+
+    { "flycast", L"Flycast (Dojo)", "Sega NAOMI / Dreamcast",
+      L"C:\\Emulators\\flycast\\flycast.exe", L"C:\\Games\\Naomi",
+      L".zip,.7z,.chd,.gdi,.cdi,.cue,.lst",
+      L"\"{rom}\"",
+      "15kHz 240p / 480i", NULL, NULL },
+
+    { "pcsx2", L"PCSX2", "Sony PlayStation 2",
+      L"C:\\Emulators\\pcsx2\\pcsx2-qt.exe", L"C:\\Games\\PS2",
+      L".iso,.chd,.cso,.gz,.bin",
+      L"-batch -nogui \"{rom}\"",
+      "15kHz 240p / 480i", NULL, NULL },
+
+    { "rpcs3", L"RPCS3", "Sony PlayStation 3",
+      L"C:\\Emulators\\rpcs3\\rpcs3.exe", L"C:\\Games\\PS3",
+      L".iso,.pkg,.self,.elf,.bin",
+      L"--no-gui \"{rom}\"",
+      "480p via MiSTer settings", NULL, NULL },
+
+    { "xemu", L"xemu (Xbox)", "Microsoft Xbox",
+      L"C:\\Emulators\\xemu\\xemu.exe", L"C:\\Games\\Xbox",
+      L".iso,.xiso",
+      L"-dvd_path \"{rom}\"",
+      "15kHz 480i", NULL, NULL },
+
+    { "retroarch", L"RetroArch", "RetroArch",
+      L"C:\\Emulators\\RetroArch\\retroarch.exe", L"C:\\Games\\RetroArch",
+      L".zip,.7z,.chd,.cue,.bin,.sfc,.smc,.md,.gen,.nes,.pce,.gg,.sms,.n64,.z64",
+      L"\"{rom}\"",
+      "15kHz Dynamic", NULL, NULL },
+};
+static const int g_emuCount = (int)(sizeof(g_emus) / sizeof(g_emus[0]));
+
+// Control IDs are allocated from a base so the table stays the only place a new
+// emulator has to be mentioned.
+#define IDC_EMU_BASE 400
+#define IDC_EMU_EXE(i)        (IDC_EMU_BASE + (i) * 4 + 0)
+#define IDC_EMU_EXE_BROWSE(i) (IDC_EMU_BASE + (i) * 4 + 1)
+#define IDC_EMU_ROMS(i)       (IDC_EMU_BASE + (i) * 4 + 2)
+#define IDC_EMU_ROMS_BROWSE(i)(IDC_EMU_BASE + (i) * 4 + 3)
+
+static EmulatorDef* EmuByKey(const std::string& key) {
+    for (int i = 0; i < g_emuCount; i++) if (key == g_emus[i].key) return &g_emus[i];
+    return NULL;
+}
 
 std::atomic<bool> g_daemonRunning(false);
 std::atomic<DWORD> g_activePid(0);
@@ -235,6 +298,14 @@ std::string ToJsonString(const std::wstring& wstr) {
         else if (c == '\t') out += "\\t";
         else out += c;
     }
+    return out;
+}
+
+// The extension lists in g_emus are plain ASCII, so a narrowing copy is enough.
+static std::string WstringToString(const std::wstring& w) {
+    std::string out;
+    out.reserve(w.size());
+    for (wchar_t c : w) out.push_back((c < 128) ? (char)c : '?');
     return out;
 }
 
@@ -390,52 +461,24 @@ void LoadConfiguration() {
     g_udpPort = ExtractJsonInt(json, "udp_port", RegReadInt(L"udp_port", PHANTOM_DEFAULT_PORT));
     if (g_udpPort <= 0 || g_udpPort > 65535) g_udpPort = PHANTOM_DEFAULT_PORT;
 
-    // 3. GroovyMAME Executable & ROMs
-    std::string mameExe = ExtractJsonString(json, "mame_exe");
-    if (mameExe.empty()) mameExe = ExtractJsonString(json, "exe");
-    std::wstring wMameExe = mameExe.empty() ? RegReadString(L"mame_exe", L"C:\\Emulators\\GroovyMAME\\groovymame64.exe") : StringToWstring(mameExe);
-    SetWindowText(hEditMameExe, wMameExe.c_str());
+    // 3. Emulator paths, straight off the table.
+    for (int i = 0; i < g_emuCount; i++) {
+        EmulatorDef& e = g_emus[i];
+        std::string kExe  = std::string(e.key) + "_exe";
+        std::string kRoms = std::string(e.key) + "_roms";
 
-    std::string mameRoms = ExtractJsonString(json, "mame_roms");
-    if (mameRoms.empty()) mameRoms = ExtractJsonString(json, "roms");
-    std::wstring wMameRoms = mameRoms.empty() ? RegReadString(L"mame_roms", L"C:\\Emulators\\GroovyMAME\\roms") : StringToWstring(mameRoms);
-    SetWindowText(hEditMameRoms, wMameRoms.c_str());
+        std::string jExe = ExtractJsonString(json, kExe.c_str());
+        std::wstring wExe = jExe.empty()
+            ? RegReadString(StringToWstring(kExe).c_str(), e.defExe)
+            : StringToWstring(jExe);
+        SetWindowText(e.exeEdit, wExe.c_str());
 
-    // 4. RetroArch
-    std::string raExe = ExtractJsonString(json, "retroarch_exe");
-    std::wstring wRaExe = raExe.empty() ? RegReadString(L"retroarch_exe", L"C:\\Emulators\\RetroArch\\retroarch.exe") : StringToWstring(raExe);
-    SetWindowText(hEditRetroarchExe, wRaExe.c_str());
-
-    std::string raRoms = ExtractJsonString(json, "retroarch_roms");
-    std::wstring wRaRoms = raRoms.empty() ? RegReadString(L"retroarch_roms", L"C:\\Games\\RetroArch\\roms") : StringToWstring(raRoms);
-    SetWindowText(hEditRetroarchRoms, wRaRoms.c_str());
-
-    // 5. Dolphin
-    std::string dolphinExe = ExtractJsonString(json, "dolphin_exe");
-    std::wstring wDolphinExe = dolphinExe.empty() ? RegReadString(L"dolphin_exe", L"C:\\Emulators\\Dolphin\\Dolphin.exe") : StringToWstring(dolphinExe);
-    SetWindowText(hEditDolphinExe, wDolphinExe.c_str());
-
-    std::string dolphinRoms = ExtractJsonString(json, "dolphin_roms");
-    std::wstring wDolphinRoms = dolphinRoms.empty() ? RegReadString(L"dolphin_roms", L"C:\\Games\\GameCube") : StringToWstring(dolphinRoms);
-    SetWindowText(hEditGcRoms, wDolphinRoms.c_str());
-
-    // 6. Flycast
-    std::string flycastExe = ExtractJsonString(json, "flycast_exe");
-    std::wstring wFlycastExe = flycastExe.empty() ? RegReadString(L"flycast_exe", L"C:\\Emulators\\Flycast\\flycast.exe") : StringToWstring(flycastExe);
-    SetWindowText(hEditFlycastExe, wFlycastExe.c_str());
-
-    std::string flycastRoms = ExtractJsonString(json, "flycast_roms");
-    std::wstring wFlycastRoms = flycastRoms.empty() ? RegReadString(L"flycast_roms", L"C:\\Games\\Arcade\\Naomi") : StringToWstring(flycastRoms);
-    SetWindowText(hEditNaomiRoms, wFlycastRoms.c_str());
-
-    // 7. PCSX2
-    std::string pcsx2Exe = ExtractJsonString(json, "pcsx2_exe");
-    std::wstring wPcsx2Exe = pcsx2Exe.empty() ? RegReadString(L"pcsx2_exe", L"C:\\Emulators\\PCSX2\\pcsx2-qt.exe") : StringToWstring(pcsx2Exe);
-    SetWindowText(hEditPcsx2Exe, wPcsx2Exe.c_str());
-
-    std::string pcsx2Roms = ExtractJsonString(json, "pcsx2_roms");
-    std::wstring wPcsx2Roms = pcsx2Roms.empty() ? RegReadString(L"pcsx2_roms", L"C:\\Games\\PS2") : StringToWstring(pcsx2Roms);
-    SetWindowText(hEditPs2Roms, wPcsx2Roms.c_str());
+        std::string jRoms = ExtractJsonString(json, kRoms.c_str());
+        std::wstring wRoms = jRoms.empty()
+            ? RegReadString(StringToWstring(kRoms).c_str(), e.defRoms)
+            : StringToWstring(jRoms);
+        SetWindowText(e.romsEdit, wRoms.c_str());
+    }
 
     SetWindowText(hStaticStatus, L"Status: Configuration loaded from disk and registry.");
 }
@@ -444,35 +487,18 @@ void LoadConfiguration() {
 void SaveConfiguration() {
     std::wstring misterIp = GetLearnedMisterIp();
     int port = GetPort();
-    std::wstring mameExe = GetText(hEditMameExe);
-    std::wstring mameRoms = GetText(hEditMameRoms);
-    std::wstring raExe = GetText(hEditRetroarchExe);
-    std::wstring raRoms = GetText(hEditRetroarchRoms);
-    std::wstring dolphinExe = GetText(hEditDolphinExe);
-    std::wstring dolphinRoms = GetText(hEditGcRoms);
-    std::wstring flycastExe = GetText(hEditFlycastExe);
-    std::wstring flycastRoms = GetText(hEditNaomiRoms);
-    std::wstring pcsx2Exe = GetText(hEditPcsx2Exe);
-    std::wstring pcsx2Roms = GetText(hEditPs2Roms);
-
-    // Save to Windows Registry
-    RegWriteString(L"mister_client_ip", misterIp);
-    RegWriteInt(L"udp_port", port);
-
-    RegWriteString(L"mame_exe", mameExe);
-    RegWriteString(L"mame_roms", mameRoms);
-    RegWriteString(L"retroarch_exe", raExe);
-    RegWriteString(L"retroarch_roms", raRoms);
-    RegWriteString(L"dolphin_exe", dolphinExe);
-    RegWriteString(L"dolphin_roms", dolphinRoms);
-    RegWriteString(L"flycast_exe", flycastExe);
-    RegWriteString(L"flycast_roms", flycastRoms);
-    RegWriteString(L"pcsx2_exe", pcsx2Exe);
-    RegWriteString(L"pcsx2_roms", pcsx2Roms);
-
-    // Save to JSON in application directory
+    // Everything emulator-shaped comes off the table, so a new one needs no change here.
     std::wstring cfgPath = GetConfigPath();
     std::ofstream out; out.open(cfgPath.c_str());
+
+    RegWriteString(L"mister_client_ip", misterIp);
+    RegWriteInt(L"udp_port", port);
+    for (int i = 0; i < g_emuCount; i++) {
+        EmulatorDef& e = g_emus[i];
+        RegWriteString(StringToWstring(std::string(e.key) + "_exe").c_str(),  GetText(e.exeEdit).c_str());
+        RegWriteString(StringToWstring(std::string(e.key) + "_roms").c_str(), GetText(e.romsEdit).c_str());
+    }
+
     if (out.is_open()) {
         out << "{\n";
         out << "  \"server\": {\n";
@@ -482,48 +508,22 @@ void SaveConfiguration() {
         out << "    \"mister_client_ip\": \"" << ToJsonString(misterIp) << "\"\n";
         out << "  },\n";
         out << "  \"paths\": {\n";
-        out << "    \"mame_exe\": \"" << ToJsonString(mameExe) << "\",\n";
-        out << "    \"mame_roms\": \"" << ToJsonString(mameRoms) << "\",\n";
-        out << "    \"retroarch_exe\": \"" << ToJsonString(raExe) << "\",\n";
-        out << "    \"retroarch_roms\": \"" << ToJsonString(raRoms) << "\",\n";
-        out << "    \"dolphin_exe\": \"" << ToJsonString(dolphinExe) << "\",\n";
-        out << "    \"dolphin_roms\": \"" << ToJsonString(dolphinRoms) << "\",\n";
-        out << "    \"flycast_exe\": \"" << ToJsonString(flycastExe) << "\",\n";
-        out << "    \"flycast_roms\": \"" << ToJsonString(flycastRoms) << "\",\n";
-        out << "    \"pcsx2_exe\": \"" << ToJsonString(pcsx2Exe) << "\",\n";
-        out << "    \"pcsx2_roms\": \"" << ToJsonString(pcsx2Roms) << "\"\n";
+        for (int i = 0; i < g_emuCount; i++) {
+            EmulatorDef& e = g_emus[i];
+            out << "    \"" << e.key << "_exe\": \""  << ToJsonString(GetText(e.exeEdit))  << "\",\n";
+            out << "    \"" << e.key << "_roms\": \"" << ToJsonString(GetText(e.romsEdit)) << "\""
+                << (i + 1 < g_emuCount ? "," : "") << "\n";
+        }
         out << "  },\n";
         out << "  \"emulators\": {\n";
-        out << "    \"groovymame\": {\n";
-        out << "      \"exe\": \"" << ToJsonString(mameExe) << "\",\n";
-        out << "      \"roms\": \"" << ToJsonString(mameRoms) << "\",\n";
-        out << "      \"args\": \"\\\"{rom_stem}\\\" -video mister -skip_gameinfo -nokeepaspect\",\n";
-        out << "      \"pipeline\": \"Groovy_MiSTer SwitchRes 15kHz Direct\"\n";
-        out << "    },\n";
-        out << "    \"retroarch\": {\n";
-        out << "      \"exe\": \"" << ToJsonString(raExe) << "\",\n";
-        out << "      \"roms\": \"" << ToJsonString(raRoms) << "\",\n";
-        out << "      \"args\": \"-f \\\"{rom}\\\"\",\n";
-        out << "      \"pipeline\": \"RetroArch CRT SwitchRes 15kHz\"\n";
-        out << "    },\n";
-        out << "    \"dolphin\": {\n";
-        out << "      \"exe\": \"" << ToJsonString(dolphinExe) << "\",\n";
-        out << "      \"roms\": \"" << ToJsonString(dolphinRoms) << "\",\n";
-        out << "      \"args\": \"-b -e \\\"{rom}\\\"\",\n";
-        out << "      \"pipeline\": \"Groovy_MiSTer 480i/240p\"\n";
-        out << "    },\n";
-        out << "    \"flycast\": {\n";
-        out << "      \"exe\": \"" << ToJsonString(flycastExe) << "\",\n";
-        out << "      \"roms\": \"" << ToJsonString(flycastRoms) << "\",\n";
-        out << "      \"args\": \"\\\"{rom}\\\"\",\n";
-        out << "      \"pipeline\": \"SwitchRes Direct 15kHz\"\n";
-        out << "    },\n";
-        out << "    \"pcsx2\": {\n";
-        out << "      \"exe\": \"" << ToJsonString(pcsx2Exe) << "\",\n";
-        out << "      \"roms\": \"" << ToJsonString(pcsx2Roms) << "\",\n";
-        out << "      \"args\": \"-batch -nogui \\\"{rom}\\\"\",\n";
-        out << "      \"pipeline\": \"PCSX2 CRT 240p/480i\"\n";
-        out << "    }\n";
+        for (int i = 0; i < g_emuCount; i++) {
+            EmulatorDef& e = g_emus[i];
+            out << "    \"" << e.key << "\": {\n";
+            out << "      \"exe\": \""  << ToJsonString(GetText(e.exeEdit))  << "\",\n";
+            out << "      \"roms\": \"" << ToJsonString(GetText(e.romsEdit)) << "\",\n";
+            out << "      \"args\": \"" << ToJsonString(e.defArgs) << "\"\n";
+            out << "    }" << (i + 1 < g_emuCount ? "," : "") << "\n";
+        }
         out << "  }\n";
         out << "}\n";
         out.close();
@@ -830,22 +830,21 @@ void ScanRomDirectories() {
         std::string system;
         std::string systemName;
         std::string videoMode;
-        std::string resolution;
+        std::wstring exts;
     };
 
-    std::vector<ScanTarget> targets = {
-        { GetText(hEditMameRoms), "groovymame", "GroovyMAME Arcade", "15kHz 240p Native", "Dynamic SwitchRes" },
-        { GetText(hEditRetroarchRoms), "retroarch", "RetroArch SwitchRes", "15kHz 240p Dynamic", "Dynamic SwitchRes" },
-        { GetText(hEditGcRoms), "dolphin", "GameCube / Wii", "15kHz 480i @ 60Hz", "640x480i" },
-        { GetText(hEditNaomiRoms), "flycast", "Sega Naomi / DC Arcade", "15kHz 240p / 480i", "640x480" },
-        { GetText(hEditPs2Roms), "pcsx2", "Sony PlayStation 2", "15kHz 240p / 480i", "640x224" }
-    };
+    std::vector<ScanTarget> targets;
+    for (int i = 0; i < g_emuCount; i++) {
+        EmulatorDef& e = g_emus[i];
+        targets.push_back({ GetText(e.romsEdit), e.key, e.sysName, e.videoMode, e.exts });
+    }
 
     // Ask MAME for its own names once, so arcade entries list "Battle Garegga (Korea)"
     // rather than "bgaregga". Empty if MAME is not configured, in which case titles fall
     // back to the ROM stem.
     SetWindowText(hStaticStatus, L"Status: Reading MAME's game list...");
-    std::wstring mameExeForScan = GetText(hEditMameExe);
+    EmulatorDef* mameDef = EmuByKey("groovymame");
+    std::wstring mameExeForScan = mameDef ? GetText(mameDef->exeEdit) : L"";
     std::map<std::string, std::string> mameTitles = LoadMameTitles(mameExeForScan);
 
     // Ask MAME which of the arcade sets on disk will actually start, before listing any
@@ -854,7 +853,7 @@ void ScanRomDirectories() {
     std::map<std::string, MameMeta> mameMeta;
     {
         std::vector<std::string> stems;
-        std::wstring mameRoms = GetText(hEditMameRoms);
+        std::wstring mameRoms = mameDef ? GetText(mameDef->romsEdit) : L"";
         if (!mameRoms.empty() && fs::exists(mameRoms)) {
             try {
                 for (const auto& e : fs::directory_iterator(mameRoms)) {
@@ -887,8 +886,14 @@ void ScanRomDirectories() {
                     auto ext = entry.path().extension().string();
                     for (auto& c : ext) c = tolower(c);
 
-                    if (ext == ".zip" || ext == ".7z" || ext == ".iso" || ext == ".chd" || 
-                        ext == ".cso" || ext == ".elf" || ext == ".cue" || ext == ".sfc" || ext == ".md") {
+                    // Each emulator declares the extensions it can open, so a PS2 iso
+                    // does not end up listed under xemu and vice versa.
+                    std::string exts = WstringToString(target.exts);
+                    bool wanted = (!ext.empty() &&
+                                   (exts.find(ext + ",") != std::string::npos ||
+                                    (exts.size() >= ext.size() &&
+                                     exts.compare(exts.size() - ext.size(), ext.size(), ext) == 0)));
+                    if (wanted) {
                         std::string filename = entry.path().filename().string();
                         std::string stem = entry.path().stem().string();
                         // Leave out arcade sets MAME will not start - they would sit in
@@ -953,7 +958,7 @@ void ScanRomDirectories() {
                         catOut << "      \"videoMode\": \"" << JsonEscape(videoMode) << "\",\n";
                         catOut << "      \"year\": \"" << JsonEscape(year) << "\",\n";
                         catOut << "      \"manufacturer\": \"" << JsonEscape(maker) << "\",\n";
-                        catOut << "      \"resolution\": \"" << target.resolution << "\"\n";
+                        catOut << "      \"resolution\": \"" << JsonEscape(videoMode) << "\"\n";
                         catOut << "    }";
                         totalFound++;
                     }
@@ -978,7 +983,27 @@ void ScanRomDirectories() {
 
 std::atomic<bool> g_launchInProgress(false);
 
-// Internal helper that actually spawns GroovyMAME / RetroArch after delay
+// Fill {rom}, {rom_stem} and {mister_ip} in an emulator's argument template.
+static std::wstring ExpandArgs(const std::wstring& tmpl, const std::wstring& rom,
+                               const std::wstring& stem, const std::wstring& misterIp) {
+    std::wstring out = tmpl;
+    struct { const wchar_t* tag; const std::wstring& val; } subs[] = {
+        { L"{rom_stem}",  stem },
+        { L"{rom}",       rom },
+        { L"{mister_ip}", misterIp },
+    };
+    for (auto& s : subs) {
+        size_t at;
+        while ((at = out.find(s.tag)) != std::wstring::npos)
+            out.replace(at, wcslen(s.tag), s.val);
+    }
+    return out;
+}
+
+// Start the emulator a catalog id belongs to.
+//
+// The id is "<emulator key>_<rom stem>", which is how the cabinet's choice maps back to
+// a row of g_emus without the launcher needing to know anything about the emulator.
 bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetMisterIp) {
     g_launchInProgress.store(false); // Reset guard once launched
 
@@ -993,141 +1018,112 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
     }
 
     std::wstring misterIp = targetMisterIp.empty() ? GetLearnedMisterIp() : targetMisterIp;
-    if (misterIp.empty()) misterIp = L"192.168.1.50";
     int port = GetPort();
 
-    std::wstring mameExe = GetText(hEditMameExe);
-    std::wstring mameRoms = GetText(hEditMameRoms);
-
-    std::string stem = gameId;
-    if (stem.rfind("groovymame_", 0) == 0) {
-        stem = stem.substr(11);
-    }
-
-    // Determine directory of MAME executable
-    std::wstring mameDir = L"";
-    size_t slashPos = mameExe.find_last_of(L"\\/");
-    if (slashPos != std::wstring::npos) {
-        mameDir = mameExe.substr(0, slashPos);
-    }
-
-    // If gameId indicates RetroArch
-    if (gameId.rfind("retroarch_", 0) == 0) {
-        std::wstring raExe = GetText(hEditRetroarchExe);
-        std::wstring raRoms = GetText(hEditRetroarchRoms);
-        std::string raStem = gameId.substr(10);
-        std::wstring romFile = raRoms + L"\\" + StringToWstring(raStem) + L".zip";
-        std::wstring cmd = L"\"" + raExe + L"\" -f \"" + romFile + L"\"";
-
-        STARTUPINFO si = { sizeof(si) };
-        PROCESS_INFORMATION pi = { 0 };
-        std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
-        cmdBuf.push_back(0);
-
-        if (CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, FALSE, CREATE_NEW_CONSOLE | NORMAL_PRIORITY_CLASS, NULL, NULL, &si, &pi)) {
-            g_activePid = pi.dwProcessId;
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            SetWindowText(hStaticStatus, (L"Status: RetroArch launched (" + StringToWstring(raStem) + L")").c_str());
-            return true;
+    // split "<key>_<stem>"
+    EmulatorDef* emu = NULL;
+    std::string stem;
+    for (int i = 0; i < g_emuCount; i++) {
+        std::string prefix = std::string(g_emus[i].key) + "_";
+        if (gameId.rfind(prefix, 0) == 0) {
+            emu = &g_emus[i];
+            stem = gameId.substr(prefix.size());
+            break;
         }
     }
+    if (!emu) {
+        SetWindowText(hStaticStatus,
+                      (L"Status: [FAILED] no emulator for id " + StringToWstring(gameId)).c_str());
+        return false;
+    }
 
-    // -mister_ip is what tells GroovyMAME where to send the frames. Without it the game
-    // starts on the PC, renders happily, and streams to nothing: the MiSTer sits on the
-    // launcher and eventually gives up. It was dropped from here once as a "legacy
-    // argument", which also broke launching MAME by hand for anyone whose mame.ini had
-    // no mister_ip set.
-    //
-    // The address is the one the launch request arrived from, so a cabinet on DHCP needs
-    // nothing typed in anywhere; the GUI field is only the fallback for a manual launch.
-    // -joystickprovider mister is what makes the cabinet's controls reach the game. The
-    // core forwards pad state on UDP 32101 (its Server > Joysticks option, Digital or
-    // Analog), but MAME only reads it when told to; with the default provider it polls
-    // the PC's own devices instead, so a stick plugged into the MiSTer does nothing and
-    // only a keyboard attached to the PC works.
-    //
-    // -keyboardprovider is deliberately NOT set to mister. That one depends on the
-    // core's Server > PS2 option, which is Off by default, and switching MAME over to a
-    // keyboard the core is not sending would take away the working PC keyboard and
-    // leave no input at all. Turn PS2 on in the OSD first if you want cabinet keys.
+    std::wstring exe  = GetText(emu->exeEdit);
+    std::wstring roms = GetText(emu->romsEdit);
+    if (exe.empty()) {
+        SetWindowText(hStaticStatus,
+                      (std::wstring(L"Status: [FAILED] no executable set for ") + emu->label).c_str());
+        return false;
+    }
+
+    // Only GroovyMAME needs the address on the command line; the others are told once in
+    // their own Settings > MiSTer page. Passing it to them would be an unknown option.
+    if (misterIp.empty() && std::string(emu->key) == "groovymame") {
+        SetWindowText(hStaticStatus,
+                      L"Status: [FAILED] no MiSTer has been seen yet, so there is no address to stream to.");
+        return false;
+    }
+
+    // Find the ROM on disk. The scan recorded the stem, not the extension, so the
+    // emulator's own extension list is walked to find what is actually there.
     std::wstring wStem = StringToWstring(stem);
-    std::wstring misterArgs = L" -video mister -mister_ip " + misterIp +
-                              L" -joystickprovider mister -skip_gameinfo -nokeepaspect";
-    std::wstring cmd = L"\"" + mameExe + L"\" " + wStem + misterArgs;
+    std::wstring romPath;
+    {
+        std::wstring exts = emu->exts;
+        size_t at = 0;
+        while (at <= exts.size()) {
+            size_t comma = exts.find(L',', at);
+            std::wstring ext = exts.substr(at, (comma == std::wstring::npos ? exts.size() : comma) - at);
+            if (!ext.empty()) {
+                std::wstring cand = roms + L"\\" + wStem + ext;
+                if (fs::exists(cand)) { romPath = cand; break; }
+            }
+            if (comma == std::wstring::npos) break;
+            at = comma + 1;
+        }
+    }
+    // GroovyMAME takes the set name, not a path, so a missing file is not fatal for it.
+    if (romPath.empty()) romPath = roms + L"\\" + wStem;
+
+    std::wstring args = ExpandArgs(emu->defArgs, romPath, wStem, misterIp);
+    std::wstring cmd  = L"\"" + exe + L"\" " + args;
+
+    std::wstring exeDir;
+    size_t slashPos = exe.find_last_of(L"\\/");
+    if (slashPos != std::wstring::npos) exeDir = exe.substr(0, slashPos);
 
     STARTUPINFO si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
     std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
     cmdBuf.push_back(0);
 
-    BOOL ok = CreateProcessW(
-        NULL,
-        cmdBuf.data(),
-        NULL,
-        NULL,
-        FALSE,
-        CREATE_NEW_CONSOLE | NORMAL_PRIORITY_CLASS,
-        NULL,
-        mameDir.empty() ? NULL : mameDir.c_str(),
-        &si,
-        &pi
-    );
+    BOOL ok = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, FALSE,
+                             CREATE_NEW_CONSOLE | NORMAL_PRIORITY_CLASS, NULL,
+                             exeDir.empty() ? NULL : exeDir.c_str(), &si, &pi);
 
     if (!ok) {
-        // Fallback: try launching with just "mame" using system PATH
-        std::wstring fallbackCmd = L"mame " + wStem + misterArgs;
-        std::vector<wchar_t> fbBuf(fallbackCmd.begin(), fallbackCmd.end());
-        fbBuf.push_back(0);
-        ok = CreateProcessW(
-            NULL,
-            fbBuf.data(),
-            NULL,
-            NULL,
-            FALSE,
-            CREATE_NEW_CONSOLE | NORMAL_PRIORITY_CLASS,
-            NULL,
-            NULL,
-            &si,
-            &pi
-        );
-    }
-
-    if (ok) {
-        g_activePid = pi.dwProcessId;
-        CloseHandle(pi.hThread);
-
-        // Spawning successfully is not the same as running. MAME exits within a second
-        // or two when it cannot find or run the set - a ROM that is missing, a parent
-        // romset, or an entry that is not a playable game at all (plenty of things in a
-        // roms folder are devices or unsupported drivers). That used to look exactly
-        // like a core or network fault from the cabinet: the launcher sat on "starting
-        // stream" and eventually gave up with nothing to say. This waits long enough to
-        // catch that case and reports it.
-        //
-        // We are on the launch worker thread, so blocking here costs nothing.
-        DWORD waited = WaitForSingleObject(pi.hProcess, 6000);
-        if (waited == WAIT_OBJECT_0) {
-            DWORD code = 0;
-            GetExitCodeProcess(pi.hProcess, &code);
-            CloseHandle(pi.hProcess);
-            g_activePid = 0;
-            std::wstring stat = L"Status: [FAILED] " + wStem + L" exited immediately (code " +
-                                std::to_wstring(code) + L"). ROM missing, or not a playable set?";
-            SetWindowText(hStaticStatus, stat.c_str());
-            return false;
-        }
-        CloseHandle(pi.hProcess);
-
-        std::wstring stat = L"Status: [RUNNING] GroovyMAME (" + wStem + L") -> Streaming to MiSTer (" + misterIp + L":" + std::to_wstring(port) + L")";
-        SetWindowText(hStaticStatus, stat.c_str());
-        return true;
-    } else {
         DWORD err = GetLastError();
-        std::wstring stat = L"Status: Could not launch MAME (Error " + std::to_wstring(err) + L"). Check MAME executable path!";
+        std::wstring stat = std::wstring(L"Status: Could not start ") + emu->label +
+                            L" (Error " + std::to_wstring(err) + L"). Check the executable path.";
         SetWindowText(hStaticStatus, stat.c_str());
         return false;
     }
+
+    g_activePid = pi.dwProcessId;
+    CloseHandle(pi.hThread);
+
+    // Spawning successfully is not the same as running. Emulators exit within a second
+    // or two when they cannot open what they were given - a missing or incomplete set,
+    // or a file they do not support. That used to look exactly like a core or network
+    // fault from the cabinet: the launcher sat on "starting stream" and eventually gave
+    // up with nothing to say. We are on the launch worker thread, so waiting is free.
+    DWORD waited = WaitForSingleObject(pi.hProcess, 6000);
+    if (waited == WAIT_OBJECT_0) {
+        DWORD code = 0;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess);
+        g_activePid = 0;
+        std::wstring stat = std::wstring(L"Status: [FAILED] ") + wStem + L" exited immediately (code " +
+                            std::to_wstring(code) + L"). Missing ROM, or not a playable set?";
+        SetWindowText(hStaticStatus, stat.c_str());
+        return false;
+    }
+    CloseHandle(pi.hProcess);
+
+    std::wstring stat = std::wstring(L"Status: [RUNNING] ") + emu->label + L" (" + wStem +
+                        L") -> streaming to MiSTer " + (misterIp.empty() ? L"(set in emulator)" : misterIp) +
+                        L":" + std::to_wstring(port);
+    SetWindowText(hStaticStatus, stat.c_str());
+    return true;
 }
 
 struct LaunchTaskParams {
@@ -1398,60 +1394,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                       hWnd, NULL, hInst, NULL);
 
 
-        // 1. GroovyMAME
-        y += 32;
-        CreateWindow(L"STATIC", L"GroovyMAME Executable:", WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
-        hEditMameExe = CreateWindow(L"EDIT", L"C:\\Emulators\\GroovyMAME\\groovymame64.exe", WS_CHILD | WS_VISIBLE | WS_BORDER, 195, y, 350, 22, hWnd, (HMENU)IDC_EDIT_GROOVYMAME_EXE, hInst, NULL);
-        CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE, 555, y, 85, 22, hWnd, (HMENU)IDC_BTN_BROWSE_MAME_EXE, hInst, NULL);
+        // One pair of rows per emulator, generated from g_emus.
+        for (int i = 0; i < g_emuCount; i++) {
+            EmulatorDef& e = g_emus[i];
 
-        y += 26;
-        CreateWindow(L"STATIC", L"GroovyMAME ROMs Folder:", WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
-        hEditMameRoms = CreateWindow(L"EDIT", L"C:\\Emulators\\GroovyMAME\\roms", WS_CHILD | WS_VISIBLE | WS_BORDER, 195, y, 350, 22, hWnd, (HMENU)IDC_EDIT_MAME_ROMS, hInst, NULL);
-        CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE, 555, y, 85, 22, hWnd, (HMENU)IDC_BTN_BROWSE_MAME_ROMS, hInst, NULL);
+            y += 32;
+            std::wstring exeLabel = std::wstring(e.label) + L" Executable:";
+            CreateWindow(L"STATIC", exeLabel.c_str(), WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
+            e.exeEdit = CreateWindow(L"EDIT", e.defExe, WS_CHILD | WS_VISIBLE | WS_BORDER,
+                                     195, y, 350, 22, hWnd, (HMENU)(INT_PTR)IDC_EMU_EXE(i), hInst, NULL);
+            CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE,
+                         555, y, 85, 22, hWnd, (HMENU)(INT_PTR)IDC_EMU_EXE_BROWSE(i), hInst, NULL);
 
-        // 2. RetroArch
-        y += 32;
-        CreateWindow(L"STATIC", L"RetroArch Executable:", WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
-        hEditRetroarchExe = CreateWindow(L"EDIT", L"C:\\Emulators\\RetroArch\\retroarch.exe", WS_CHILD | WS_VISIBLE | WS_BORDER, 195, y, 350, 22, hWnd, (HMENU)IDC_EDIT_RETROARCH_EXE, hInst, NULL);
-        CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE, 555, y, 85, 22, hWnd, (HMENU)IDC_BTN_BROWSE_RA_EXE, hInst, NULL);
-
-        y += 26;
-        CreateWindow(L"STATIC", L"RetroArch ROMs Folder:", WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
-        hEditRetroarchRoms = CreateWindow(L"EDIT", L"C:\\Games\\RetroArch\\roms", WS_CHILD | WS_VISIBLE | WS_BORDER, 195, y, 350, 22, hWnd, (HMENU)IDC_EDIT_RETROARCH_ROMS, hInst, NULL);
-        CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE, 555, y, 85, 22, hWnd, (HMENU)IDC_BTN_BROWSE_RA_ROMS, hInst, NULL);
-
-        // 3. Dolphin
-        y += 32;
-        CreateWindow(L"STATIC", L"Dolphin Executable:", WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
-        hEditDolphinExe = CreateWindow(L"EDIT", L"C:\\Emulators\\Dolphin\\Dolphin.exe", WS_CHILD | WS_VISIBLE | WS_BORDER, 195, y, 350, 22, hWnd, (HMENU)IDC_EDIT_DOLPHIN_EXE, hInst, NULL);
-        CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE, 555, y, 85, 22, hWnd, (HMENU)IDC_BTN_BROWSE_DOLPHIN, hInst, NULL);
-
-        y += 26;
-        CreateWindow(L"STATIC", L"GameCube/Wii ROMs:", WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
-        hEditGcRoms = CreateWindow(L"EDIT", L"C:\\Games\\GameCube", WS_CHILD | WS_VISIBLE | WS_BORDER, 195, y, 350, 22, hWnd, (HMENU)IDC_EDIT_GC_ROMS, hInst, NULL);
-        CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE, 555, y, 85, 22, hWnd, (HMENU)IDC_BTN_BROWSE_GCROMS, hInst, NULL);
-
-        // 4. Flycast
-        y += 32;
-        CreateWindow(L"STATIC", L"Flycast Executable:", WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
-        hEditFlycastExe = CreateWindow(L"EDIT", L"C:\\Emulators\\Flycast\\flycast.exe", WS_CHILD | WS_VISIBLE | WS_BORDER, 195, y, 350, 22, hWnd, (HMENU)IDC_EDIT_FLYCAST_EXE, hInst, NULL);
-        CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE, 555, y, 85, 22, hWnd, (HMENU)IDC_BTN_BROWSE_FLYCAST, hInst, NULL);
-
-        y += 26;
-        CreateWindow(L"STATIC", L"Naomi/Arcade ROMs:", WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
-        hEditNaomiRoms = CreateWindow(L"EDIT", L"C:\\Games\\Arcade\\Naomi", WS_CHILD | WS_VISIBLE | WS_BORDER, 195, y, 350, 22, hWnd, (HMENU)IDC_EDIT_NAOMI_ROMS, hInst, NULL);
-        CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE, 555, y, 85, 22, hWnd, (HMENU)IDC_BTN_BROWSE_NAOMI, hInst, NULL);
-
-        // 5. PCSX2
-        y += 32;
-        CreateWindow(L"STATIC", L"PCSX2 Executable (Opt):", WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
-        hEditPcsx2Exe = CreateWindow(L"EDIT", L"C:\\Emulators\\PCSX2\\pcsx2-qt.exe", WS_CHILD | WS_VISIBLE | WS_BORDER, 195, y, 350, 22, hWnd, (HMENU)IDC_EDIT_PCSX2_EXE, hInst, NULL);
-        CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE, 555, y, 85, 22, hWnd, (HMENU)IDC_BTN_BROWSE_PCSX2, hInst, NULL);
-
-        y += 26;
-        CreateWindow(L"STATIC", L"PS2 ROMs Folder:", WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
-        hEditPs2Roms = CreateWindow(L"EDIT", L"C:\\Games\\PS2", WS_CHILD | WS_VISIBLE | WS_BORDER, 195, y, 350, 22, hWnd, (HMENU)IDC_EDIT_PS2_ROMS, hInst, NULL);
-        CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE, 555, y, 85, 22, hWnd, (HMENU)IDC_BTN_BROWSE_PS2ROMS, hInst, NULL);
+            y += 26;
+            std::wstring romLabel = std::wstring(e.label) + L" ROMs Folder:";
+            CreateWindow(L"STATIC", romLabel.c_str(), WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
+            e.romsEdit = CreateWindow(L"EDIT", e.defRoms, WS_CHILD | WS_VISIBLE | WS_BORDER,
+                                      195, y, 350, 22, hWnd, (HMENU)(INT_PTR)IDC_EMU_ROMS(i), hInst, NULL);
+            CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE,
+                         555, y, 85, 22, hWnd, (HMENU)(INT_PTR)IDC_EMU_ROMS_BROWSE(i), hInst, NULL);
+        }
 
         // Action Buttons Row
         y += 36;
@@ -1495,87 +1457,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
 
+        // Browse buttons for every emulator row, resolved back to the table by id.
+        // Ahead of the switch because the ids are a computed range, not constants.
+        if (wmId >= IDC_EMU_BASE && wmId < IDC_EMU_BASE + g_emuCount * 4) {
+            int idx = (wmId - IDC_EMU_BASE) / 4;
+            int which = (wmId - IDC_EMU_BASE) % 4;
+            EmulatorDef& e = g_emus[idx];
+            if (which == 1) {
+                // a Win32 filter needs embedded NULs, so it has to be a literal, not a concat
+                auto path = BrowseFile(hWnd, L"Executable (*.exe)\0*.exe\0All Files (*.*)\0*.*\0");
+                if (!path.empty()) { SetWindowText(e.exeEdit, path.c_str()); SaveConfiguration(); }
+            } else if (which == 3) {
+                std::wstring title = std::wstring(L"Select ") + e.label + L" ROMs Folder";
+                auto path = BrowseFolder(hWnd, title.c_str());
+                if (!path.empty()) { SetWindowText(e.romsEdit, path.c_str()); SaveConfiguration(); }
+            }
+            break;
+        }
+
         switch (wmId) {
-        case IDC_BTN_BROWSE_MAME_EXE: {
-            auto path = BrowseFile(hWnd, L"GroovyMAME Executable (*.exe)\0*.exe\0All Files (*.*)\0*.*\0");
-            if (!path.empty()) {
-                SetWindowText(hEditMameExe, path.c_str());
-                SaveConfiguration();
-            }
-            break;
-        }
-        case IDC_BTN_BROWSE_MAME_ROMS: {
-            auto path = BrowseFolder(hWnd, L"Select GroovyMAME ROMs Folder");
-            if (!path.empty()) {
-                SetWindowText(hEditMameRoms, path.c_str());
-                SaveConfiguration();
-            }
-            break;
-        }
-        case IDC_BTN_BROWSE_RA_EXE: {
-            auto path = BrowseFile(hWnd, L"RetroArch Executable (retroarch.exe)\0retroarch.exe;*.exe\0All Files (*.*)\0*.*\0");
-            if (!path.empty()) {
-                SetWindowText(hEditRetroarchExe, path.c_str());
-                SaveConfiguration();
-            }
-            break;
-        }
-        case IDC_BTN_BROWSE_RA_ROMS: {
-            auto path = BrowseFolder(hWnd, L"Select RetroArch ROMs Folder");
-            if (!path.empty()) {
-                SetWindowText(hEditRetroarchRoms, path.c_str());
-                SaveConfiguration();
-            }
-            break;
-        }
-        case IDC_BTN_BROWSE_DOLPHIN: {
-            auto path = BrowseFile(hWnd, L"Dolphin Executable (*.exe)\0*.exe\0All Files (*.*)\0*.*\0");
-            if (!path.empty()) {
-                SetWindowText(hEditDolphinExe, path.c_str());
-                SaveConfiguration();
-            }
-            break;
-        }
-        case IDC_BTN_BROWSE_GCROMS: {
-            auto path = BrowseFolder(hWnd, L"Select GameCube/Wii ROMs Folder");
-            if (!path.empty()) {
-                SetWindowText(hEditGcRoms, path.c_str());
-                SaveConfiguration();
-            }
-            break;
-        }
-        case IDC_BTN_BROWSE_FLYCAST: {
-            auto path = BrowseFile(hWnd, L"Flycast Executable (*.exe)\0*.exe\0All Files (*.*)\0*.*\0");
-            if (!path.empty()) {
-                SetWindowText(hEditFlycastExe, path.c_str());
-                SaveConfiguration();
-            }
-            break;
-        }
-        case IDC_BTN_BROWSE_NAOMI: {
-            auto path = BrowseFolder(hWnd, L"Select Naomi/Arcade ROMs Folder");
-            if (!path.empty()) {
-                SetWindowText(hEditNaomiRoms, path.c_str());
-                SaveConfiguration();
-            }
-            break;
-        }
-        case IDC_BTN_BROWSE_PCSX2: {
-            auto path = BrowseFile(hWnd, L"PCSX2 Executable (*.exe)\0*.exe\0All Files (*.*)\0*.*\0");
-            if (!path.empty()) {
-                SetWindowText(hEditPcsx2Exe, path.c_str());
-                SaveConfiguration();
-            }
-            break;
-        }
-        case IDC_BTN_BROWSE_PS2ROMS: {
-            auto path = BrowseFolder(hWnd, L"Select PS2 ROMs Folder");
-            if (!path.empty()) {
-                SetWindowText(hEditPs2Roms, path.c_str());
-                SaveConfiguration();
-            }
-            break;
-        }
         case IDC_BTN_SAVE_CONFIG:
             SaveConfiguration();
             break;

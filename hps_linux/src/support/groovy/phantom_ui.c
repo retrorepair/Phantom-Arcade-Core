@@ -317,12 +317,18 @@ static int tab_match(int tab, const char *sys)
 		return 1;
 	case PH_TAB_MAME:
 		return ieq(sys, "groovymame") || ieq(sys, "mame") || ieq(sys, "arcade");
+	case PH_TAB_FBNEO:
+		return ieq(sys, "fbneo") || ieq(sys, "fightcade");
 	case PH_TAB_NAOMI:
 		return ieq(sys, "flycast") || ieq(sys, "naomi") || ieq(sys, "dreamcast");
 	case PH_TAB_PS2:
 		return ieq(sys, "pcsx2") || ieq(sys, "ps2");
-	case PH_TAB_CUBE:
-		return ieq(sys, "dolphin") || ieq(sys, "gamecube") || ieq(sys, "gc") || ieq(sys, "wii");
+	case PH_TAB_PS3:
+		return ieq(sys, "rpcs3") || ieq(sys, "ps3");
+	case PH_TAB_XBOX:
+		return ieq(sys, "xemu") || ieq(sys, "xbox");
+	case PH_TAB_RA:
+		return ieq(sys, "retroarch");
 	default:
 		return 0;
 	}
@@ -549,7 +555,10 @@ static void draw_header(ph_ui *u)
 
 static void draw_tabs(ph_ui *u)
 {
-	static const char *tabs[PH_TAB_COUNT] = { "ALL", "GROOVYMAME", "NAOMI", "PS2", "GAMECUBE" };
+	/* Kept short: eight tabs plus the position counter have to fit 720px at 8px a
+	 * character, and a tab strip that wraps or clips is worse than an abbreviation. */
+	static const char *tabs[PH_TAB_COUNT] =
+		{ "ALL", "MAME", "FBNEO", "NAOMI", "PS2", "PS3", "XBOX", "RETROARCH" };
 
 	rect(u, 0, TAB_Y, u->w, TAB_H, C_TABBAR);
 

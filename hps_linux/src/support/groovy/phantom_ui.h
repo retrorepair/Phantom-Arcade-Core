@@ -67,12 +67,19 @@ typedef enum
  * launcher, not of the host's catalog: a host that serves only MAME still shows all
  * the tabs, with the empty ones reporting zero titles rather than vanishing (a tab
  * strip that changes width as the library loads is disorienting on a CRT). */
-#define PH_TAB_ALL   0
-#define PH_TAB_MAME  1
-#define PH_TAB_NAOMI 2
-#define PH_TAB_PS2   3
-#define PH_TAB_CUBE  4
-#define PH_TAB_COUNT 5
+/* One tab per emulator the host can drive. These mirror the table in the PC manager
+ * (host/PhantomArcadeManager.cpp g_emus), which is the set of GroovyNLC-capable
+ * emulators plus GroovyMAME. There is deliberately no GameCube tab: no GroovyNLC fork
+ * of Dolphin exists, so it could only ever have listed games that cannot stream. */
+#define PH_TAB_ALL    0
+#define PH_TAB_MAME   1
+#define PH_TAB_FBNEO  2
+#define PH_TAB_NAOMI  3
+#define PH_TAB_PS2    4
+#define PH_TAB_PS3    5
+#define PH_TAB_XBOX   6
+#define PH_TAB_RA     7
+#define PH_TAB_COUNT  8
 
 typedef struct
 {

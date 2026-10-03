@@ -3,7 +3,7 @@
 A MiSTer core that is also an arcade launcher.
 
 Load it and the cabinet shows your PC's game library on the CRT at 15kHz. Pick a title with
-the stick, the PC starts GroovyMAME (or Flycast, PCSX2, Dolphin, RetroArch) and streams the
+the stick, the PC starts GroovyMAME (or FBNeo, Flycast, PCSX2, RPCS3, xemu, RetroArch) and streams the
 frames straight into the FPGA. Quit, and you are back on the list.
 
 There is no script to run, no second core to switch to, and nothing to keep in sync. The
@@ -101,6 +101,34 @@ IDLE_SCREEN=launcher   ; launcher | logo | off
 EXIT_HOTKEY=on
 ```
 
+### Emulators
+
+The manager drives the GroovyNLC-capable emulators from
+[verbst's repositories](https://github.com/verbst?tab=repositories), plus GroovyMAME,
+which is Calamity's and is where the arcade support comes from:
+
+| Tab | Emulator | |
+|---|---|---|
+| MAME | [GroovyMAME](https://github.com/antonioginer/GroovyMAME) | arcade |
+| FBNEO | [fightcade-fbneo](https://github.com/verbst/fightcade-fbneo) | arcade |
+| NAOMI | [flycast-dojo](https://github.com/verbst/flycast-dojo) | NAOMI, Dreamcast, Atomiswave |
+| PS2 | [pcsx2](https://github.com/verbst/pcsx2) | PlayStation 2 |
+| PS3 | [rpcs3](https://github.com/verbst/rpcs3) | PlayStation 3 |
+| XBOX | [xemu](https://github.com/verbst/xemu) | original Xbox |
+| RETROARCH | [RetroArch](https://github.com/verbst/RetroArch) | everything else |
+
+There is no GameCube tab. No GroovyNLC fork of Dolphin exists, so one could only ever
+have listed games that cannot stream.
+
+**One thing to set up per emulator.** Only GroovyMAME takes the MiSTer's address on the
+command line, so only GroovyMAME gets it from discovery. The rest are told once, in their
+own settings — xemu has *Settings > MiSTer*, RetroArch has *Settings > Groovy MiSTer*,
+and rpcs3, pcsx2 and flycast each have a MiSTer settings page. Set the address there and
+the launcher does the rest.
+
+Each emulator's launch arguments live in `phantom_config.json` under `emulators`, so they
+can be changed without rebuilding. `{rom}`, `{rom_stem}` and `{mister_ip}` are substituted.
+
 ### Upgrading from a Groovy install
 
 Nothing to do. The core name has not changed, so your `GroovyNLC.CFG`, your input maps and
@@ -151,7 +179,7 @@ The core already had everything needed; almost nothing new talks to the hardware
    │ MiSTer_phantom (ARM)         │                   │ PhantomArcadeManager│
    │  ┌────────────────────────┐  │  LAUNCH:<id>      │                     │
    │  │ Phantom Arcade launcher│──┼──── UDP :1999 ───▶│  starts GroovyMAME, │
-   │  │  720x480 canvas        │◀─┼──── catalog ──────│  Flycast, PCSX2 ... │
+   │  │  720x480 canvas        │◀─┼──── catalog ──────│  FBNeo, PCSX2 ...   │
    │  └───────────┬────────────┘  │                   └──────────┬──────────┘
    │              │ memcpy        │                              │
    │        DDR3 framebuffer      │◀───── Groovy video UDP :32100 ┘

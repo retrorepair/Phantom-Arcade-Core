@@ -100,16 +100,32 @@ static void test_tabs(void)
 	reset();
 	add("m1", "Mame One", "groovymame", "X");
 	add("m2", "Mame Two", "mame", "X");
+	add("f1", "FBNeo One", "fbneo", "X");
 	add("n1", "Naomi One", "flycast", "X");
 	add("p1", "PS2 One", "pcsx2", "X");
-	add("g1", "Cube One", "dolphin", "X");
-	add("g2", "Wii One", "wii", "X");
+	add("p3", "PS3 One", "rpcs3", "X");
+	add("x1", "Xbox One", "xemu", "X");
+	add("r1", "RetroArch One", "retroarch", "X");
+	add("d1", "Cube One", "dolphin", "X");   /* no GroovyNLC fork: must match no tab */
 
-	ui.tab = PH_TAB_ALL;   CHECK(filtered_count() == 6, "ALL shows everything, got %d", filtered_count());
+	ui.tab = PH_TAB_ALL;   CHECK(filtered_count() == 9, "ALL shows everything, got %d", filtered_count());
 	ui.tab = PH_TAB_MAME;  CHECK(filtered_count() == 2, "MAME tab matches groovymame and mame, got %d", filtered_count());
+	ui.tab = PH_TAB_FBNEO; CHECK(filtered_count() == 1, "FBNeo tab, got %d", filtered_count());
 	ui.tab = PH_TAB_NAOMI; CHECK(filtered_count() == 1, "NAOMI tab, got %d", filtered_count());
 	ui.tab = PH_TAB_PS2;   CHECK(filtered_count() == 1, "PS2 tab, got %d", filtered_count());
-	ui.tab = PH_TAB_CUBE;  CHECK(filtered_count() == 2, "GameCube tab covers wii too, got %d", filtered_count());
+	ui.tab = PH_TAB_PS3;   CHECK(filtered_count() == 1, "PS3 tab, got %d", filtered_count());
+	ui.tab = PH_TAB_XBOX;  CHECK(filtered_count() == 1, "Xbox tab, got %d", filtered_count());
+	ui.tab = PH_TAB_RA;    CHECK(filtered_count() == 1, "RetroArch tab, got %d", filtered_count());
+
+	/* A system no tab claims is still reachable under ALL rather than vanishing: the
+	 * catalog is the host's to decide, and silently hiding rows would be worse than
+	 * showing them in one place. */
+	int idx[PH_MAX_GAMES];
+	ui.tab = PH_TAB_ALL;
+	int n = ph_ui_filtered(&ui, idx, PH_MAX_GAMES);
+	int sawCube = 0;
+	for (int i = 0; i < n; i++) if (!strcmp(ui.games[idx[i]].system, "dolphin")) sawCube = 1;
+	CHECK(sawCube, "an unclaimed system still appears under ALL");
 
 	/* tab cycling wraps and resets the row */
 	reset();
@@ -132,9 +148,19 @@ static void test_tab_switch_resets_selection(void)
 	ph_ui_move(&ui, 1);
 	CHECK(ui.sel == 2, "moved within the MAME tab, got %d", ui.sel);
 
-	ph_ui_tab(&ui, 1);   /* -> NAOMI, which has one entry */
+	/* Step to NAOMI by name rather than by "the next tab along": inserting a tab in
+	 * between is a routine change and should not break this. */
+	while (ui.tab != PH_TAB_NAOMI) ph_ui_tab(&ui, 1);
 	CHECK(ui.sel == 0, "changing tab returns to the first row, got %d", ui.sel);
 	CHECK(ph_ui_selected(&ui) != 0, "a one-entry tab still has a selection");
+
+	/* And an empty tab is a valid place to be: no selection, no crash, and moving
+	 * around in it does nothing rather than running off the end. */
+	ui.tab = PH_TAB_XBOX;
+	ui.sel = 0;
+	CHECK(ph_ui_selected(&ui) == 0, "an empty tab has no selection");
+	CHECK(ph_ui_move(&ui, 1) == 0, "moving in an empty tab reports no change");
+	ph_ui_render(&ui);
 }
 
 static void test_reclamp_keeps_id(void)
