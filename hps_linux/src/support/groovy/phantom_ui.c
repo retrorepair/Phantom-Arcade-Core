@@ -60,21 +60,32 @@
 #define PH_SAFE_X   16
 #define PH_SAFE_Y   8
 
+/* Sized for 720x480. The list gets everything left over: 15 rows of 90 columns, where
+ * the first version managed 11 rows of 45 on the same screen. */
 #define HEAD_Y      0
-#define HEAD_H      52
-#define TAB_Y       56
-#define TAB_H       34
-#define LIST_Y      94
-#define LIST_H      304
-#define LIST_HDR_H  28
-#define ROW_H       26
-#define DETAIL_Y    402
-#define DETAIL_H    36
-#define FOOT_Y      442
-#define FOOT_H      38
+#define HEAD_H      44
+#define TAB_Y       48
+#define TAB_H       28
+#define LIST_Y      80
+#define LIST_H      338
+#define LIST_HDR_H  24
+#define ROW_H       20
+#define DETAIL_Y    422
+#define DETAIL_H    24
+#define FOOT_Y      450
+#define FOOT_H      30
 
 #define GLYPH_W 8
 #define GLYPH_H 12
+
+/* The font declares 12 rows but inks only rows 2..9 - rows 0, 1, 10 and 11 are blank in
+ * all 95 glyphs (',QV_gjpqy' are the ones that reach row 9). Drawing the declared cell
+ * spent a third of every row's height on nothing, which is what actually limited the
+ * list to eleven entries on a 480-line screen. Only the inked band is drawn, and the
+ * row pitch is set from that. */
+#define FONT_TOP 2
+#define FONT_BOT 9
+#define FONT_INK (FONT_BOT - FONT_TOP + 1)
 
 /* marquee timing: hold, scroll, hold, snap back */
 #define MQ_HOLD_MS   1800
@@ -142,34 +153,96 @@ static void box(ph_ui *u, int x, int y, int w, int h, uint32_t bg, uint32_t bord
 	}
 }
 
-static void glyph(ph_ui *u, int x, int y, char c, uint32_t rgb, int s)
+/* Horizontal and vertical scale are separate on purpose, and this is the whole reason
+ * the launcher gets any value out of 480i.
+ *
+ * Interlace constrains the vertical axis only: a 1px-tall stroke lands in one field and
+ * blinks at 30Hz, so vertical scale is never below 2. Nothing of the sort applies
+ * horizontally - the beam resolves every pixel of a line in both fields alike. Drawing
+ * body text at 2x in both directions therefore threw away half the horizontal
+ * resolution for no benefit at all, and left game titles truncated at 45 characters on
+ * a screen that can carry 90.
+ *
+ * So the chrome (wordmark, tabs, button legends) stays square-scaled and chunky, while
+ * the data - game titles, system names, the detail line - is drawn narrow: 1x across,
+ * 2x down. Full horizontal detail, still two scanlines per stroke.
+ */
+static void glyph_s(ph_ui *u, int x, int y, char c, uint32_t rgb, int sx, int sy)
 {
 	int idx = (unsigned char)c - 32;
 	if (idx < 0 || idx >= 95) idx = 31; /* '?' */
 	const uint8_t *g = font8x12[idx];
 
-	for (int r = 0; r < GLYPH_H; r++)
+	for (int r = FONT_TOP; r <= FONT_BOT; r++)
 	{
 		uint8_t row = g[r];
 		if (!row) continue;
 		for (int b = 0; b < GLYPH_W; b++)
 		{
 			if (!((row >> (7 - b)) & 1)) continue;
-			if (s == 1)
-			{
-				put_px(u, x + b, y + r, rgb);
-			}
-			else
-			{
-				rect(u, x + b * s, y + r * s, s, s, rgb);
-			}
+			rect(u, x + b * sx, y + (r - FONT_TOP) * sy, sx, sy, rgb);
 		}
 	}
 }
 
-static int text_w(const char *s, int scale)
+static void glyph(ph_ui *u, int x, int y, char c, uint32_t rgb, int s)
 {
-	return (int)strlen(s) * GLYPH_W * scale;
+	glyph_s(u, x, y, c, rgb, s, s);
+}
+
+/* Narrow text: 1x across, 2x down. 8 px wide, 16 px tall, two scanlines per stroke. */
+#define PH_NARROW_W GLYPH_W
+#define PH_NARROW_H (FONT_INK * 2)
+
+static void text_n(ph_ui *u, int x, int y, const char *s, uint32_t rgb)
+{
+	if (!s) return;
+	for (; *s; s++)
+	{
+		glyph_s(u, x, y, *s, rgb, 1, 2);
+		x += PH_NARROW_W;
+	}
+}
+
+static void text_n_right(ph_ui *u, int xr, int y, const char *s, uint32_t rgb)
+{
+	if (!s) return;
+	text_n(u, xr - (int)strlen(s) * PH_NARROW_W, y, s, rgb);
+}
+
+static void text_n_clip(ph_ui *u, int x, int y, const char *s, uint32_t rgb, int maxw)
+{
+	int maxc = maxw / PH_NARROW_W;
+	if (maxc <= 0 || !s) return;
+
+	int len = (int)strlen(s);
+	if (len <= maxc) { text_n(u, x, y, s, rgb); return; }
+
+	char buf[PH_TITLE_LEN + 8];
+	int keep = maxc - 3;
+	if (keep < 1) keep = 1;
+	if (keep > (int)sizeof(buf) - 4) keep = (int)sizeof(buf) - 4;
+	memcpy(buf, s, (size_t)keep);
+	buf[keep] = 0;
+	strcat(buf, "...");
+	text_n(u, x, y, buf, rgb);
+}
+
+static void text_n_scroll(ph_ui *u, int x, int y, const char *s, uint32_t rgb, uint32_t sh,
+                          int winw, int off)
+{
+	int i = 0;
+	for (const char *p = s; *p; p++, i++)
+	{
+		int gx = x - off + i * PH_NARROW_W;
+		if (gx + PH_NARROW_W <= x) continue;
+		if (gx >= x + winw) break;
+		if (gx >= x && gx + PH_NARROW_W <= x + winw)
+		{
+			if (sh) glyph_s(u, gx + 1, y + 2, *p, sh, 1, 2);
+			glyph_s(u, gx, y, *p, rgb, 1, 2);
+		}
+	}
 }
 
 static void text(ph_ui *u, int x, int y, const char *s, uint32_t rgb, int scale)
@@ -189,54 +262,6 @@ static void text_sh(ph_ui *u, int x, int y, const char *s, uint32_t rgb, uint32_
 	if (!s) return;
 	if (sh) text(u, x + scale, y + scale, s, sh, scale);
 	text(u, x, y, s, rgb, scale);
-}
-
-static void text_right(ph_ui *u, int xr, int y, const char *s, uint32_t rgb, int scale)
-{
-	text(u, xr - text_w(s, scale), y, s, rgb, scale);
-}
-
-/* Truncate with an ellipsis at a pixel budget. */
-static void text_clip(ph_ui *u, int x, int y, const char *s, uint32_t rgb, int scale, int maxw)
-{
-	int cw = GLYPH_W * scale;
-	int maxc = maxw / cw;
-	if (maxc <= 0 || !s) return;
-
-	int len = (int)strlen(s);
-	if (len <= maxc)
-	{
-		text(u, x, y, s, rgb, scale);
-		return;
-	}
-	char buf[PH_TITLE_LEN + 8];
-	int keep = maxc - 3;
-	if (keep < 1) keep = 1;
-	if (keep > (int)sizeof(buf) - 4) keep = (int)sizeof(buf) - 4;
-	memcpy(buf, s, (size_t)keep);
-	buf[keep] = 0;
-	strcat(buf, "...");
-	text(u, x, y, buf, rgb, scale);
-}
-
-/* Horizontally scrolled text inside a window, clipped to it. Used only for the
- * selected row, so exactly one title is ever in motion. */
-static void text_scroll(ph_ui *u, int x, int y, const char *s, uint32_t rgb, uint32_t sh,
-                        int scale, int winw, int off)
-{
-	int cw = GLYPH_W * scale;
-	int i = 0;
-	for (const char *p = s; *p; p++, i++)
-	{
-		int gx = x - off + i * cw;
-		if (gx + cw <= x) continue;      /* fully left of the window */
-		if (gx >= x + winw) break;       /* past the right edge */
-		if (gx >= x && gx + cw <= x + winw)
-		{
-			if (sh) glyph(u, gx + scale, y + scale, *p, sh, scale);
-			glyph(u, gx, y, *p, rgb, scale);
-		}
-	}
 }
 
 /* Arrow glyphs. The font is ASCII 32..126 only, so the stick and cursor indicators
@@ -338,10 +363,10 @@ static int title_window(const ph_ui *u, const ph_game *g, int n, int *out_sys_x,
 	 * hardware string cannot squeeze every title down to an ellipsis. */
 	const char *sys = g->sysname[0] ? g->sysname : g->system;
 	int sys_cap = (w - 24 - bar_w) * 2 / 5;
-	int sys_w = text_w(sys, 2);
+	int sys_w = (int)strlen(sys) * PH_NARROW_W;
 	if (sys_w > sys_cap) sys_w = sys_cap;
 
-	int tx = PH_SAFE_X + 34;
+	int tx = PH_SAFE_X + 30;
 	int sys_x = PH_SAFE_X + w - 12 - bar_w - sys_w;
 	int tw = sys_x - tx - 16;
 	if (tw < 32) tw = 32;
@@ -453,7 +478,7 @@ int ph_ui_animate(ph_ui *u, uint32_t tick_ms)
 	int idx[PH_MAX_GAMES];
 	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
 	int winw = title_window(u, g, n, 0, 0);
-	int full = text_w(g->title, 2);
+	int full = (int)strlen(g->title) * PH_NARROW_W;
 	if (full <= winw)
 	{
 		if (u->marquee_px)
@@ -486,21 +511,26 @@ int ph_ui_animate(ph_ui *u, uint32_t tick_ms)
 
 /* ---- rendering --------------------------------------------------------------- */
 
+static int ntw(const char *s)
+{
+	return s ? (int)strlen(s) * PH_NARROW_W : 0;
+}
+
 static void draw_header(ph_ui *u)
 {
 	vgrad(u, 0, HEAD_Y, u->w, HEAD_H - 4, C_HEAD_A, C_HEAD_B);
 	rect(u, 0, HEAD_Y + HEAD_H - 4, u->w, 4, C_AMBER);
 
-	/* Wordmark. Scale 3 (24x36) so it reads as a marquee from across a room. */
-	text_sh(u, PH_SAFE_X, HEAD_Y + 7, "PHANTOM ARCADE", C_AMBER, C_AMBER_DK, 3);
+	/* Wordmark stays square-scaled and chunky - it is the one thing meant to read from
+	 * across a room, and it is short enough that the width costs nothing. */
+	text_sh(u, PH_SAFE_X, HEAD_Y + 6, "PHANTOM ARCADE", C_AMBER, C_AMBER_DK, 3);
 
-	/* Host indicator, right-aligned. The LED is 8px so it survives both fields. */
 	const char *label;
 	uint32_t led;
 	switch (u->host_state)
 	{
-	case PH_HOST_ONLINE:  label = "HOST ONLINE";  led = C_GREEN;  break;
-	case PH_HOST_OFFLINE: label = "NO HOST";      led = C_RED;    break;
+	case PH_HOST_ONLINE:  label = "HOST ONLINE";   led = C_GREEN;  break;
+	case PH_HOST_OFFLINE: label = "NO HOST";       led = C_RED;    break;
 	default:              label = "SEARCHING...";  led = C_YELLOW; break;
 	}
 
@@ -511,11 +541,10 @@ static void draw_header(ph_ui *u)
 		addr[0] = 0;
 
 	int xr = u->w - PH_SAFE_X;
-	text_right(u, xr, HEAD_Y + 6, label, C_TEXT_DIM, 2);
-	if (addr[0]) text_right(u, xr, HEAD_Y + 28, addr, C_TEXT_MUTE, 2);
+	text_n_right(u, xr, HEAD_Y + 4, label, C_TEXT_DIM);
+	if (addr[0]) text_n_right(u, xr, HEAD_Y + 22, addr, C_TEXT_MUTE);
 
-	int lw = text_w(label, 2);
-	rect(u, xr - lw - 18, HEAD_Y + 12, 8, 8, led);
+	rect(u, xr - ntw(label) - 16, HEAD_Y + 8, 8, 8, led);
 }
 
 static void draw_tabs(ph_ui *u)
@@ -527,30 +556,28 @@ static void draw_tabs(ph_ui *u)
 	int x = PH_SAFE_X;
 	for (int t = 0; t < PH_TAB_COUNT; t++)
 	{
-		int tw = text_w(tabs[t], 2) + 16;
+		int tw = ntw(tabs[t]) + 16;
 		if (t == u->tab)
 		{
-			box(u, x, TAB_Y + 2, tw, TAB_H - 6, C_AMBER, C_AMBER_HI, 0);
-			text(u, x + 8, TAB_Y + 6, tabs[t], 0x1A1200, 2);
+			box(u, x, TAB_Y + 1, tw, TAB_H - 4, C_AMBER, C_AMBER_HI, 0);
+			text_n(u, x + 8, TAB_Y + 6, tabs[t], 0x1A1200);
 		}
 		else
 		{
-			box(u, x, TAB_Y + 2, tw, TAB_H - 6, C_INACTIVE, C_BORDER, 0);
-			text(u, x + 8, TAB_Y + 6, tabs[t], C_TEXT_MUTE, 2);
+			box(u, x, TAB_Y + 1, tw, TAB_H - 4, C_INACTIVE, C_BORDER, 0);
+			text_n(u, x + 8, TAB_Y + 6, tabs[t], C_TEXT_MUTE);
 		}
 		x += tw + 8;
 	}
 
-	/* Position within the filtered list, parked at the right end of the tab strip.
-	 * It belongs next to the filter that determines it, and the footer has no room
-	 * for it once the four button legends are laid out. */
+	/* Position within the filtered list, parked at the right end of the tab strip. */
 	int idx[PH_MAX_GAMES];
 	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
 	char cnt[32];
 	snprintf(cnt, sizeof(cnt), "%d/%d", n ? u->sel + 1 : 0, n);
-	if (u->w - PH_SAFE_X - text_w(cnt, 2) > x + 8)
+	if (u->w - PH_SAFE_X - ntw(cnt) > x + 8)
 	{
-		text_right(u, u->w - PH_SAFE_X, TAB_Y + 6, cnt, C_TEXT_MUTE, 2);
+		text_n_right(u, u->w - PH_SAFE_X, TAB_Y + 6, cnt, C_TEXT_MUTE);
 	}
 
 	rect(u, 0, TAB_Y + TAB_H, u->w, 2, C_BORDER);
@@ -560,36 +587,35 @@ static void draw_tabs(ph_ui *u)
  * there is a library when there is not. */
 static void draw_empty(ph_ui *u, int x, int y, int w, int any_games)
 {
-	int cx = x + 24;
-	int cy = y + 40;
+	int cx = x + 20;
+	int cy = y + 32;
 
 	if (any_games)
 	{
-		text(u, cx, cy, "No titles in this category.", C_AMBER, 2);
-		text(u, cx, cy + 34, "Press LEFT / RIGHT to change platform.", C_TEXT_DIM, 2);
+		text_n(u, cx, cy, "No titles in this category.", C_AMBER);
+		text_n(u, cx, cy + 26, "Press LEFT / RIGHT to change platform.", C_TEXT_DIM);
 		return;
 	}
 
 	switch (u->host_state)
 	{
 	case PH_HOST_SEARCHING:
-		text(u, cx, cy, "Looking for a Phantom Arcade host...", C_AMBER, 2);
-		text(u, cx, cy + 34, "Broadcasting on the local network.", C_TEXT_DIM, 2);
+		text_n(u, cx, cy, "Looking for a Phantom Arcade host...", C_AMBER);
+		text_n(u, cx, cy + 26, "Broadcasting on the local network.", C_TEXT_DIM);
 		break;
 	case PH_HOST_ONLINE:
-		text(u, cx, cy, "Host online, library is empty.", C_AMBER, 2);
-		text(u, cx, cy + 34, "Run Auto-Scan ROMs in the PC manager", C_TEXT_DIM, 2);
-		text(u, cx, cy + 62, "to publish a catalog.", C_TEXT_DIM, 2);
+		text_n(u, cx, cy, "Host online, library is empty.", C_AMBER);
+		text_n(u, cx, cy + 26, "Run Auto-Scan ROMs in the PC manager to publish a catalog.", C_TEXT_DIM);
 		break;
 	default:
-		text(u, cx, cy, "No host found.", C_RED, 2);
-		text(u, cx, cy + 34, "Start Phantom Arcade Manager on the PC,", C_TEXT_DIM, 2);
-		text(u, cx, cy + 62, "then press REFRESH to search again.", C_TEXT_DIM, 2);
+		text_n(u, cx, cy, "No host found.", C_RED);
+		text_n(u, cx, cy + 26, "Start Phantom Arcade Manager on the PC,", C_TEXT_DIM);
+		text_n(u, cx, cy + 48, "then press REFRESH to search again.", C_TEXT_DIM);
 		if (u->host_ip[0])
 		{
 			char s[96];
 			snprintf(s, sizeof(s), "Configured host: %s:%d", u->host_ip, u->host_port);
-			text(u, cx, cy + 96, s, C_TEXT_MUTE, 2);
+			text_n(u, cx, cy + 76, s, C_TEXT_MUTE);
 		}
 		break;
 	}
@@ -605,8 +631,8 @@ static void draw_list(ph_ui *u)
 
 	/* column header */
 	rect(u, x + 2, LIST_Y + 2, w - 4, LIST_HDR_H - 2, C_PANEL_DK);
-	text(u, x + 12, LIST_Y + 6, "GAME TITLE", C_TEXT_MUTE, 2);
-	text_right(u, x + w - 12, LIST_Y + 6, "SYSTEM", C_TEXT_MUTE, 2);
+	text_n(u, x + 12, LIST_Y + 5, "GAME TITLE", C_TEXT_MUTE);
+	text_n_right(u, x + w - 12, LIST_Y + 5, "SYSTEM", C_TEXT_MUTE);
 	rect(u, x + 2, LIST_Y + LIST_HDR_H, w - 4, 2, C_BORDER);
 
 	int idx[PH_MAX_GAMES];
@@ -620,7 +646,7 @@ static void draw_list(ph_ui *u)
 
 	int rows = visible_rows();
 	int inner_y = LIST_Y + LIST_HDR_H + 4;
-	int bar_w = (n > rows) ? 14 : 0;   /* scrollbar gutter, reserved up front */
+	int bar_w = (n > rows) ? 14 : 0;
 
 	for (int r = 0; r < rows; r++)
 	{
@@ -637,14 +663,14 @@ static void draw_list(ph_ui *u)
 		 * Fighter III: 3rd Strike". */
 		const char *sys = g->sysname[0] ? g->sysname : g->system;
 		int sys_x, sys_w;
-		int tx = x + 34;
+		int tx = x + 30;
 		int title_w = title_window(u, g, n, &sys_x, &sys_w);
 
 		if (sel)
 		{
 			rect(u, x + 2, ry, w - 4, ROW_H, C_ROW_SEL);
 			rect(u, x + 2, ry, 6, ROW_H, C_AMBER);
-			arrow(u, x + 14, ry + 5, 16, PH_ARROW_RIGHT, C_AMBER);
+			arrow(u, x + 12, ry + 4, 12, PH_ARROW_RIGHT, C_AMBER);
 		}
 		else
 		{
@@ -654,18 +680,18 @@ static void draw_list(ph_ui *u)
 		uint32_t tc = sel ? C_AMBER_HI : C_TEXT;
 
 		/* The selected row scrolls instead of clipping, so a long title is readable
-		 * in full without leaving the list. Unselected rows clip: eleven marquees
+		 * in full without leaving the list. Unselected rows clip: fifteen marquees
 		 * at once would be unreadable. */
 		if (sel)
 		{
-			text_scroll(u, tx, ry + 2, g->title, tc, 0x000000, 2, title_w, u->marquee_px);
+			text_n_scroll(u, tx, ry + 2, g->title, tc, 0x000000, title_w, u->marquee_px);
 		}
 		else
 		{
-			text_clip(u, tx, ry + 2, g->title, tc, 2, title_w);
+			text_n_clip(u, tx, ry + 2, g->title, tc, title_w);
 		}
 
-		text_clip(u, sys_x, ry + 2, sys, sel ? C_AMBER : C_TEXT_MUTE, 2, sys_w);
+		text_n_clip(u, sys_x, ry + 2, sys, sel ? C_AMBER : C_TEXT_MUTE, sys_w);
 	}
 
 	/* Scrollbar. Only drawn when it means something, and 6px wide so it is visible
@@ -677,7 +703,7 @@ static void draw_list(ph_ui *u)
 		int bar_h = track_h * rows / n;
 		if (bar_h < 12) bar_h = 12;
 		int bar_y = track_y + (track_h - bar_h) * u->scroll / (n - rows);
-		int bx = x + w - 4 - bar_w + 4;   /* inside the gutter title_window reserved */
+		int bx = x + w - 4 - bar_w + 4;
 		rect(u, bx, track_y, 6, track_h, C_PANEL_DK);
 		rect(u, bx, bar_y, 6, bar_h, C_BORDER_HI);
 	}
@@ -696,14 +722,14 @@ static void draw_detail(ph_ui *u)
 	 * status after a few seconds. */
 	if (u->status[0] && u->view != PH_VIEW_BUSY)
 	{
-		text_clip(u, x + 12, DETAIL_Y + 7, u->status, C_AMBER, 2, w - 24);
+		text_n_clip(u, x + 12, DETAIL_Y + 4, u->status, C_AMBER, w - 24);
 		return;
 	}
 
 	const ph_game *g = ph_ui_selected(u);
 	if (!g)
 	{
-		text(u, x + 12, DETAIL_Y + 7, "--", C_TEXT_MUTE, 2);
+		text_n(u, x + 12, DETAIL_Y + 4, "--", C_TEXT_MUTE);
 		return;
 	}
 
@@ -711,7 +737,7 @@ static void draw_detail(ph_ui *u)
 	 * mismatch between core and host catalog visible instead of mysterious. */
 	char left[128];
 	snprintf(left, sizeof(left), "ID %s", g->id);
-	text_clip(u, x + 12, DETAIL_Y + 7, left, C_TEXT_DIM, 2, w / 2 - 20);
+	text_n_clip(u, x + 12, DETAIL_Y + 4, left, C_TEXT_DIM, w / 2 - 20);
 
 	/* Right: the timing the host reported. Omitted entirely when unknown rather than
 	 * filled in with a stock 15.734kHz that may be wrong for this title. */
@@ -730,7 +756,7 @@ static void draw_detail(ph_ui *u)
 	{
 		snprintf(right, sizeof(right), "timing from host at launch");
 	}
-	text_right(u, x + w - 12, DETAIL_Y + 7, right, C_CYAN, 2);
+	text_n_right(u, x + w - 12, DETAIL_Y + 4, right, C_CYAN);
 }
 
 static void draw_footer(ph_ui *u)
@@ -738,29 +764,29 @@ static void draw_footer(ph_ui *u)
 	rect(u, 0, FOOT_Y, u->w, FOOT_H, C_PANEL_DK);
 	rect(u, 0, FOOT_Y, u->w, 2, C_BORDER);
 
-	int y = FOOT_Y + 8;
+	int y = FOOT_Y + 7;
 	int x = PH_SAFE_X;
 
-	arrow(u, x, y + 2, 16, PH_ARROW_UP, C_AMBER);
-	arrow(u, x + 20, y + 2, 16, PH_ARROW_DOWN, C_AMBER);
-	x += 42;
-	text(u, x, y, "SELECT", C_TEXT_DIM, 2);
-	x += text_w("SELECT", 2) + 24;
+	arrow(u, x, y + 1, 14, PH_ARROW_UP, C_AMBER);
+	arrow(u, x + 18, y + 1, 14, PH_ARROW_DOWN, C_AMBER);
+	x += 38;
+	text_n(u, x, y, "SELECT", C_TEXT_DIM);
+	x += ntw("SELECT") + 22;
 
-	arrow(u, x, y + 2, 16, PH_ARROW_LEFT, C_CYAN);
-	arrow(u, x + 20, y + 2, 16, PH_ARROW_RIGHT, C_CYAN);
-	x += 42;
-	text(u, x, y, "PLATFORM", C_TEXT_DIM, 2);
-	x += text_w("PLATFORM", 2) + 24;
+	arrow(u, x, y + 1, 14, PH_ARROW_LEFT, C_CYAN);
+	arrow(u, x + 18, y + 1, 14, PH_ARROW_RIGHT, C_CYAN);
+	x += 38;
+	text_n(u, x, y, "PLATFORM", C_TEXT_DIM);
+	x += ntw("PLATFORM") + 22;
 
-	rect(u, x, y + 4, 14, 14, C_RED);
-	x += 20;
-	text(u, x, y, "LAUNCH", C_TEXT, 2);
-	x += text_w("LAUNCH", 2) + 24;
+	rect(u, x, y + 3, 12, 12, C_RED);
+	x += 18;
+	text_n(u, x, y, "LAUNCH", C_TEXT);
+	x += ntw("LAUNCH") + 22;
 
-	rect(u, x, y + 4, 14, 14, C_YELLOW);
-	x += 20;
-	text(u, x, y, "REFRESH", C_TEXT_DIM, 2);
+	rect(u, x, y + 3, 12, 12, C_YELLOW);
+	x += 18;
+	text_n(u, x, y, "REFRESH", C_TEXT_DIM);
 }
 
 /* The busy overlay. There is deliberately no percentage and no countdown: the core
@@ -771,24 +797,24 @@ static void draw_footer(ph_ui *u)
 static void draw_busy(ph_ui *u)
 {
 	int bw = 560;
-	int bh = 180;
+	int bh = 150;
 	int bx = (u->w - bw) / 2;
 	int by = (u->h - bh) / 2;
 
 	box(u, bx, by, bw, bh, 0x161826, C_AMBER, C_AMBER_DK);
 
-	text(u, bx + 24, by + 20, "STARTING STREAM", C_AMBER, 3);
-	text_clip(u, bx + 24, by + 66, u->busy_title, C_TEXT, 2, bw - 48);
-	text_clip(u, bx + 24, by + 98, u->status, C_CYAN, 2, bw - 48);
+	text(u, bx + 20, by + 16, "STARTING STREAM", C_AMBER, 2);
+	text_n_clip(u, bx + 20, by + 56, u->busy_title, C_TEXT, bw - 40);
+	text_n_clip(u, bx + 20, by + 80, u->status, C_CYAN, bw - 40);
 
-	/* An indeterminate sweep, 4px tall. It conveys "alive", not "progress". */
-	int tw = bw - 48;
-	rect(u, bx + 24, by + 140, tw, 8, 0x0A0B12);
+	/* An indeterminate sweep, 8px tall. It conveys "alive", not "progress". */
+	int tw = bw - 40;
+	rect(u, bx + 20, by + 114, tw, 8, 0x0A0B12);
 	int seg = tw / 4;
 	int pos = (int)((u->tick_ms / 8) % (uint32_t)(tw + seg)) - seg;
-	int sx = pos < 0 ? bx + 24 : bx + 24 + pos;
+	int sx = pos < 0 ? bx + 20 : bx + 20 + pos;
 	int sw = pos < 0 ? seg + pos : (pos + seg > tw ? tw - pos : seg);
-	if (sw > 0) rect(u, sx, by + 140, sw, 8, C_AMBER);
+	if (sw > 0) rect(u, sx, by + 114, sw, 8, C_AMBER);
 }
 
 void ph_ui_render(ph_ui *u)

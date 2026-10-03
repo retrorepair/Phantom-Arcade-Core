@@ -36,6 +36,7 @@
 #include <atomic>
 #include <filesystem>
 #include <algorithm>
+#include <map>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -502,6 +503,124 @@ void SaveConfiguration() {
     }
 }
 
+// ---- MAME title lookup -----------------------------------------------------------
+//
+// A scan used to title every arcade game by its ROM filename, so the cabinet listed
+// "bgaregga" and "ddp3" rather than what they are. MAME already knows the real names,
+// so ask it: `mame -listfull` prints "shortname  \"Full Description\"" for everything
+// it supports, and the description carries the region - exactly what is wanted on the
+// menu. Nothing is shipped or redistributed; this reads the user's own MAME install.
+//
+// The output is a few megabytes and takes a moment, so it is cached beside the exe and
+// only regenerated when the cache is missing.
+
+static std::string RunCapture(const std::wstring& cmdline, const std::wstring& workDir) {
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE rd = NULL, wr = NULL;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return "";
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    PROCESS_INFORMATION pi = { 0 };
+
+    std::vector<wchar_t> buf(cmdline.begin(), cmdline.end());
+    buf.push_back(0);
+
+    BOOL ok = CreateProcessW(NULL, buf.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                             NULL, workDir.empty() ? NULL : workDir.c_str(), &si, &pi);
+    CloseHandle(wr);   // the child owns the write end now; our copy must go or the read never ends
+    if (!ok) { CloseHandle(rd); return ""; }
+
+    std::string out;
+    char chunk[8192];
+    DWORD got = 0;
+    while (ReadFile(rd, chunk, sizeof(chunk), &got, NULL) && got > 0) out.append(chunk, got);
+
+    CloseHandle(rd);
+    WaitForSingleObject(pi.hProcess, 20000);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return out;
+}
+
+// MAME appends a build date to some descriptions, e.g.
+//   "Battle Garegga (Europe / USA / Japan / Asia) (Sat Feb 3 1996)"
+// The region is wanted, the datestamp is not. Only a trailing parenthesised group that
+// contains a 19xx/20xx year is removed, so "(Korea)" and "(v1.5, USA)" are untouched.
+static std::string TrimBuildDate(const std::string& desc) {
+    if (desc.empty() || desc.back() != ')') return desc;
+    size_t open = desc.rfind('(');
+    if (open == std::string::npos || open == 0) return desc;
+
+    std::string tail = desc.substr(open + 1, desc.size() - open - 2);
+    bool hasYear = false;
+    for (size_t i = 0; i + 3 < tail.size() + 1 && i + 4 <= tail.size(); i++) {
+        if ((tail[i] == '1' && tail[i + 1] == '9') || (tail[i] == '2' && tail[i + 1] == '0')) {
+            if (isdigit((unsigned char)tail[i + 2]) && isdigit((unsigned char)tail[i + 3])) { hasYear = true; break; }
+        }
+    }
+    if (!hasYear) return desc;
+
+    size_t end = open;
+    while (end > 0 && desc[end - 1] == ' ') end--;
+    return desc.substr(0, end);
+}
+
+static std::map<std::string, std::string> LoadMameTitles(const std::wstring& mameExe) {
+    std::map<std::string, std::string> titles;
+    if (mameExe.empty()) return titles;
+
+    std::wstring cachePath = GetAppDir() + L"\\mame_titles.txt";
+    std::string raw;
+
+    std::ifstream cache(cachePath.c_str(), std::ios::binary);
+    if (cache.is_open()) {
+        std::stringstream ss; ss << cache.rdbuf(); raw = ss.str(); cache.close();
+    }
+
+    if (raw.size() < 1024) {
+        std::wstring dir;
+        size_t slash = mameExe.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) dir = mameExe.substr(0, slash);
+        raw = RunCapture(L"\"" + mameExe + L"\" -listfull", dir);
+        if (raw.size() >= 1024) {
+            std::ofstream out(cachePath.c_str(), std::ios::binary);
+            if (out.is_open()) { out << raw; out.close(); }
+        }
+    }
+
+    // lines look like:   bgaregga         "Battle Garegga (Europe / ...) (Sat Feb 3 1996)"
+    std::stringstream ls(raw);
+    std::string line;
+    while (std::getline(ls, line)) {
+        size_t q1 = line.find('"');
+        if (q1 == std::string::npos) continue;
+        size_t q2 = line.rfind('"');
+        if (q2 == std::string::npos || q2 <= q1 + 1) continue;
+
+        std::string name = line.substr(0, q1);
+        while (!name.empty() && (name.back() == ' ' || name.back() == '\t' || name.back() == '\r')) name.pop_back();
+        if (name.empty() || name == "Name:") continue;
+
+        titles[name] = TrimBuildDate(line.substr(q1 + 1, q2 - q1 - 1));
+    }
+    return titles;
+}
+
+static std::string JsonEscape(const std::string& in) {
+    std::string out;
+    for (char c : in) {
+        if (c == '"' || c == '\\') { out.push_back('\\'); out.push_back(c); }
+        else if ((unsigned char)c < 0x20) out.push_back(' ');
+        else out.push_back(c);
+    }
+    return out;
+}
+
 // Auto-Scan ROM Directories and build games_catalog.json
 void ScanRomDirectories() {
     SendMessage(hListGames, LB_RESETCONTENT, 0, 0);
@@ -521,6 +640,12 @@ void ScanRomDirectories() {
         { GetText(hEditNaomiRoms), "flycast", "Sega Naomi / DC Arcade", "15kHz 240p / 480i", "640x480" },
         { GetText(hEditPs2Roms), "pcsx2", "Sony PlayStation 2", "15kHz 240p / 480i", "640x224" }
     };
+
+    // Ask MAME for its own names once, so arcade entries list "Battle Garegga (Korea)"
+    // rather than "bgaregga". Empty if MAME is not configured, in which case titles fall
+    // back to the ROM stem.
+    SetWindowText(hStaticStatus, L"Status: Reading MAME's game list...");
+    std::map<std::string, std::string> mameTitles = LoadMameTitles(GetText(hEditMameExe));
 
     std::wstring catPath = GetAppDir() + L"\\games_catalog.json";
     std::ofstream catOut; catOut.open(catPath.c_str());
@@ -544,14 +669,24 @@ void ScanRomDirectories() {
                         std::string id = target.system + "_" + stem;
                         std::string cleanRomPath = entry.path().generic_string();
 
+                        // Arcade sets get MAME's own description, which carries the region.
+                        // Everything else keeps the filename: Dolphin, PCSX2 and Flycast have
+                        // no equivalent list to ask, and inventing titles for them would be
+                        // guessing.
+                        std::string title = stem;
+                        if (target.system == "groovymame") {
+                            auto it = mameTitles.find(stem);
+                            if (it != mameTitles.end()) title = it->second;
+                        }
+
                         std::wstring listEntry = L"[" + std::wstring(target.system.begin(), target.system.end()) + L"] " +
-                                                std::wstring(stem.begin(), stem.end());
+                                                StringToWstring(title);
                         SendMessage(hListGames, LB_ADDSTRING, 0, (LPARAM)listEntry.c_str());
 
                         if (totalFound > 0) catOut << ",\n";
                         catOut << "    {\n";
                         catOut << "      \"id\": \"" << id << "\",\n";
-                        catOut << "      \"title\": \"" << stem << "\",\n";
+                        catOut << "      \"title\": \"" << JsonEscape(title) << "\",\n";
                         catOut << "      \"system\": \"" << target.system << "\",\n";
                         catOut << "      \"systemName\": \"" << target.systemName << "\",\n";
                         catOut << "      \"romName\": \"" << filename << "\",\n";
@@ -636,9 +771,17 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
         }
     }
 
-    // Default to GroovyMAME with video mister, skip gameinfo, and nokeepaspect to prevent narrow pillarbox screen width
+    // -mister_ip is what tells GroovyMAME where to send the frames. Without it the game
+    // starts on the PC, renders happily, and streams to nothing: the MiSTer sits on the
+    // launcher and eventually gives up. It was dropped from here once as a "legacy
+    // argument", which also broke launching MAME by hand for anyone whose mame.ini had
+    // no mister_ip set.
+    //
+    // The address is the one the launch request arrived from, so a cabinet on DHCP needs
+    // nothing typed in anywhere; the GUI field is only the fallback for a manual launch.
     std::wstring wStem = StringToWstring(stem);
-    std::wstring cmd = L"\"" + mameExe + L"\" " + wStem + L" -video mister -skip_gameinfo -nokeepaspect";
+    std::wstring misterArgs = L" -video mister -mister_ip " + misterIp + L" -skip_gameinfo -nokeepaspect";
+    std::wstring cmd = L"\"" + mameExe + L"\" " + wStem + misterArgs;
 
     STARTUPINFO si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
@@ -660,7 +803,7 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
 
     if (!ok) {
         // Fallback: try launching with just "mame" using system PATH
-        std::wstring fallbackCmd = L"mame " + wStem + L" -video mister -skip_gameinfo -nokeepaspect";
+        std::wstring fallbackCmd = L"mame " + wStem + misterArgs;
         std::vector<wchar_t> fbBuf(fallbackCmd.begin(), fallbackCmd.end());
         fbBuf.push_back(0);
         ok = CreateProcessW(
