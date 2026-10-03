@@ -157,6 +157,14 @@ static EmulatorDef* EmuByKey(const std::string& key) {
     return NULL;
 }
 
+// Config keys used before the table existed, so an upgrade keeps the paths somebody
+// already set. Dropping this silently reset GroovyMAME to an empty default folder and
+// the arcade games simply disappeared from the cabinet.
+static const char* LegacyKeyFor(const char* key) {
+    if (!strcmp(key, "groovymame")) return "mame";
+    return NULL;
+}
+
 std::atomic<bool> g_daemonRunning(false);
 std::atomic<DWORD> g_activePid(0);
 std::atomic<int> g_configuredPort(1999);
@@ -467,15 +475,25 @@ void LoadConfiguration() {
         std::string kExe  = std::string(e.key) + "_exe";
         std::string kRoms = std::string(e.key) + "_roms";
 
+        const char* legacy = LegacyKeyFor(e.key);
+        std::string lExe  = legacy ? std::string(legacy) + "_exe"  : "";
+        std::string lRoms = legacy ? std::string(legacy) + "_roms" : "";
+
         std::string jExe = ExtractJsonString(json, kExe.c_str());
+        if (jExe.empty() && legacy) jExe = ExtractJsonString(json, lExe.c_str());
         std::wstring wExe = jExe.empty()
-            ? RegReadString(StringToWstring(kExe).c_str(), e.defExe)
+            ? RegReadString(StringToWstring(kExe).c_str(),
+                            legacy ? RegReadString(StringToWstring(lExe).c_str(), e.defExe).c_str()
+                                   : e.defExe)
             : StringToWstring(jExe);
         SetWindowText(e.exeEdit, wExe.c_str());
 
         std::string jRoms = ExtractJsonString(json, kRoms.c_str());
+        if (jRoms.empty() && legacy) jRoms = ExtractJsonString(json, lRoms.c_str());
         std::wstring wRoms = jRoms.empty()
-            ? RegReadString(StringToWstring(kRoms).c_str(), e.defRoms)
+            ? RegReadString(StringToWstring(kRoms).c_str(),
+                            legacy ? RegReadString(StringToWstring(lRoms).c_str(), e.defRoms).c_str()
+                                   : e.defRoms)
             : StringToWstring(jRoms);
         SetWindowText(e.romsEdit, wRoms.c_str());
     }
@@ -837,6 +855,21 @@ void ScanRomDirectories() {
     for (int i = 0; i < g_emuCount; i++) {
         EmulatorDef& e = g_emus[i];
         targets.push_back({ GetText(e.romsEdit), e.key, e.sysName, e.videoMode, e.exts });
+
+        // RPCS3 keeps installed titles in its own dev_hdd0, not in a ROMs folder - a
+        // .pkg is an installer, so that is where a PS3 game ends up once it has been
+        // added. Scanned as well as the ROMs path so an installed game is found without
+        // anybody having to point a second setting at the emulator's own directory.
+        if (!strcmp(e.key, "rpcs3")) {
+            std::wstring exe = GetText(e.exeEdit);
+            size_t slash = exe.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) {
+                std::wstring hdd = exe.substr(0, slash) + L"\\dev_hdd0\\game";
+                if (fs::exists(hdd)) {
+                    targets.push_back({ hdd, e.key, e.sysName, e.videoMode, e.exts });
+                }
+            }
+        }
     }
 
     // Ask MAME for its own names once, so arcade entries list "Battle Garegga (Korea)"
@@ -856,7 +889,11 @@ void ScanRomDirectories() {
         std::wstring mameRoms = mameDef ? GetText(mameDef->romsEdit) : L"";
         if (!mameRoms.empty() && fs::exists(mameRoms)) {
             try {
-                for (const auto& e : fs::directory_iterator(mameRoms)) {
+                for (auto rit = fs::recursive_directory_iterator(
+                            mameRoms, fs::directory_options::skip_permission_denied);
+                     rit != fs::recursive_directory_iterator(); ++rit) {
+                    if (rit.depth() > 5) { rit.disable_recursion_pending(); continue; }
+                    const auto& e = *rit;
                     if (!e.is_regular_file()) continue;
                     auto ext = e.path().extension().string();
                     for (auto& c : ext) c = (char)tolower((unsigned char)c);
@@ -870,6 +907,7 @@ void ScanRomDirectories() {
         }
     }
     int skipped = 0;
+    int pkgsSeen = 0;   // PS3 installers found but not listed
 
     std::wstring catPath = GetAppDir() + L"\\games_catalog.json";
     std::ofstream catOut; catOut.open(catPath.c_str());
@@ -881,21 +919,72 @@ void ScanRomDirectories() {
         if (target.path.empty() || !fs::exists(target.path)) continue;
 
         try {
-            for (const auto& entry : fs::directory_iterator(target.path)) {
+            // Recursive, because games are routinely one-per-folder rather than loose
+            // files - a PS3 title is a directory, a Dreamcast game is a .gdi beside its
+            // tracks, and CHDs often sit in a folder named after the set. Depth is
+            // capped so a ROM drive full of extras does not take all day.
+            std::set<std::string> seenStems;   // one entry per game, not per file
+            for (auto it = fs::recursive_directory_iterator(
+                        target.path, fs::directory_options::skip_permission_denied);
+                 it != fs::recursive_directory_iterator(); ++it) {
+                if (it.depth() > 5) { it.disable_recursion_pending(); continue; }
+                const auto& entry = *it;
                 if (entry.is_regular_file()) {
                     auto ext = entry.path().extension().string();
                     for (auto& c : ext) c = tolower(c);
+                    std::string fname = entry.path().filename().string();
+                    std::string lower = fname;
+                    for (auto& c : lower) c = (char)tolower((unsigned char)c);
+
+                    // PS3 games are shipped as .pkg installers, which RPCS3 installs
+                    // rather than runs - and a single title arrives as a dozen of them
+                    // (base, patches, DLC, region fixes). Listing each as a game would
+                    // fill the cabinet with entries that cannot start. They are counted
+                    // and reported instead, and the launchable form is EBOOT.BIN.
+                    if (target.system == "rpcs3" && ext == ".pkg") { pkgsSeen++; continue; }
 
                     // Each emulator declares the extensions it can open, so a PS2 iso
-                    // does not end up listed under xemu and vice versa.
+                    // does not end up listed under xemu and vice versa. EBOOT.BIN is
+                    // matched by name because it has no distinguishing extension.
                     std::string exts = WstringToString(target.exts);
                     bool wanted = (!ext.empty() &&
                                    (exts.find(ext + ",") != std::string::npos ||
                                     (exts.size() >= ext.size() &&
                                      exts.compare(exts.size() - ext.size(), ext.size(), ext) == 0)));
+                    if (target.system == "rpcs3" && lower == "eboot.bin") wanted = true;
+
                     if (wanted) {
-                        std::string filename = entry.path().filename().string();
+                        std::string filename = fname;
                         std::string stem = entry.path().stem().string();
+
+                        // MAME and FBNeo name a set, not a file. A set's CHDs live in a
+                        // folder called after the set - roms/sfiii3/cap-33s-1.chd - so a
+                        // nested file belongs to the folder, and taking its stem instead
+                        // invented "cap-33s-1" and "cap-33s-2" as if they were games.
+                        if (target.system == "groovymame" || target.system == "fbneo") {
+                            std::error_code rc;
+                            fs::path rel = fs::relative(entry.path(), target.path, rc);
+                            if (!rc && rel.has_parent_path() && rel.begin() != rel.end()) {
+                                std::string top = rel.begin()->string();
+                                if (!top.empty() && top != "." && top != "..") stem = top;
+                            }
+                        }
+
+                        // A generic filename says nothing, so name the game after the
+                        // folder holding it, stepping over the layout directories a PS3
+                        // disc carries.
+                        if (lower == "eboot.bin") {
+                            fs::path p = entry.path().parent_path();
+                            for (int up = 0; up < 3; up++) {
+                                std::string n = p.filename().string();
+                                std::string nl = n;
+                                for (auto& c : nl) c = (char)tolower((unsigned char)c);
+                                if (nl != "usrdir" && nl != "ps3_game" && !n.empty()) { stem = n; break; }
+                                p = p.parent_path();
+                            }
+                        }
+
+                        if (!seenStems.insert(stem).second) continue;
                         // Leave out arcade sets MAME will not start - they would sit in
                         // the menu failing the moment anybody picked one.
                         if (target.system == "groovymame" && !runnable.empty() &&
@@ -978,6 +1067,8 @@ void ScanRomDirectories() {
 
     std::wstring status = L"Status: Scanned " + std::to_wstring(totalFound) + L" game(s). Catalog saved.";
     if (skipped > 0) status += L" (" + std::to_wstring(skipped) + L" set(s) left out: MAME cannot run them.)";
+    if (pkgsSeen > 0) status += L" (" + std::to_wstring(pkgsSeen) +
+                               L" PS3 .pkg installer(s) ignored - install them in RPCS3 first.)";
     SetWindowText(hStaticStatus, status.c_str());
 }
 
