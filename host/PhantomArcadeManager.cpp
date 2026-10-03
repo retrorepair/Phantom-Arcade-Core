@@ -547,23 +547,70 @@ static std::string RunCapture(const std::wstring& cmdline, const std::wstring& w
     return out;
 }
 
-// MAME appends a build date to some descriptions, e.g.
+// MAME appends a compiler-style build stamp to some descriptions:
 //   "Battle Garegga (Europe / USA / Japan / Asia) (Sat Feb 3 1996)"
-// The region is wanted, the datestamp is not. Only a trailing parenthesised group that
-// contains a 19xx/20xx year is removed, so "(Korea)" and "(v1.5, USA)" are untouched.
+// The region is wanted on the menu, the build stamp is not.
+//
+// Testing for a year alone is far too greedy, because plenty of real region groups
+// carry one and must survive intact:
+//   "DoDonPachi III (World, 2002.05.15 Master Ver)"
+//   "Deathsmiles (Japan, 2007/10/09 MASTER VER)"
+// A MAME build stamp is specifically "(Weekday Mon D YYYY)": it always contains an
+// English month abbreviation and never a comma, which neither of those does. Requiring
+// all three - year, month name, no comma - strips the stamp and leaves regions alone.
 static std::string TrimBuildDate(const std::string& desc) {
-    if (desc.empty() || desc.back() != ')') return desc;
+    if (desc.size() < 3 || desc.back() != ')') return desc;
     size_t open = desc.rfind('(');
     if (open == std::string::npos || open == 0) return desc;
 
     std::string tail = desc.substr(open + 1, desc.size() - open - 2);
+    if (tail.find(',') != std::string::npos) return desc;
+
     bool hasYear = false;
-    for (size_t i = 0; i + 3 < tail.size() + 1 && i + 4 <= tail.size(); i++) {
+    for (size_t i = 0; i + 4 <= tail.size(); i++) {
         if ((tail[i] == '1' && tail[i + 1] == '9') || (tail[i] == '2' && tail[i + 1] == '0')) {
             if (isdigit((unsigned char)tail[i + 2]) && isdigit((unsigned char)tail[i + 3])) { hasYear = true; break; }
         }
     }
     if (!hasYear) return desc;
+
+    // The group must be nothing BUT a date. Every run of letters in it has to be a month,
+    // a weekday or an ordinal suffix; anything else means the brackets are carrying
+    // information worth keeping, and dropping them would merge distinct sets:
+    //   "Judge Dredd (Rev B Nov. 26 1997)" and "(Rev C Dec. 17 1997)" -> two "Judge Dredd"
+    //   "Vapor TRX (GUTS Apr 10 1998 / MAIN Apr 10 1998)"
+    //   "Pump it Up: The Collection (R5/v3.43 - Nov 14 2000)"
+    // Checking whole words also keeps "Apple IIgs (1991 Mark Twain prototype)", where a
+    // substring search finds "Mar" inside "Mark".
+    static const char* dateWords[] = {
+        "jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec",
+        "mon","tue","wed","thu","fri","sat","sun",
+        "st","nd","rd","th"
+    };
+
+    bool hasMonth = false;
+    for (size_t i = 0; i < tail.size(); ) {
+        if (!isalpha((unsigned char)tail[i])) { i++; continue; }
+        size_t j = i;
+        while (j < tail.size() && isalpha((unsigned char)tail[j])) j++;
+
+        std::string word = tail.substr(i, j - i);
+        for (char& c : word) c = (char)tolower((unsigned char)c);
+
+        bool known = false, isMonth = false;
+        for (const char* w : dateWords) {
+            if (word == w) {
+                known = true;
+                isMonth = (word.size() == 3 && word != "mon" && word != "tue" && word != "wed" &&
+                           word != "thu" && word != "fri" && word != "sat" && word != "sun");
+                break;
+            }
+        }
+        if (!known) return desc;        // a real word: keep the whole group
+        if (isMonth) hasMonth = true;
+        i = j;
+    }
+    if (!hasMonth) return desc;
 
     size_t end = open;
     while (end > 0 && desc[end - 1] == ' ') end--;
