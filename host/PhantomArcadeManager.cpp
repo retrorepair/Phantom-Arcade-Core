@@ -829,6 +829,134 @@ static void FilterRunnableSets(const std::wstring& mameExe,
     }
 }
 
+// ---- PS3 titles --------------------------------------------------------------------
+//
+// An installed PS3 game is a directory named after its title id - NPUA80105 - which is
+// no use on a cabinet. The real name sits in PARAM.SFO beside it, so read that.
+//
+// SFO is a small, fixed binary format: a header giving the offsets of a key table and a
+// data table, then one 16-byte index entry per field. No library needed.
+static std::string ReadSfoTitle(const fs::path& sfo) {
+    std::ifstream f(sfo.string().c_str(), std::ios::binary);
+    if (!f.is_open()) return "";
+    std::string buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (buf.size() < 20) return "";
+
+    const unsigned char* d = (const unsigned char*)buf.data();
+    auto u32 = [&](size_t o) -> uint32_t {
+        if (o + 4 > buf.size()) return 0;
+        return (uint32_t)d[o] | ((uint32_t)d[o + 1] << 8) |
+               ((uint32_t)d[o + 2] << 16) | ((uint32_t)d[o + 3] << 24);
+    };
+    auto u16 = [&](size_t o) -> uint16_t {
+        if (o + 2 > buf.size()) return 0;
+        return (uint16_t)(d[o] | (d[o + 1] << 8));
+    };
+
+    if (u32(0) != 0x46535000u) return "";          // "\0PSF"
+    uint32_t keyTable  = u32(8);
+    uint32_t dataTable = u32(12);
+    uint32_t entries   = u32(16);
+    if (entries == 0 || entries > 1024) return "";
+
+    std::string best;
+    for (uint32_t i = 0; i < entries; i++) {
+        size_t e = 20 + (size_t)i * 16;
+        if (e + 16 > buf.size()) break;
+        uint32_t keyOff  = u16(e);
+        uint32_t dataLen = u32(e + 4);
+        uint32_t dataOff = u32(e + 12);
+
+        size_t k = keyTable + keyOff;
+        if (k >= buf.size()) continue;
+        std::string key;
+        while (k < buf.size() && d[k]) key.push_back((char)d[k++]);
+
+        // TITLE is the plain name; TITLE_xx are localisations, which we ignore so the
+        // result does not depend on which happens to come first.
+        if (key != "TITLE") continue;
+
+        size_t v = dataTable + dataOff;
+        if (v >= buf.size()) continue;
+        size_t n = dataLen;
+        if (v + n > buf.size()) n = buf.size() - v;
+        std::string val((const char*)d + v, n);
+        while (!val.empty() && (val.back() == '\0' || val.back() == ' ')) val.pop_back();
+        if (!val.empty()) { best = val; break; }
+    }
+    return best;
+}
+
+// Find PARAM.SFO for a game file. An installed title keeps it beside USRDIR; a disc
+// layout keeps it in PS3_GAME. Walk up a few levels rather than assuming either.
+static std::string Ps3TitleFor(const fs::path& romFile) {
+    fs::path p = romFile.parent_path();
+    for (int up = 0; up < 4 && !p.empty(); up++) {
+        std::error_code ec;
+        fs::path cand = p / "PARAM.SFO";
+        if (fs::exists(cand, ec)) {
+            std::string t = ReadSfoTitle(cand);
+            if (!t.empty()) return t;
+        }
+        p = p.parent_path();
+    }
+    return "";
+}
+
+// Fold a UTF-8 title down to ASCII for the cabinet.
+//
+// The launcher's font is ASCII 32..126 (phantom_font.h), so anything else draws as '?'.
+// PARAM.SFO titles routinely carry symbols - "WipEout(R) HD" - and MAME descriptions
+// carry accents, so this maps the common Latin-1 letters to their base form, drops
+// decorative symbols, and collapses whatever that leaves.
+static std::string AsciiFold(const std::string& in) {
+    static const struct { unsigned cp; const char* rep; } MAP[] = {
+        { 0x00AE, "" }, { 0x2122, "" }, { 0x00A9, "" },           // (R) (TM) (C)
+        { 0x2013, "-" }, { 0x2014, "-" },                          // en/em dash
+        { 0x2018, "'" }, { 0x2019, "'" },
+        { 0x201C, "\"" }, { 0x201D, "\"" },
+        { 0x2026, "..." }, { 0x00B7, "-" }, { 0x00D7, "x" },
+        { 0x00E0, "a" }, { 0x00E1, "a" }, { 0x00E2, "a" }, { 0x00E4, "a" }, { 0x00E5, "a" },
+        { 0x00E7, "c" }, { 0x00E8, "e" }, { 0x00E9, "e" }, { 0x00EA, "e" }, { 0x00EB, "e" },
+        { 0x00EC, "i" }, { 0x00ED, "i" }, { 0x00EE, "i" }, { 0x00EF, "i" },
+        { 0x00F1, "n" }, { 0x00F2, "o" }, { 0x00F3, "o" }, { 0x00F4, "o" }, { 0x00F6, "o" },
+        { 0x00F9, "u" }, { 0x00FA, "u" }, { 0x00FB, "u" }, { 0x00FC, "u" },
+        { 0x00C0, "A" }, { 0x00C1, "A" }, { 0x00C4, "A" }, { 0x00C7, "C" },
+        { 0x00C8, "E" }, { 0x00C9, "E" }, { 0x00D6, "O" }, { 0x00DC, "U" }, { 0x00DF, "ss" },
+    };
+
+    std::string out;
+    size_t i = 0;
+    while (i < in.size()) {
+        unsigned char c = (unsigned char)in[i];
+        if (c < 0x80) { out.push_back((char)c); i++; continue; }
+
+        // decode one UTF-8 sequence
+        unsigned cp = 0;
+        int len = 1;
+        if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+        else { i++; continue; }                       // stray continuation byte
+        if (i + len > in.size()) break;
+        for (int k = 1; k < len; k++) cp = (cp << 6) | ((unsigned char)in[i + k] & 0x3F);
+        i += len;
+
+        const char* rep = NULL;
+        for (const auto& m : MAP) if (m.cp == cp) { rep = m.rep; break; }
+        if (rep) out += rep;                          // unknown codepoints are dropped
+    }
+
+    // tidy up whatever the drops left behind
+    std::string tidy;
+    for (size_t n = 0; n < out.size(); n++) {
+        if (out[n] == ' ' && !tidy.empty() && tidy.back() == ' ') continue;
+        tidy.push_back(out[n]);
+    }
+    while (!tidy.empty() && tidy.back() == ' ') tidy.pop_back();
+    return tidy;
+}
+
 static std::string JsonEscape(const std::string& in) {
     std::string out;
     for (char c : in) {
@@ -1004,8 +1132,13 @@ void ScanRomDirectories() {
                         if (target.system == "groovymame") {
                             auto it = mameTitles.find(stem);
                             if (it != mameTitles.end()) title = it->second;
+                        } else if (target.system == "rpcs3") {
+                            // "NPUA80105" is a title id, not a name. PARAM.SFO has the name.
+                            std::string sfo = Ps3TitleFor(entry.path());
+                            if (!sfo.empty()) title = sfo;
                         }
 
+                        title = AsciiFold(title);   // the cabinet font is ASCII only
                         std::wstring listEntry = L"[" + std::wstring(target.system.begin(), target.system.end()) + L"] " +
                                                 StringToWstring(title);
                         SendMessage(hListGames, LB_ADDSTRING, 0, (LPARAM)listEntry.c_str());
@@ -1146,11 +1279,39 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
         return false;
     }
 
-    // Find the ROM on disk. The scan recorded the stem, not the extension, so the
-    // emulator's own extension list is walked to find what is actually there.
+    // Use the path the scan actually recorded. Rebuilding it from the ROMs folder and
+    // the stem only works for a file sitting directly in that folder, which stopped
+    // being true once the scan went recursive: an installed PS3 game lives under
+    // RPCS3's own dev_hdd0, so the reconstruction produced C:\Games\PS3\NPUA80105 and
+    // RPCS3 refused it as an invalid folder. The catalog already knows the real path.
     std::wstring wStem = StringToWstring(stem);
     std::wstring romPath;
     {
+        std::ifstream cf(WstringToString(GetAppDir() + L"\\games_catalog.json").c_str());
+        if (cf.is_open()) {
+            std::stringstream ss; ss << cf.rdbuf();
+            std::string cat = ss.str();
+            std::string needle = "\"id\": \"" + gameId + "\"";
+            size_t at = cat.find(needle);
+            if (at != std::string::npos) {
+                size_t rp = cat.find("\"romPath\"", at);
+                size_t end = cat.find("}", at);
+                if (rp != std::string::npos && (end == std::string::npos || rp < end)) {
+                    size_t q1 = cat.find('"', cat.find(':', rp));
+                    size_t q2 = (q1 == std::string::npos) ? std::string::npos : cat.find('"', q1 + 1);
+                    if (q2 != std::string::npos) {
+                        std::string p = cat.substr(q1 + 1, q2 - q1 - 1);
+                        for (auto& c : p) if (c == '/') c = '\\';
+                        if (!p.empty()) romPath = StringToWstring(p);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to the old reconstruction for a catalog that predates this, trying each
+    // extension the emulator declares.
+    if (romPath.empty()) {
         std::wstring exts = emu->exts;
         size_t at = 0;
         while (at <= exts.size()) {
