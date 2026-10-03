@@ -51,6 +51,7 @@ uint32_t groovy_idle_canvas_bytes(void);
 int      groovy_idle_begin(void);
 void     groovy_idle_present(const uint8_t *src);
 void     groovy_idle_end(void);
+void     groovy_force_close(void);
 }
 
 #define PH_INI       "/media/fat/config/phantom.ini"
@@ -473,6 +474,27 @@ void phantom_send_kill(void)
 	LOGP("kill sent\n");
 }
 
+/* "Stop the game and come back to the menu", as one action.
+ *
+ * Both halves are needed. Telling the host to kill the emulator leaves the core still
+ * holding the session - GroovyMAME has no keepalive capability, so a process that was
+ * terminated never sends CMD_CLOSE and the idle timeout is not allowed to reap it. The
+ * CRT would keep showing the last frame for ever. Closing locally alone would be worse:
+ * the launcher would return while the emulator carried on running on the PC, still
+ * streaming into a core that had stopped listening.
+ *
+ * Order matters: the KILL goes first so the emulator is already on its way out by the
+ * time the core stops accepting its frames. */
+void phantom_return_to_launcher(void)
+{
+	phantom_send_kill();
+	groovy_force_close();
+	snprintf(ui.status, sizeof(ui.status), "Stopped. Back at the launcher.");
+	t_status_set = now_ms();
+	ui.dirty = 1;
+	LOGP("returned to launcher on request\n");
+}
+
 void phantom_request_refresh(void)
 {
 	live_host[0] = 0;
@@ -835,7 +857,7 @@ int phantom_exit_hotkey(unsigned char joy, uint32_t mask)
 	if (!hk_fired && (int32_t)(t - hk_since) >= T_EXIT_HOLD)
 	{
 		hk_fired = 1;
-		phantom_send_kill();
+		phantom_return_to_launcher();
 		return 1;
 	}
 	return 0;

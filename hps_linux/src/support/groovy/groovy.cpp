@@ -1278,7 +1278,22 @@ static void setClose()
 	user_io_status_set(AUDIO_RATE_OPT, (uint32_t)0);
  	user_io_status_set(AUDIO_CHANNELS_OPT, (uint32_t)0);
  	user_io_status_set(RGB_MODE_OPT, (uint32_t)0);
- 	user_io_status_set(LZ4_OPT, (uint32_t)0); 	
+ 	user_io_status_set(LZ4_OPT, (uint32_t)0);
+}
+
+/* Hand the screen back to the launcher on demand, without waiting for the client.
+ *
+ * This cannot be left to the idle timeout. That close is licensed by CAP_KEEPALIVE
+ * alone, and GroovyMAME sends no caps byte and no keepalives, so a client that is
+ * killed outright - which is exactly what "stop the game" does - never produces a
+ * CMD_CLOSE and is never reaped. The core would hold its last frame on the CRT
+ * indefinitely and the menu would simply never come back.
+ *
+ * So the request tears the session down from this side. setClose() re-raises the idle
+ * screen itself, which is where the launcher comes from. */
+extern "C" void groovy_force_close(void)
+{
+	setClose();
 }
 
 #ifdef _AF_XDP

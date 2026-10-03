@@ -37,6 +37,8 @@
 #include <filesystem>
 #include <algorithm>
 #include <map>
+#include <mutex>
+#include <set>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -84,7 +86,8 @@ namespace fs = std::filesystem;
 // Global State
 HINSTANCE hInst = NULL;
 HWND hMainWnd = NULL;
-HWND hEditMisterIp, hEditUdpPort, hEditLaunchDelay;
+HWND hEditLaunchDelay;
+HWND hStaticMisterIp = NULL;   // read-only: the address we discovered
 HWND hEditMameExe, hEditMameRoms;
 HWND hEditRetroarchExe, hEditRetroarchRoms;
 HWND hEditDolphinExe, hEditGcRoms;
@@ -311,14 +314,49 @@ int ExtractJsonInt(const std::string& json, const std::string& key, int defaultV
     }
 }
 
-int GetPortFromUI() {
-    std::wstring portText = GetText(hEditUdpPort);
-    if (portText.empty()) return 1999;
-    try {
-        int p = std::stoi(portText);
-        if (p > 0 && p <= 65535) return p;
-    } catch (...) {}
-    return 1999;
+// ---- MiSTer address and port ------------------------------------------------------
+//
+// Neither of these is a setting any more, but for different reasons, and the difference
+// matters:
+//
+//   The address is genuinely discovered. The MiSTer opens every conversation - it
+//   broadcasts DISCOVER_PHANTOM and sends LAUNCH - so the daemon simply remembers the
+//   source address of whatever arrived and hands that to GroovyMAME as -mister_ip. It
+//   follows the cabinet across DHCP leases on its own, and a typed value could only
+//   ever be wrong. There is nothing to configure.
+//
+//   The port cannot be discovered, because discovery itself has to arrive somewhere.
+//   It is a rendezvous both ends agree on in advance, so it is a constant here and in
+//   the core (phantom.ini UDP_PORT). It is not exposed as a control because changing it
+//   on one side alone silently breaks discovery, which is a far more likely outcome
+//   than a clash on 1999. phantom_config.json's "udp_port" is still honoured for the
+//   rare case where something else owns the port and both ends get changed together.
+#define PHANTOM_DEFAULT_PORT 1999
+
+static int g_udpPort = PHANTOM_DEFAULT_PORT;
+
+static std::mutex g_ipMutex;
+static std::wstring g_learnedMisterIp;   // last address a MiSTer contacted us from
+
+int GetPort() { return g_udpPort; }
+
+static std::wstring GetLearnedMisterIp() {
+    std::lock_guard<std::mutex> lk(g_ipMutex);
+    return g_learnedMisterIp;
+}
+
+// Called from the UDP thread for every datagram a MiSTer sends us.
+static void NoteMisterAddress(const std::wstring& ip) {
+    {
+        std::lock_guard<std::mutex> lk(g_ipMutex);
+        if (g_learnedMisterIp == ip) return;
+        g_learnedMisterIp = ip;
+    }
+    RegWriteString(L"mister_client_ip", ip);
+    if (hStaticMisterIp) {
+        std::wstring shown = ip + L"  (discovered)";
+        SetWindowText(hStaticMisterIp, shown.c_str());
+    }
 }
 
 // Load Configuration (Checks JSON file in AppDir, then merges with Registry)
@@ -333,14 +371,26 @@ void LoadConfiguration() {
         in.close();
     }
 
-    // 1. MiSTer IP
+    // 1. Last discovered MiSTer address. Only a seed for the manual Launch button
+    //    before any cabinet has been heard from; a real MiSTer overwrites it the
+    //    moment it broadcasts. Not shown as an editable field - see GetPort above.
     std::string misterIp = ExtractJsonString(json, "mister_client_ip");
-    std::wstring wMisterIp = misterIp.empty() ? RegReadString(L"mister_client_ip", L"192.168.1.50") : StringToWstring(misterIp);
-    SetWindowText(hEditMisterIp, wMisterIp.c_str());
+    std::wstring wMisterIp = misterIp.empty() ? RegReadString(L"mister_client_ip", L"") : StringToWstring(misterIp);
+    if (!wMisterIp.empty()) {
+        {
+            std::lock_guard<std::mutex> lk(g_ipMutex);
+            g_learnedMisterIp = wMisterIp;
+        }
+        if (hStaticMisterIp) {
+            std::wstring shown = wMisterIp + L"  (last seen)";
+            SetWindowText(hStaticMisterIp, shown.c_str());
+        }
+    }
 
-    // 2. UDP Port
-    int port = ExtractJsonInt(json, "udp_port", RegReadInt(L"udp_port", 1999));
-    SetWindowText(hEditUdpPort, std::to_wstring(port).c_str());
+    // 2. Rendezvous port. Honoured if present so a clash can be worked around, but both
+    //    ends have to be changed together, so it is deliberately not a control.
+    g_udpPort = ExtractJsonInt(json, "udp_port", RegReadInt(L"udp_port", PHANTOM_DEFAULT_PORT));
+    if (g_udpPort <= 0 || g_udpPort > 65535) g_udpPort = PHANTOM_DEFAULT_PORT;
 
     // 2b. PC-side launch delay. Zero by default - the merged Phantom Arcade core does not
     // reconfigure the FPGA at launch time, so there is nothing to wait for.
@@ -400,8 +450,8 @@ void LoadConfiguration() {
 
 // Save Configuration to phantom_config.json AND Windows Registry
 void SaveConfiguration() {
-    std::wstring misterIp = GetText(hEditMisterIp);
-    int port = GetPortFromUI();
+    std::wstring misterIp = GetLearnedMisterIp();
+    int port = GetPort();
     std::wstring mameExe = GetText(hEditMameExe);
     std::wstring mameRoms = GetText(hEditMameRoms);
     std::wstring raExe = GetText(hEditRetroarchExe);
@@ -658,6 +708,67 @@ static std::map<std::string, std::string> LoadMameTitles(const std::wstring& mam
     return titles;
 }
 
+// ---- which arcade sets will actually start -----------------------------------------
+//
+// A roms folder is not a games list. Two kinds of entry in one will start MAME and have
+// it exit again within a second, which from the cabinet is indistinguishable from the
+// stream failing - the launcher just sits on "starting stream" and gives up:
+//
+//   Incomplete sets. "mame -verifyroms" calls these bad; a missing parent, BIOS or
+//   device ROM is enough. ("best available" is fine - it runs, something is just
+//   undumped.)
+//
+//   Things that are not games. Devices and BIOS images live in roms folders quite
+//   legitimately - hd44780 is an LCD controller, model1io is Sega I/O board firmware.
+//   MAME flags them in -listxml as runnable="no".
+//
+// Both answers come from the user's own MAME, asked once per scan, and a set is listed
+// only if it passes both. Anything we cannot get an answer about is kept rather than
+// hidden, so a parsing failure cannot silently empty somebody's library.
+static void FilterRunnableSets(const std::wstring& mameExe,
+                               const std::vector<std::string>& stems,
+                               std::set<std::string>& outRunnable) {
+    outRunnable.insert(stems.begin(), stems.end());   // default to keeping everything
+    if (mameExe.empty() || stems.empty()) return;
+
+    std::wstring dir;
+    size_t slash = mameExe.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) dir = mameExe.substr(0, slash);
+
+    std::wstring names;
+    for (const auto& s : stems) names += L" " + StringToWstring(s);
+
+    // 1. bad romsets
+    std::string verify = RunCapture(L"\"" + mameExe + L"\" -verifyroms" + names, dir);
+    std::stringstream vs(verify);
+    std::string line;
+    while (std::getline(vs, line)) {
+        // "romset <name> is bad"
+        if (line.rfind("romset ", 0) != 0) continue;
+        size_t sp = line.find(' ', 7);
+        if (sp == std::string::npos) continue;
+        std::string name = line.substr(7, sp - 7);
+        if (line.find(" is bad") != std::string::npos) outRunnable.erase(name);
+    }
+
+    // 2. devices and other non-runnable machines
+    std::string xml = RunCapture(L"\"" + mameExe + L"\" -listxml" + names, dir);
+    if (xml.size() > 64) {
+        size_t at = 0;
+        while ((at = xml.find("<machine name=\"", at)) != std::string::npos) {
+            size_t q = at + 15;
+            size_t e = xml.find('"', q);
+            if (e == std::string::npos) break;
+            std::string name = xml.substr(q, e - q);
+            size_t tagEnd = xml.find('>', e);
+            if (tagEnd == std::string::npos) break;
+            std::string tag = xml.substr(e, tagEnd - e);
+            if (tag.find("runnable=\"no\"") != std::string::npos) outRunnable.erase(name);
+            at = tagEnd;
+        }
+    }
+}
+
 static std::string JsonEscape(const std::string& in) {
     std::string out;
     for (char c : in) {
@@ -692,7 +803,31 @@ void ScanRomDirectories() {
     // rather than "bgaregga". Empty if MAME is not configured, in which case titles fall
     // back to the ROM stem.
     SetWindowText(hStaticStatus, L"Status: Reading MAME's game list...");
-    std::map<std::string, std::string> mameTitles = LoadMameTitles(GetText(hEditMameExe));
+    std::wstring mameExeForScan = GetText(hEditMameExe);
+    std::map<std::string, std::string> mameTitles = LoadMameTitles(mameExeForScan);
+
+    // Ask MAME which of the arcade sets on disk will actually start, before listing any
+    // of them. See FilterRunnableSets.
+    std::set<std::string> runnable;
+    {
+        std::vector<std::string> stems;
+        std::wstring mameRoms = GetText(hEditMameRoms);
+        if (!mameRoms.empty() && fs::exists(mameRoms)) {
+            try {
+                for (const auto& e : fs::directory_iterator(mameRoms)) {
+                    if (!e.is_regular_file()) continue;
+                    auto ext = e.path().extension().string();
+                    for (auto& c : ext) c = (char)tolower((unsigned char)c);
+                    if (ext == ".zip" || ext == ".7z" || ext == ".chd") stems.push_back(e.path().stem().string());
+                }
+            } catch (...) {}
+        }
+        if (!stems.empty()) {
+            SetWindowText(hStaticStatus, L"Status: Checking which sets MAME can run...");
+            FilterRunnableSets(mameExeForScan, stems, runnable);
+        }
+    }
+    int skipped = 0;
 
     std::wstring catPath = GetAppDir() + L"\\games_catalog.json";
     std::ofstream catOut; catOut.open(catPath.c_str());
@@ -713,6 +848,14 @@ void ScanRomDirectories() {
                         ext == ".cso" || ext == ".elf" || ext == ".cue" || ext == ".sfc" || ext == ".md") {
                         std::string filename = entry.path().filename().string();
                         std::string stem = entry.path().stem().string();
+                        // Leave out arcade sets MAME will not start - they would sit in
+                        // the menu failing the moment anybody picked one.
+                        if (target.system == "groovymame" && !runnable.empty() &&
+                            runnable.find(stem) == runnable.end()) {
+                            skipped++;
+                            continue;
+                        }
+
                         std::string id = target.system + "_" + stem;
                         std::string cleanRomPath = entry.path().generic_string();
 
@@ -758,6 +901,7 @@ void ScanRomDirectories() {
     catOut.close();
 
     std::wstring status = L"Status: Scanned " + std::to_wstring(totalFound) + L" game(s). Catalog saved.";
+    if (skipped > 0) status += L" (" + std::to_wstring(skipped) + L" set(s) left out: MAME cannot run them.)";
     SetWindowText(hStaticStatus, status.c_str());
 }
 
@@ -777,9 +921,9 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
         Sleep(150);
     }
 
-    std::wstring misterIp = targetMisterIp.empty() ? GetText(hEditMisterIp) : targetMisterIp;
+    std::wstring misterIp = targetMisterIp.empty() ? GetLearnedMisterIp() : targetMisterIp;
     if (misterIp.empty()) misterIp = L"192.168.1.50";
-    int port = GetPortFromUI();
+    int port = GetPort();
 
     std::wstring mameExe = GetText(hEditMameExe);
     std::wstring mameRoms = GetText(hEditMameRoms);
@@ -1069,6 +1213,11 @@ DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
             inet_ntop(AF_INET, &(clientAddr.sin_addr), clientIpStr, INET_ADDRSTRLEN);
             std::wstring misterClientIp = StringToWstring(clientIpStr);
 
+            // Every datagram from a cabinet re-confirms where it is. This is the only
+            // source of the address: there is no field to type it into, and a MiSTer
+            // that moves to a new DHCP lease is picked up on its next broadcast.
+            NoteMisterAddress(misterClientIp);
+
             if (msg.rfind("DISCOVER_PHANTOM", 0) == 0) {
                 std::string reply = "PHANTOM_HOST_ONLINE:" + std::to_string(port) + ":8088";
                 sendto(g_udpSocket, reply.c_str(), (int)reply.length(), 0, (sockaddr*)&clientAddr, clientLen);
@@ -1137,7 +1286,7 @@ void EnsureFirewallRules() {
 
 void ToggleDaemon() {
     if (!g_daemonRunning) {
-        int port = GetPortFromUI();
+        int port = GetPort();
         g_configuredPort.store(port);
         g_daemonRunning = true;
 
@@ -1180,11 +1329,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         int y = 12;
-        CreateWindow(L"STATIC", L"MiSTer IP:", WS_CHILD | WS_VISIBLE, 20, y, 70, 20, hWnd, NULL, hInst, NULL);
-        hEditMisterIp = CreateWindow(L"EDIT", L"192.168.1.50", WS_CHILD | WS_VISIBLE | WS_BORDER, 95, y, 120, 22, hWnd, (HMENU)IDC_EDIT_MISTER_IP, hInst, NULL);
-
-        CreateWindow(L"STATIC", L"UDP Port:", WS_CHILD | WS_VISIBLE, 225, y, 65, 20, hWnd, NULL, hInst, NULL);
-        hEditUdpPort = CreateWindow(L"EDIT", L"1999", WS_CHILD | WS_VISIBLE | WS_BORDER, 295, y, 55, 22, hWnd, (HMENU)IDC_EDIT_UDP_PORT, hInst, NULL);
+        CreateWindow(L"STATIC", L"MiSTer:", WS_CHILD | WS_VISIBLE, 20, y, 55, 20, hWnd, NULL, hInst, NULL);
+        hStaticMisterIp = CreateWindow(L"STATIC", L"waiting for a cabinet to announce itself...",
+                                      WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP, 80, y + 2, 280, 20,
+                                      hWnd, NULL, hInst, NULL);
 
         CreateWindow(L"STATIC", L"Launch Delay (s):", WS_CHILD | WS_VISIBLE, 365, y, 110, 20, hWnd, NULL, hInst, NULL);
         hEditLaunchDelay = CreateWindow(L"EDIT", L"0", WS_CHILD | WS_VISIBLE | WS_BORDER, 480, y, 40, 22, hWnd, (HMENU)IDC_EDIT_LAUNCH_DELAY, hInst, NULL);

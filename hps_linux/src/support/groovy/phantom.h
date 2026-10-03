@@ -62,6 +62,7 @@ const char *phantom_state_text(void);
 int         phantom_title_count(void);
 void        phantom_request_refresh(void);
 void        phantom_send_kill(void);
+void        phantom_return_to_launcher(void);
 int         phantom_get_exit_hotkey(void);
 void        phantom_set_exit_hotkey(int on);
 void        phantom_save_config(void);

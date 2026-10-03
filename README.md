@@ -70,8 +70,26 @@ Three things, and one line of configuration.
 Then on the PC, run `build_output/PhantomArcadeManager.exe`, point it at your emulators and
 ROM folders, press **Auto-Scan ROMs**, and press **Start Background Daemon**.
 
-Nothing else. The core finds the host by broadcast, so there is no IP to type in. If your
-network drops broadcast, create `/media/fat/config/phantom.ini`:
+Nothing else — there is no address to configure at either end. The cabinet opens every
+conversation, so the daemon takes the MiSTer's address from the datagrams it receives and
+hands that to GroovyMAME as `-mister_ip`. It follows the cabinet across DHCP leases by
+itself, and the manager shows the address it discovered rather than offering a box to
+type one into.
+
+The port is the one thing that cannot be discovered, since discovery has to arrive
+somewhere. Both ends therefore agree on **1999** in advance. It is not a control either,
+because changing it on one side alone silently breaks discovery — a far likelier mistake
+than a clash on 1999. If something else really does own that port, change it in both
+`phantom_config.json` (`udp_port`) and `phantom.ini` (`UDP_PORT`) together.
+
+Auto-Scan asks MAME which sets will actually start, and lists only those. Incomplete
+romsets (`mame -verifyroms` calls them bad) and entries that are not games at all —
+devices and BIOS images like `hd44780` or `model1io`, which live in roms folders quite
+legitimately — are left out. They would otherwise sit in the menu and fail the instant
+anyone chose one, which from the cabinet looks exactly like a broken stream.
+
+If your network drops broadcast, you can still name the host in
+`/media/fat/config/phantom.ini`:
 
 ```ini
 [SERVER]
@@ -103,7 +121,17 @@ only the default, not the only option.
 | Left / Right | change platform tab |
 | Button 1 | launch the highlighted game |
 | Start | search for the host again and refresh the catalog |
-| Start + Select, held 1.2 s | tell the host to kill the running emulator |
+| Start + Select, held 1.2 s | stop the game and come back to the launcher |
+
+To get back to the menu there is also **OSD → System → Phantom Arcade → Return to
+launcher**, which does the same thing.
+
+Either route does two things, and both are needed. It tells the host to kill the
+emulator, and it closes the session from the core's side. Without the second half the
+menu would never come back: the core's idle timeout may only reap a client that
+advertised the keepalive capability, and GroovyMAME advertises none, so an emulator that
+was killed outright never sends `CMD_CLOSE` and the CRT would hold its last frame
+indefinitely.
 
 Keyboard equivalents: arrows, Enter/Space, Esc, F5.
 

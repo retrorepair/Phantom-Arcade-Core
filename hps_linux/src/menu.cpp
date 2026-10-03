@@ -2617,11 +2617,13 @@ void HandleUI(void)
 
 			MenuWrite(n++);
 			MenuWrite(n++, " Search for host now", menusub == 2, 0);
-			MenuWrite(n++, " Stop host emulator", menusub == 3, 0);
+			MenuWrite(n++, " Return to launcher", menusub == 3, 0);
 
 			MenuWrite(n++);
-			MenuWrite(n++, " Start+Select held for 1.2s", 0, 1);
-			MenuWrite(n++, " also stops the emulator.", 0, 1);
+			MenuWrite(n++, " Return stops the game on the", 0, 1);
+			MenuWrite(n++, " PC and brings the menu back.", 0, 1);
+			MenuWrite(n++, " Start+Select held 1.2s does", 0, 1);
+			MenuWrite(n++, " the same from the cabinet.", 0, 1);
 
 			while (n < OsdGetSize() - 1) MenuWrite(n++);
 			MenuWrite(n++, STD_EXIT, menusub == 5, 0, OSD_ARROW_LEFT);
@@ -2664,8 +2666,11 @@ void HandleUI(void)
 			case 3:
 				if (select)
 				{
-					phantom_send_kill();
-					menustate = MENU_PHANTOM1;
+					/* Stops the emulator AND closes the session locally - see
+					 * phantom_return_to_launcher. Leaving the OSD afterwards puts the
+					 * launcher straight on screen, which is the point of the item. */
+					phantom_return_to_launcher();
+					menustate = MENU_NONE1;
 				}
 				break;
 
