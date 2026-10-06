@@ -379,6 +379,26 @@ static int isCorePriority = 0;
 static uint8_t  blitSuspended      = 0;
 static uint32_t blitSuspendBytes   = 0;
 static uint32_t blitSuspendOffset  = 0;
+
+// The chunk size the client is sending at. CMD_INIT carries compression, audio rate,
+// channels, rgb mode and caps - but NOT the mtu, which the client takes and uses only for
+// its own chunking. So it is learned from the stream instead: every datagram that is not
+// a transfer's last one is exactly one chunk, and the core knows which those are because
+// it knows the expected total. That makes the loss detection correct for any client mtu,
+// jumbo included, with no protocol change and no client change.
+#define BLIT_CHUNK_DEFAULT 1472
+static uint32_t blitChunk = BLIT_CHUNK_DEFAULT;
+
+static inline void learnBlitChunk(uint32_t len, uint32_t recvAfter, uint32_t want)
+{
+	// Only a non-final chunk measures the size; a tail is short by definition and a
+	// transfer that fits in one datagram says nothing about the chunking.
+	if (len > blitChunk && recvAfter < want)
+	{
+		LOG(1, "[CHUNK][client chunk size %u -> %u]\n", blitChunk, len);
+		blitChunk = len;
+	}
+}
 static int usingOldBlit = 0;
 
 static uint8_t hpsBlit = 0;
@@ -403,7 +423,10 @@ static uint8_t recvNotifyDefer = 0;              // mode 2 batch loop defers per
 static struct mmsghdr recvMsgs[RECV_BATCH];
 static struct iovec recvIovs[RECV_BATCH];
 static struct sockaddr_in recvAddrs[RECV_BATCH];
-static char recvBatchBuf[RECV_BATCH][2048] __attribute__((aligned(64)));
+// 4096 rather than 2048: a jumbo client chunks at MTU-28, which is 3772 at the 3800 the
+// Jumbo frames option sets eth0 to. At 2048 those arrive truncated and every frame is
+// short, which is indistinguishable from heavy packet loss.
+static char recvBatchBuf[RECV_BATCH][4096] __attribute__((aligned(64)));
 static uint8_t recvBatchReady = 0;
 #endif
 
@@ -1277,6 +1300,7 @@ static void setClose()
 	isBlitting = 0;
 	isCorePriority = 0;   // defensive: a mid-blit caller (idle timeout) leaves this 1; the poll loop would spin
 	blitSuspended = 0;    // likewise: a suspend outstanding across a close must not resume into the new session
+	blitChunk = BLIT_CHUNK_DEFAULT;   // the next client may chunk at a different mtu, including a smaller one
 	usingOldBlit = 0;
 	numBlit = 0;
 	blitCompression = 0;
@@ -1929,6 +1953,7 @@ static void setBlitAudio(uint16_t udp_bytes_samples)
 static void setBlitRawAudio(uint16_t len)
 {
 	poc->PoC_bytes_recv += len;
+	learnBlitChunk(len, poc->PoC_bytes_recv, poc->PoC_bytes_audio_len);
 	isBlitting = (poc->PoC_bytes_recv >= poc->PoC_bytes_audio_len) ? 0 : 2;
 
 	LOG(2, "[DDR_AUDIO][%d/%d]\n", poc->PoC_bytes_recv, poc->PoC_bytes_audio_len);
@@ -1957,6 +1982,7 @@ static void setBlitRawAudio(uint16_t len)
 static void setBlitRaw(uint16_t len)
 {
 	poc->PoC_bytes_recv += len;
+	learnBlitChunk(len, poc->PoC_bytes_recv, poc->PoC_bytes_len);
 	isBlitting = (poc->PoC_bytes_recv >= poc->PoC_bytes_len) ? 0 : 1;
 
        	if (!hpsBlit && !recvNotifyDefer) //ASAP (mode 2 notifies once per recv batch instead)
@@ -1991,6 +2017,7 @@ static void setBlitRaw(uint16_t len)
 static void setBlitLZ4(uint16_t len)
 {
 	poc->PoC_bytes_recv += len;
+	learnBlitChunk(len, poc->PoC_bytes_recv, poc->PoC_bytes_lz4_len);
 	isBlitting = (poc->PoC_bytes_recv >= poc->PoC_bytes_lz4_len) ? 0 : 1;
 
 	if (!hpsBlit && !recvNotifyDefer) //ASAP (mode 2 notifies once per recv batch instead)
@@ -2599,7 +2626,7 @@ static inline void process_packet(char *recvbufPtr, int len)
 		if (isBlitting)
 		{
 			//udp error lost detection (jumbo to do)
-			if (len > 0 && len < 1472)
+			if (len > 0 && len < (int) blitChunk)
 			{
 				/* A short datagram during a transfer is one of two things, and this used to
 				 * assume the first: the transfer's final chunk, or a command the client
@@ -2617,7 +2644,7 @@ static inline void process_packet(char *recvbufPtr, int len)
 				 * discrimination, kept because it is the safer reading: acting on a bogus
 				 * CMD_AUDIO length is worse than losing one frame. */
 				if (isBlitting == 1 && cmdSuspendsBlit(recvbufPtr, len) &&
-				    (uint32_t) len != blitWant % 1472 &&
+				    (uint32_t) len != blitWant % blitChunk &&
 				    poc->PoC_bytes_recv + len != blitWant)
 				{
 					suspendedNow      = 1;
@@ -2645,7 +2672,7 @@ static inline void process_packet(char *recvbufPtr, int len)
 						groovy_FPGA_blit(poc->PoC_bytes_len, 65535);
 					}
 					isBlitting = 0;
-					prev_len = poc->PoC_bytes_len % 1472;
+					prev_len = poc->PoC_bytes_len % blitChunk;
 					tota_len = poc->PoC_bytes_len;
 				}
 				if (isBlitting == 1 && blitCompression && poc->PoC_bytes_recv + len != poc->PoC_bytes_lz4_len) // lz4 rgb
@@ -2655,13 +2682,13 @@ static inline void process_packet(char *recvbufPtr, int len)
 						groovy_FPGA_blit_lz4(poc->PoC_bytes_lz4_len, 65535);
 					}
 					isBlitting = 0;
-					prev_len = poc->PoC_bytes_lz4_len % 1472;
+					prev_len = poc->PoC_bytes_lz4_len % blitChunk;
 					tota_len = poc->PoC_bytes_lz4_len;
 				}
 				if (isBlitting == 2 && poc->PoC_bytes_recv + len != poc->PoC_bytes_audio_len) // audio
 				{
 					isBlitting = 0;
-					prev_len = poc->PoC_bytes_audio_len % 1472;
+					prev_len = poc->PoC_bytes_audio_len % blitChunk;
 					tota_len = poc->PoC_bytes_audio_len;
 				}
 				/* suspendedNow already cleared isBlitting so the dispatch runs; it must not
