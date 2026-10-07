@@ -79,6 +79,19 @@ settings, and there is a **MiSTer** page in Tools → Settings.
 
 ## Next
 
+- **OutRun 2 will not boot in xemu, and it is the image, not the stack.** `OutRun 2 (USA).iso` is a
+  7.29 GB full redump with the XDVDFS filesystem at offset `0x18300000` behind a 0.38 GB video
+  partition. xemu only boots an xiso (filesystem at 0), so it sits at "insert Xbox disc". Halo 2
+  is 4.40 GB at offset 0 and boots fine. The fix is to copy bytes `0x18300000`..end into a new
+  file (6.91 GB); the original is not touched. Not done yet - it needs 6.91 GB and a decision
+  about where the result goes, because the scan dedupes by filename stem and a second
+  `OutRun 2 (USA)` in the same tree would collide. The scan could also flag a non-zero base as
+  unplayable instead of listing it; `XboxMetaFor` already finds the base.
+- **xemu was a slideshow, then was not.** Measured at 1.8 fresh frames/s with `present` at 64 ms
+  mean while NVIDIA rendered into a window the AMD iGPU owns; Groovy's own `send` (5 ms) and
+  `pace` (0.2 ms) were fine throughout. A reboot of the laptop cleared it, so the cause was host
+  state, not the forks. If it returns, see `memory/xemu-gl-vulkan-same-gpu.md`: never put xemu's
+  Vulkan device on a different GPU from its OpenGL capture - that gives fast black frames.
 - **GameCube/Wii disc titles.** Same treatment as Xbox — the disc header at 0x20 carries
   the real title, so Galaxy and Sunshine could drop their `(Europe, Australia) (En,Fr,...)`
   filename baggage. The user has been offered this and not yet answered.
@@ -104,5 +117,16 @@ Forks under `C:\Users\joelw\Documents\groovy-forks\` except rpcs3
 `-hostkey SHA256:FqNJOsj3FLUoMQxgn+cqGoXvVfENmVK4QFoSCMKl2lU` to plink/pscp or it hangs
 waiting for a confirmation it cannot read from stdin.
 
-The launcher the user actually runs is `build_output/PhantomArcadeManager.exe`, not the one
-built in `host/`. Its startup ROM scan takes ~85 s before the game list fills.
+**The launcher the user runs is `C:\PhantomArcade\PhantomArcadeManager.exe`** - not
+`build_output\`, which is only the repo's shipped copy of the same build. That folder holds
+the user's own `phantom_config.json`, `mame_titles.txt` and `mister\`, so deploy by copying
+the exe over the top and leave everything else in it alone. This file used to say
+`build_output` was the one in use; that was wrong, and it left the real install on the Oct 3
+build - no Dolphin or 86Box rows, Xbox games named from their filenames - for a day.
+
+The daemon serves `games_catalog.json` from the **folder its own exe is in**, so two copies
+means two catalogs and whichever one is running wins. Twelve copies existed this session
+(eleven under `Documents`, deleted, plus this one at the top of C:). Search the whole drive
+before declaring there is only one. Its startup scan takes ~85 s before the list fills, and
+the cabinet only re-fetches when the host goes from offline to online, so restart the
+launcher to push a new catalog.
