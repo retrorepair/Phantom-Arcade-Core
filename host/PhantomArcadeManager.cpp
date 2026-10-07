@@ -907,6 +907,187 @@ static std::string ReadSfoTitle(const fs::path& sfo) {
     return best;
 }
 
+
+// ---- Xbox: the title lives in the disc's XBE, not in its filename --------------------
+//
+// A scene release is called "eps-h2u.iso" and a redump is called something nearly as
+// unhelpful, so the only trustworthy name for an Xbox game is the one the executable
+// carries. default.xbe holds a certificate with the title, the publisher and the build
+// date, which is what the cabinet should be showing.
+//
+// Two formats have to be read to get there: XDVDFS, the disc filesystem, to find
+// default.xbe; and the XBE header, to find the certificate inside it. Both are simple and
+// fixed, and only a few KB is ever read - the ISO is not scanned.
+
+struct XboxMeta {
+    std::string title;
+    std::string year;
+    std::string maker;
+};
+
+static const unsigned XISO_SECTOR = 2048;
+
+static bool ReadAt(std::ifstream& f, unsigned long long off, void* dst, size_t len) {
+    f.clear();
+    f.seekg((std::streamoff)off, std::ios::beg);
+    if (!f) return false;
+    f.read((char*)dst, (std::streamsize)len);
+    return (size_t)f.gcount() == len;
+}
+
+static uint32_t Rd32(const unsigned char* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint16_t Rd16(const unsigned char* p) {
+    return (uint16_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8));
+}
+
+// Walk the directory tree for a name. Entries are a binary tree whose child links are
+// 4-byte-unit offsets into the same table; `seen` stops a malformed image looping.
+static bool XisoFind(const std::vector<unsigned char>& table, const std::string& want,
+                     uint32_t& outSector, uint32_t& outSize) {
+    std::vector<uint32_t> stack;
+    std::set<uint32_t> seen;
+    stack.push_back(0);
+    while (!stack.empty()) {
+        const uint32_t off = stack.back();
+        stack.pop_back();
+        if (!seen.insert(off).second) continue;
+        const size_t p = (size_t)off * 4;
+        if (p + 14 > table.size()) continue;
+
+        const uint16_t left = Rd16(&table[p]);
+        const uint16_t right = Rd16(&table[p + 2]);
+        const uint32_t sector = Rd32(&table[p + 4]);
+        const uint32_t size = Rd32(&table[p + 8]);
+        const unsigned char nlen = table[p + 13];
+        if (p + 14 + nlen > table.size()) continue;
+
+        std::string name((const char*)&table[p + 14], nlen);
+        if (_stricmp(name.c_str(), want.c_str()) == 0) {
+            outSector = sector;
+            outSize = size;
+            return true;
+        }
+        if (left) stack.push_back(left);
+        if (right) stack.push_back(right);
+    }
+    return false;
+}
+
+static XboxMeta XboxMetaFor(const fs::path& iso) {
+    XboxMeta meta;
+
+    std::ifstream f(iso, std::ios::binary);
+    if (!f) return meta;
+
+    // The game partition starts at 0 in a plain xiso; a full dump carries a video
+    // partition in front of it. These are the starts seen in the wild.
+    static const unsigned long long BASES[] = { 0ull, 0x18300000ull, 0x02080000ull, 0x0FD90000ull };
+    static const char MAGIC[20] = { 'M','I','C','R','O','S','O','F','T','*','X','B','O','X','*','M','E','D','I','A' };
+
+    unsigned char vd[XISO_SECTOR];
+    unsigned long long base = 0;
+    bool haveBase = false;
+    for (unsigned long long b : BASES) {
+        if (!ReadAt(f, b + 32ull * XISO_SECTOR, vd, sizeof(vd))) continue;
+        if (memcmp(vd, MAGIC, sizeof(MAGIC)) == 0) { base = b; haveBase = true; break; }
+    }
+    if (!haveBase) return meta;
+
+    const uint32_t rootSector = Rd32(&vd[20]);
+    const uint32_t rootSize = Rd32(&vd[24]);
+    // A root table is a few KB; anything larger is a malformed or hostile image.
+    if (rootSize == 0 || rootSize > 1u * 1024u * 1024u) return meta;
+
+    std::vector<unsigned char> table(rootSize);
+    if (!ReadAt(f, base + (unsigned long long)rootSector * XISO_SECTOR, table.data(), rootSize))
+        return meta;
+
+    uint32_t xbeSector = 0, xbeSize = 0;
+    if (!XisoFind(table, "default.xbe", xbeSector, xbeSize)) return meta;
+    if (xbeSize < 0x200) return meta;
+
+    unsigned char hdr[0x200];
+    if (!ReadAt(f, base + (unsigned long long)xbeSector * XISO_SECTOR, hdr, sizeof(hdr)))
+        return meta;
+    if (memcmp(hdr, "XBEH", 4) != 0) return meta;
+
+    // The certificate is given as a virtual address; the XBE's own base address turns it
+    // back into a file offset.
+    const uint32_t baseAddr = Rd32(&hdr[0x104]);
+    const uint32_t certAddr = Rd32(&hdr[0x118]);
+    if (certAddr < baseAddr) return meta;
+    const uint32_t certOff = certAddr - baseAddr;
+    if (certOff + 0xA4 > xbeSize) return meta;
+
+    unsigned char cert[0xA4];
+    if (!ReadAt(f, base + (unsigned long long)xbeSector * XISO_SECTOR + certOff, cert, sizeof(cert)))
+        return meta;
+
+    // Title name: 40 UTF-16LE characters, NUL padded.
+    std::wstring wtitle;
+    for (int i = 0; i < 40; i++) {
+        const wchar_t c = (wchar_t)Rd16(&cert[0x0C + i * 2]);
+        if (!c) break;
+        wtitle.push_back(c);
+    }
+    while (!wtitle.empty() && (wtitle.back() == L' ' || wtitle.back() == L'\t')) wtitle.pop_back();
+    if (!wtitle.empty()) meta.title = WstringToString(wtitle);
+
+    // The build date. Not the release date, but the right year, which is all the cabinet
+    // shows - and a wrong one is worse than none, so an implausible value is dropped.
+    const uint32_t when = Rd32(&cert[0x04]);
+    if (when > 883612800u && when < 1577836800u) {   // 1998-01-01 .. 2020-01-01
+        const time_t t = (time_t)when;
+        struct tm tmv;
+        if (gmtime_s(&tmv, &t) == 0) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%d", tmv.tm_year + 1900);
+            meta.year = buf;
+        }
+    }
+
+    // The publisher is the top half of the title id, as two ASCII letters.
+    const uint32_t titleId = Rd32(&cert[0x08]);
+    const char pub[3] = { (char)((titleId >> 24) & 0xFF), (char)((titleId >> 16) & 0xFF), 0 };
+    if (isalnum((unsigned char)pub[0]) && isalnum((unsigned char)pub[1])) {
+        static const struct { const char* code; const char* name; } PUBS[] = {
+            { "MS", "Microsoft" },       { "AC", "Acclaim" },        { "AQ", "Aqua System" },
+            { "AT", "Atlus" },           { "AV", "Activision" },     { "BA", "Bandai" },
+            { "BL", "Black Box" },       { "BM", "BAM! Entertainment" }, { "BS", "Bethesda" },
+            { "BV", "Buena Vista" },     { "BW", "BBC Multimedia" }, { "CC", "Codemasters" },
+            { "CK", "Capcom" },          { "CM", "Capcom" },         { "CV", "Crave" },
+            { "DC", "DreamCatcher" },    { "EA", "Electronic Arts" },{ "EM", "Empire" },
+            { "ES", "Eidos" },           { "FS", "From Software" },  { "GV", "Groove Games" },
+            { "HW", "Highwaystar" },     { "IF", "Idea Factory" },   { "IG", "Infogrames" },
+            { "JW", "JoWood" },          { "KN", "Konami" },         { "KO", "KOEI" },
+            { "LA", "LucasArts" },       { "LS", "Black Bean" },     { "MD", "Midway" },
+            { "ME", "Medix" },           { "MI", "Microids" },       { "MJ", "Majesco" },
+            { "MM", "Myelin Media" },    { "MP", "MipMap" },         { "MW", "Midway" },
+            { "MX", "Empire" },          { "NK", "NewKidCo" },       { "NL", "NovaLogic" },
+            { "NM", "Namco" },           { "OX", "Oxygen" },         { "PC", "Playlogic" },
+            { "PL", "Phantagram" },      { "RA", "Rage" },           { "SA", "Sammy" },
+            { "SC", "SCi" },             { "SE", "SEGA" },           { "SN", "SNK" },
+            { "SQ", "Square Enix" },     { "SS", "Simon & Schuster" },{ "SU", "Success" },
+            { "SW", "Swing!" },          { "TA", "Takara" },         { "TC", "Tecmo" },
+            { "TK", "Takuyo" },          { "TM", "TDK Mediactive" }, { "TQ", "THQ" },
+            { "TS", "Titus" },           { "TT", "Take-Two" },       { "UA", "Unknown" },
+            { "UB", "Ubisoft" },         { "VC", "Victor" },         { "VN", "Vivendi" },
+            { "VU", "Vivendi" },         { "VV", "Vivendi" },        { "WE", "Wanadoo" },
+            { "WR", "Warner Bros" },     { "XI", "XPEC" },           { "XK", "Xbox kiosk" },
+            { "XL", "Xbox live" },       { "XM", "Evolved Games" },  { "XP", "XPEC" },
+            { "XR", "Panorama" },        { "YB", "YBARRA" },         { "ZD", "Zushi" },
+        };
+        meta.maker = pub;
+        for (const auto& e : PUBS) {
+            if (_stricmp(e.code, pub) == 0) { meta.maker = e.name; break; }
+        }
+    }
+
+    return meta;
+}
+
 // Find PARAM.SFO for a game file. An installed title keeps it beside USRDIR; a disc
 // layout keeps it in PS3_GAME. Walk up a few levels rather than assuming either.
 static std::string Ps3TitleFor(const fs::path& romFile) {
@@ -1184,6 +1365,7 @@ void ScanRomDirectories() {
                         // no equivalent list to ask, and inventing titles for them would be
                         // guessing.
                         std::string title = stem;
+                        XboxMeta xbox;
                         if (target.system == "groovymame") {
                             auto it = mameTitles.find(stem);
                             if (it != mameTitles.end()) title = it->second;
@@ -1191,6 +1373,13 @@ void ScanRomDirectories() {
                             // "NPUA80105" is a title id, not a name. PARAM.SFO has the name.
                             std::string sfo = Ps3TitleFor(entry.path());
                             if (!sfo.empty()) title = sfo;
+                        } else if (target.system == "xemu") {
+                            // "eps-h2u.iso" is a release group's filename, not a title. The
+                            // disc's own executable carries the real one, with its publisher
+                            // and build year; the other two are applied further down, where
+                            // year and maker exist.
+                            xbox = XboxMetaFor(entry.path());
+                            if (!xbox.title.empty()) title = xbox.title;
                         }
 
                         title = AsciiFold(title);   // the cabinet font is ASCII only
@@ -1217,6 +1406,8 @@ void ScanRomDirectories() {
                         // the emulators that have no equivalent to ask.
                         std::string videoMode = target.videoMode;
                         std::string year, maker;
+                        if (!xbox.year.empty()) year = xbox.year;
+                        if (!xbox.maker.empty()) maker = xbox.maker;
                         if (target.system == "groovymame") {
                             auto mi = mameMeta.find(stem);
                             if (mi != mameMeta.end()) {

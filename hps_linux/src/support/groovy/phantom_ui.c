@@ -557,20 +557,74 @@ static void draw_header(ph_ui *u)
 	rect(u, xr - ntw(label) - 16, HEAD_Y + 8, 8, 8, led);
 }
 
+/* Width of tab t's box, padding included. */
+static int tab_width(const char *label)
+{
+	return ntw(label) + 16;
+}
+
 static void draw_tabs(ph_ui *u)
 {
-	/* Kept short: ten tabs plus the position counter have to fit 720px at 8px a
-	 * character, and a tab strip that wraps or clips is worse than an abbreviation. */
 	static const char *tabs[PH_TAB_COUNT] =
 		{ "ALL", "MAME", "FBNEO", "DREAMCAST", "PS2", "PS3", "XBOX",
 		  "GC/WII", "PC", "RETROARCH" };
 
+	/* Gap between tab boxes. Each box already carries 8px of padding inside it. */
+	enum { TAB_GAP = 4 };
+	/* Drawn where tabs run off that side, so a strip that is scrolled does not look
+	 * like a strip that is simply short. */
+	static const char *MORE_L = "<";
+	static const char *MORE_R = ">";
+
 	rect(u, 0, TAB_Y, u->w, TAB_H, C_TABBAR);
 
-	int x = PH_SAFE_X;
-	for (int t = 0; t < PH_TAB_COUNT; t++)
+	/* Position within the filtered list, parked at the right end of the strip. Measured
+	 * first because the tabs get whatever width it does not want. */
+	int idx[PH_MAX_GAMES];
+	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
+	char cnt[32];
+	snprintf(cnt, sizeof(cnt), "%d/%d", n ? u->sel + 1 : 0, n);
+
+	const int cnt_w = ntw(cnt) + 12;
+	const int strip_l = PH_SAFE_X;
+	int strip_r = u->w - PH_SAFE_X - cnt_w;
+	if (strip_r < strip_l) strip_r = strip_l;
+
+	/* The strip scrolls rather than being limited to what fits: the tab count follows
+	 * the emulators the host can drive, so sooner or later it will not fit whatever the
+	 * labels are shortened to. Anchor on the selected tab and walk outwards.
+	 *
+	 * Recomputed every frame from u->tab alone, so there is no scroll position to keep
+	 * in step with the selection - moving along the strip can never leave the highlight
+	 * off-screen, and the same tab always draws in the same place. */
+	int first = u->tab, last = u->tab;
+	int used = tab_width(tabs[u->tab]);
+
+	/* Grow right first so moving forward reveals what is coming, then left with
+	 * whatever is left over. */
+	while (last + 1 < PH_TAB_COUNT &&
+	       used + TAB_GAP + tab_width(tabs[last + 1]) <= strip_r - strip_l)
 	{
-		int tw = ntw(tabs[t]) + 16;
+		used += TAB_GAP + tab_width(tabs[last + 1]);
+		last++;
+	}
+	while (first > 0 &&
+	       used + TAB_GAP + tab_width(tabs[first - 1]) <= strip_r - strip_l)
+	{
+		used += TAB_GAP + tab_width(tabs[first - 1]);
+		first--;
+	}
+
+	int x = strip_l;
+	if (first > 0)
+	{
+		text_n(u, x, TAB_Y + 6, MORE_L, C_TEXT_MUTE);
+		x += ntw(MORE_L) + TAB_GAP;
+	}
+
+	for (int t = first; t <= last; t++)
+	{
+		int tw = tab_width(tabs[t]);
 		if (t == u->tab)
 		{
 			box(u, x, TAB_Y + 1, tw, TAB_H - 4, C_AMBER, C_AMBER_HI, 0);
@@ -581,22 +635,13 @@ static void draw_tabs(ph_ui *u)
 			box(u, x, TAB_Y + 1, tw, TAB_H - 4, C_INACTIVE, C_BORDER, 0);
 			text_n(u, x + 8, TAB_Y + 6, tabs[t], C_TEXT_MUTE);
 		}
-		/* 4px between tabs rather than 8. Each tab already carries 8px of padding
-		 * inside its own box, and the two tabs added for Dolphin and 86Box cost more
-		 * width than the strip had spare - at 8px the position counter on the right
-		 * no longer fits and silently disappears. */
-		x += tw + 4;
+		x += tw + TAB_GAP;
 	}
 
-	/* Position within the filtered list, parked at the right end of the tab strip. */
-	int idx[PH_MAX_GAMES];
-	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
-	char cnt[32];
-	snprintf(cnt, sizeof(cnt), "%d/%d", n ? u->sel + 1 : 0, n);
-	if (u->w - PH_SAFE_X - ntw(cnt) > x + 8)
-	{
-		text_n_right(u, u->w - PH_SAFE_X, TAB_Y + 6, cnt, C_TEXT_MUTE);
-	}
+	if (last < PH_TAB_COUNT - 1 && x + ntw(MORE_R) <= strip_r)
+		text_n(u, x, TAB_Y + 6, MORE_R, C_TEXT_MUTE);
+
+	text_n_right(u, u->w - PH_SAFE_X, TAB_Y + 6, cnt, C_TEXT_MUTE);
 
 	rect(u, 0, TAB_Y + TAB_H, u->w, 2, C_BORDER);
 }
