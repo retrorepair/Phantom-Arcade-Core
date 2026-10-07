@@ -69,8 +69,7 @@ typedef enum
  * strip that changes width as the library loads is disorienting on a CRT). */
 /* One tab per emulator the host can drive. These mirror the table in the PC manager
  * (host/PhantomArcadeManager.cpp g_emus), which is the set of GroovyNLC-capable
- * emulators plus GroovyMAME. There is deliberately no GameCube tab: no GroovyNLC fork
- * of Dolphin exists, so it could only ever have listed games that cannot stream. */
+ * emulators plus GroovyMAME. */
 #define PH_TAB_ALL    0
 #define PH_TAB_MAME   1
 #define PH_TAB_FBNEO  2
@@ -78,8 +77,10 @@ typedef enum
 #define PH_TAB_PS2    4
 #define PH_TAB_PS3    5
 #define PH_TAB_XBOX   6
-#define PH_TAB_RA     7
-#define PH_TAB_COUNT  8
+#define PH_TAB_GCWII  7
+#define PH_TAB_PC     8
+#define PH_TAB_RA     9
+#define PH_TAB_COUNT  10
 
 typedef struct
 {

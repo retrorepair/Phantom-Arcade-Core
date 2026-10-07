@@ -60,3 +60,7 @@ old-builds/
 build_output/games_catalog.json
 build_output/mame_titles.txt
 build_output/phantom_config.json
+
+# Local build of the manager; the shipped copy lives in build_output/.
+host/*.exe
+host/*.obj

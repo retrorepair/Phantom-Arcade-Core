@@ -150,7 +150,7 @@ static EmulatorDef g_emus[] = {
     // 86Box is per-machine rather than per-ROM: a VM is a folder holding 86box.cfg and its
     // disk images, and -P points at the folder. The scan matches the config file because
     // that is the one file every VM has, and {rom_dir} turns it back into the folder.
-    { "86box", L"86Box (DOS / Voodoo PC)", "PC / 3dfx Voodoo",
+    { "86box", L"86Box (PC)", "PC / 3dfx Voodoo",
       L"C:\\Emulators\\86box\\86Box.exe", L"C:\\Emulators\\86box\\vms",
       L".cfg",
       L"-P \"{rom_dir}\"",
@@ -1118,6 +1118,30 @@ void ScanRomDirectories() {
                             }
                         }
 
+                        // 86Box is a machine per folder, and the file every one of them
+                        // has is called 86box.cfg - so the stem names no VM, and all of
+                        // them would collide on the same catalog id. The folder is the
+                        // machine's name.
+                        if (target.system == "86box") {
+                            std::string n = entry.path().parent_path().filename().string();
+                            if (!n.empty()) stem = n;
+                        }
+
+                        // A compound extension leaves its first half behind:
+                        // "Game.nkit.iso" stems to "Game.nkit", and ".nkit" is a container
+                        // format, not part of the title.
+                        {
+                            const char *containers[] = { ".nkit", ".nkit.gcz", ".decrypted" };
+                            for (const char *c : containers) {
+                                const size_t cl = strlen(c);
+                                if (stem.size() > cl &&
+                                    !_stricmp(stem.c_str() + stem.size() - cl, c)) {
+                                    stem.erase(stem.size() - cl);
+                                    break;
+                                }
+                            }
+                        }
+
                         // A generic filename says nothing, so name the game after the
                         // folder holding it, stepping over the layout directories a PS3
                         // disc carries.
@@ -1696,7 +1720,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             y += 32;
             std::wstring exeLabel = std::wstring(e.label) + L" Executable:";
-            CreateWindow(L"STATIC", exeLabel.c_str(), WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
+            CreateWindow(L"STATIC", exeLabel.c_str(), WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
             e.exeEdit = CreateWindow(L"EDIT", e.defExe, WS_CHILD | WS_VISIBLE | WS_BORDER,
                                      195, y, 350, 22, hWnd, (HMENU)(INT_PTR)IDC_EMU_EXE(i), hInst, NULL);
             CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE,
@@ -1704,7 +1728,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             y += 26;
             std::wstring romLabel = std::wstring(e.label) + L" ROMs Folder:";
-            CreateWindow(L"STATIC", romLabel.c_str(), WS_CHILD | WS_VISIBLE, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
+            CreateWindow(L"STATIC", romLabel.c_str(), WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP, 20, y, 170, 20, hWnd, NULL, hInst, NULL);
             e.romsEdit = CreateWindow(L"EDIT", e.defRoms, WS_CHILD | WS_VISIBLE | WS_BORDER,
                                       195, y, 350, 22, hWnd, (HMENU)(INT_PTR)IDC_EMU_ROMS(i), hInst, NULL);
             CreateWindow(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE,

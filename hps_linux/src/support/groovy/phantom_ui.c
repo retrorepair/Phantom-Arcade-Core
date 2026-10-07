@@ -327,6 +327,10 @@ static int tab_match(int tab, const char *sys)
 		return ieq(sys, "rpcs3") || ieq(sys, "ps3");
 	case PH_TAB_XBOX:
 		return ieq(sys, "xemu") || ieq(sys, "xbox");
+	case PH_TAB_GCWII:
+		return ieq(sys, "dolphin") || ieq(sys, "gamecube") || ieq(sys, "wii");
+	case PH_TAB_PC:
+		return ieq(sys, "86box") || ieq(sys, "pc") || ieq(sys, "dos");
 	case PH_TAB_RA:
 		return ieq(sys, "retroarch");
 	default:
@@ -555,10 +559,11 @@ static void draw_header(ph_ui *u)
 
 static void draw_tabs(ph_ui *u)
 {
-	/* Kept short: eight tabs plus the position counter have to fit 720px at 8px a
+	/* Kept short: ten tabs plus the position counter have to fit 720px at 8px a
 	 * character, and a tab strip that wraps or clips is worse than an abbreviation. */
 	static const char *tabs[PH_TAB_COUNT] =
-		{ "ALL", "MAME", "FBNEO", "DREAMCAST", "PS2", "PS3", "XBOX", "RETROARCH" };
+		{ "ALL", "MAME", "FBNEO", "DREAMCAST", "PS2", "PS3", "XBOX",
+		  "GC/WII", "PC", "RETROARCH" };
 
 	rect(u, 0, TAB_Y, u->w, TAB_H, C_TABBAR);
 
@@ -576,7 +581,11 @@ static void draw_tabs(ph_ui *u)
 			box(u, x, TAB_Y + 1, tw, TAB_H - 4, C_INACTIVE, C_BORDER, 0);
 			text_n(u, x + 8, TAB_Y + 6, tabs[t], C_TEXT_MUTE);
 		}
-		x += tw + 8;
+		/* 4px between tabs rather than 8. Each tab already carries 8px of padding
+		 * inside its own box, and the two tabs added for Dolphin and 86Box cost more
+		 * width than the strip had spare - at 8px the position counter on the right
+		 * no longer fits and silently disappears. */
+		x += tw + 4;
 	}
 
 	/* Position within the filtered list, parked at the right end of the tab strip. */

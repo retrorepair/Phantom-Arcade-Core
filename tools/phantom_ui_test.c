@@ -106,15 +106,20 @@ static void test_tabs(void)
 	add("p3", "PS3 One", "rpcs3", "X");
 	add("x1", "Xbox One", "xemu", "X");
 	add("r1", "RetroArch One", "retroarch", "X");
-	add("d1", "Cube One", "dolphin", "X");   /* no GroovyNLC fork: must match no tab */
+	add("d1", "Cube One", "dolphin", "X");
+	add("d2", "Wii One", "wii", "X");
+	add("b1", "DOS One", "86box", "X");
+	add("z1", "Model 2 One", "model2", "X"); /* no tab claims it: ALL only */
 
-	ui.tab = PH_TAB_ALL;   CHECK(filtered_count() == 9, "ALL shows everything, got %d", filtered_count());
+	ui.tab = PH_TAB_ALL;   CHECK(filtered_count() == 12, "ALL shows everything, got %d", filtered_count());
 	ui.tab = PH_TAB_MAME;  CHECK(filtered_count() == 2, "MAME tab matches groovymame and mame, got %d", filtered_count());
 	ui.tab = PH_TAB_FBNEO; CHECK(filtered_count() == 1, "FBNeo tab, got %d", filtered_count());
 	ui.tab = PH_TAB_DC;    CHECK(filtered_count() == 1, "Dreamcast tab, got %d", filtered_count());
 	ui.tab = PH_TAB_PS2;   CHECK(filtered_count() == 1, "PS2 tab, got %d", filtered_count());
 	ui.tab = PH_TAB_PS3;   CHECK(filtered_count() == 1, "PS3 tab, got %d", filtered_count());
 	ui.tab = PH_TAB_XBOX;  CHECK(filtered_count() == 1, "Xbox tab, got %d", filtered_count());
+	ui.tab = PH_TAB_GCWII; CHECK(filtered_count() == 2, "GC/Wii tab matches dolphin and wii, got %d", filtered_count());
+	ui.tab = PH_TAB_PC;    CHECK(filtered_count() == 1, "PC tab, got %d", filtered_count());
 	ui.tab = PH_TAB_RA;    CHECK(filtered_count() == 1, "RetroArch tab, got %d", filtered_count());
 
 	/* A system no tab claims is still reachable under ALL rather than vanishing: the
@@ -123,9 +128,9 @@ static void test_tabs(void)
 	int idx[PH_MAX_GAMES];
 	ui.tab = PH_TAB_ALL;
 	int n = ph_ui_filtered(&ui, idx, PH_MAX_GAMES);
-	int sawCube = 0;
-	for (int i = 0; i < n; i++) if (!strcmp(ui.games[idx[i]].system, "dolphin")) sawCube = 1;
-	CHECK(sawCube, "an unclaimed system still appears under ALL");
+	int sawUnclaimed = 0;
+	for (int i = 0; i < n; i++) if (!strcmp(ui.games[idx[i]].system, "model2")) sawUnclaimed = 1;
+	CHECK(sawUnclaimed, "an unclaimed system still appears under ALL");
 
 	/* tab cycling wraps and resets the row */
 	reset();
