@@ -21,6 +21,9 @@
 #endif
 
 #define WIN32_LEAN_AND_MEAN
+// windows.h defines min and max as macros unless this is set, which turns the std::min
+// below into "std::((a) < (b) ? (a) : (b))" and fails to compile.
+#define NOMINMAX
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -76,16 +79,18 @@ HWND hBtnToggleDaemon, hBtnLaunchGame;
 // than the same change made in six places.
 //
 // The set is the GroovyNLC-capable emulators from https://github.com/verbst/repositories,
-// plus GroovyMAME, which is Calamity's and is where the arcade support comes from.
-// Dolphin was dropped: there is no GroovyNLC fork of it, so a GameCube tab could only
-// ever have listed games that cannot stream.
+// plus GroovyMAME, which is Calamity's and is where the arcade support comes from, plus
+// Dolphin and 86Box, whose GroovyNLC support is ours (retrorepair/dolphin and
+// retrorepair/86Box, branch groovy-nlc).
 //
-// Only GroovyMAME takes the MiSTer's address on the command line. The rest are
-// configured in their own GUI once - xemu has Settings > MiSTer, RetroArch has
-// Settings > Groovy MiSTer, rpcs3 and pcsx2 have their own MiSTer settings pages - so
-// the launcher only has to start them with the right file.
+// Only GroovyMAME takes the MiSTer's address on the command line. The rest are configured
+// once in their own settings - xemu has Settings > MiSTer, RetroArch has Settings > Groovy
+// MiSTer, rpcs3 and pcsx2 have their own MiSTer pages, Dolphin and 86Box have a
+// [GroovyMiSTer] section in Dolphin.ini and 86box.cfg - so the launcher only has to start
+// them with the right file.
 //
-// args placeholders: {rom} full path, {rom_stem} bare name, {mister_ip} discovered address.
+// args placeholders: {rom} full path, {rom_stem} bare name, {rom_dir} containing folder,
+// {mister_ip} discovered address.
 struct EmulatorDef {
     const char*    key;       // catalog "system" value, and the config key prefix
     const wchar_t* label;     // UI label
@@ -135,6 +140,21 @@ static EmulatorDef g_emus[] = {
       L".iso,.xiso",
       L"-dvd_path \"{rom}\"",
       "15kHz 480i", NULL, NULL },
+
+    { "dolphin", L"Dolphin", "Nintendo GameCube / Wii",
+      L"C:\\Emulators\\dolphin\\Dolphin.exe", L"C:\\Games\\GameCube",
+      L".iso,.gcm,.gcz,.rvz,.wia,.ciso,.wbfs,.wad,.dol,.elf,.m3u",
+      L"-b -e \"{rom}\"",
+      "15kHz 480i / 31kHz 480p", NULL, NULL },
+
+    // 86Box is per-machine rather than per-ROM: a VM is a folder holding 86box.cfg and its
+    // disk images, and -P points at the folder. The scan matches the config file because
+    // that is the one file every VM has, and {rom_dir} turns it back into the folder.
+    { "86box", L"86Box (DOS / Voodoo PC)", "PC / 3dfx Voodoo",
+      L"C:\\Emulators\\86box\\86Box.exe", L"C:\\Emulators\\86box\\vms",
+      L".cfg",
+      L"-P \"{rom_dir}\"",
+      "15kHz 15/25/31kHz VGA", NULL, NULL },
 
     { "retroarch", L"RetroArch", "RetroArch",
       L"C:\\Emulators\\RetroArch\\retroarch.exe", L"C:\\Games\\RetroArch",
@@ -1209,12 +1229,20 @@ std::atomic<bool> g_launchInProgress(false);
 // Set from the LAUNCH datagram: true when the core says it is sending a keyboard.
 std::atomic<bool> g_misterKeyboard(false);
 
-// Fill {rom}, {rom_stem} and {mister_ip} in an emulator's argument template.
+// Fill {rom}, {rom_stem}, {rom_dir} and {mister_ip} in an emulator's argument template.
 static std::wstring ExpandArgs(const std::wstring& tmpl, const std::wstring& rom,
                                const std::wstring& stem, const std::wstring& misterIp) {
+    // The folder the file sits in, with no trailing separator. 86Box is launched against a
+    // VM directory rather than a file, and this is what turns its 86box.cfg back into one.
+    std::wstring dir;
+    const size_t slash = rom.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        dir = rom.substr(0, slash);
+
     std::wstring out = tmpl;
     struct { const wchar_t* tag; const std::wstring& val; } subs[] = {
         { L"{rom_stem}",  stem },
+        { L"{rom_dir}",   dir },
         { L"{rom}",       rom },
         { L"{mister_ip}", misterIp },
     };
