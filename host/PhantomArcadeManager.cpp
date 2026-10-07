@@ -987,9 +987,20 @@ static std::string JsonEscape(const std::string& in) {
     return out;
 }
 
+// The catalog id behind each row of hListGames, in the same order.
+//
+// The list shows "[system] Title", which is for reading, not for launching: the title is
+// not the id, and for an 86Box VM it is not even unique. Launching used to recover an id
+// by stripping the "[system] " prefix off that display text, which produced a bare title
+// with no "<key>_" on the front - so the lookup in ExecuteLaunchProcess could never match
+// it and every launch from this window failed with "no emulator for id". Keep the real
+// ids instead.
+static std::vector<std::string> g_listGameIds;
+
 // Auto-Scan ROM Directories and build games_catalog.json
 void ScanRomDirectories() {
     SendMessage(hListGames, LB_RESETCONTENT, 0, 0);
+    g_listGameIds.clear();
 
     struct ScanTarget {
         std::wstring path;
@@ -1185,7 +1196,12 @@ void ScanRomDirectories() {
                         title = AsciiFold(title);   // the cabinet font is ASCII only
                         std::wstring listEntry = L"[" + std::wstring(target.system.begin(), target.system.end()) + L"] " +
                                                 StringToWstring(title);
-                        SendMessage(hListGames, LB_ADDSTRING, 0, (LPARAM)listEntry.c_str());
+                        const LRESULT row = SendMessage(hListGames, LB_ADDSTRING, 0, (LPARAM)listEntry.c_str());
+                        if (row >= 0) {
+                            if ((size_t) row >= g_listGameIds.size())
+                                g_listGameIds.resize((size_t) row + 1);
+                            g_listGameIds[(size_t) row] = id;
+                        }
 
                         if (totalFound > 0) catOut << ",\n";
                         catOut << "    {\n";
@@ -1763,17 +1779,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wmId == IDC_LIST_GAMES && event == LBN_DBLCLK) {
             // Double-click to launch game directly
             int sel = (int)SendMessage(hListGames, LB_GETCURSEL, 0, 0);
-            if (sel != LB_ERR) {
-                wchar_t itemText[256] = { 0 };
-                SendMessage(hListGames, LB_GETTEXT, sel, (LPARAM)itemText);
-                std::wstring s(itemText);
-                size_t bracketEnd = s.find(L"] ");
-                if (bracketEnd != std::wstring::npos) {
-                    std::wstring title = s.substr(bracketEnd + 2);
-                    std::string gid(title.begin(), title.end());
-                    LaunchGame(gid);
-                }
-            }
+            if (sel != LB_ERR && (size_t) sel < g_listGameIds.size())
+                LaunchGame(g_listGameIds[(size_t) sel]);
             break;
         }
 
@@ -1804,18 +1811,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         case IDC_BTN_LAUNCH_GAME: {
             int sel = (int)SendMessage(hListGames, LB_GETCURSEL, 0, 0);
-            std::string gid = "kinst";
-            if (sel != LB_ERR) {
-                wchar_t itemText[256] = { 0 };
-                SendMessage(hListGames, LB_GETTEXT, sel, (LPARAM)itemText);
-                std::wstring s(itemText);
-                size_t bracketEnd = s.find(L"] ");
-                if (bracketEnd != std::wstring::npos) {
-                    std::wstring title = s.substr(bracketEnd + 2);
-                    gid = std::string(title.begin(), title.end());
-                }
+            if (sel == LB_ERR || (size_t) sel >= g_listGameIds.size()) {
+                SetWindowText(hStaticStatus, L"Status: pick a game from the list first.");
+                break;
             }
-            LaunchGame(gid);
+            LaunchGame(g_listGameIds[(size_t) sel]);
             break;
         }
         case IDC_BTN_TOGGLE_DAEMON:
