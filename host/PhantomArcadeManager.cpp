@@ -43,6 +43,7 @@
 #include <mutex>
 #include <set>
 #include "emulator_status.h"
+#include "fbneo_sets.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -1115,6 +1116,51 @@ static std::string Ps3TitleFor(const fs::path& romFile) {
 // PARAM.SFO titles routinely carry symbols - "WipEout(R) HD" - and MAME descriptions
 // carry accents, so this maps the common Latin-1 letters to their base form, drops
 // decorative symbols, and collapses whatever that leaves.
+static std::string JsonEscape(const std::string& in);   // defined below
+
+// What the cabinet reads of a game. The catalog on disk carries more (rom path and name, a
+// duplicate of the video mode) for the PC app and the launcher; the cabinet gets only this.
+struct CabinetRec {
+    std::string system, systemName, id, title, videoMode, year, maker;
+};
+
+// The cabinet receives the catalog in ONE datagram, which this side caps at 60,000 bytes, and
+// keeps at most 512 games (PH_MAX_GAMES). A large library - a folder of MAME sets for FBNeo runs
+// to over a thousand - was simply cut off after the first few hundred records, and since the
+// big arcade systems come first, every other emulator vanished from the cabinet. So the cabinet
+// gets its own file: compact records, the small systems first and the big arcade ones after, and
+// it stops at a whole record. Sending the rest needs the cabinet to ask for pages.
+static const size_t kCabinetBytes = 59000;
+static const size_t kCabinetMaxGames = 500;
+
+static void WriteCabinetCatalog(const std::vector<CabinetRec>& recs, const std::wstring& path) {
+    std::vector<const CabinetRec*> ordered;
+    for (int pass = 0; pass < 3; pass++) {
+        for (const auto& r : recs) {
+            const int rank = (r.system == "fbneo") ? 2 : (r.system == "groovymame") ? 1 : 0;
+            if (rank == pass) ordered.push_back(&r);
+        }
+    }
+
+    std::string out = "{\"games\":[";
+    size_t written = 0;
+    for (const CabinetRec* r : ordered) {
+        std::string rec = std::string("{\"id\":\"") + JsonEscape(r->id) + "\",\"title\":\"" + JsonEscape(r->title) +
+                          "\",\"system\":\"" + JsonEscape(r->system) + "\",\"systemName\":\"" + JsonEscape(r->systemName) +
+                          "\",\"videoMode\":\"" + JsonEscape(r->videoMode) + "\",\"year\":\"" + JsonEscape(r->year) +
+                          "\",\"manufacturer\":\"" + JsonEscape(r->maker) + "\"}";
+        const size_t add = rec.size() + (written ? 1 : 0);
+        if (written >= kCabinetMaxGames || out.size() + add + 3 > kCabinetBytes) break;
+        if (written) out += ",";
+        out += rec;
+        written++;
+    }
+    out += "]}";
+
+    std::ofstream f(path.c_str(), std::ios::binary);
+    f << out;
+}
+
 static std::string AsciiFold(const std::string& in) {
     static const struct { unsigned cp; const char* rep; } MAP[] = {
         { 0x00AE, "" }, { 0x2122, "" }, { 0x00A9, "" },           // (R) (TM) (C)
@@ -1225,6 +1271,24 @@ void ScanRomDirectories() {
     std::wstring mameExeForScan = mameDef ? GetText(mameDef->exeEdit) : L"";
     std::map<std::string, std::string> mameTitles = LoadMameTitles(mameExeForScan);
 
+    // FBNeo is asked once which games it supports: a folder of MAME sets holds plenty it cannot
+    // start, and each of those would sit in the menu failing the moment somebody picked it. If it
+    // cannot be asked (no exe, or an answer that is not a game list) the list is left unfiltered.
+    std::map<std::string, FbneoSet> fbneoSets;
+    {
+        EmulatorDef* fbDef = EmuByKey("fbneo");
+        std::wstring fbExe = fbDef ? GetText(fbDef->exeEdit) : L"";
+        if (!fbExe.empty() && fs::exists(fbExe)) {
+            std::wstring fbDir;
+            size_t slash = fbExe.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) fbDir = fbExe.substr(0, slash);
+            SetWindowText(hStaticStatus, L"Status: Asking FBNeo which games it supports...");
+            fbneoSets = ParseFbneoDat(RunCapture(L"\"" + fbExe + L"\" -listinfo", fbDir));
+            if (fbneoSets.size() < 1000) fbneoSets.clear();
+        }
+    }
+    int fbneoSkipped = 0;
+
     // Ask MAME which of the arcade sets on disk will actually start, before listing any
     // of them. See FilterRunnableSets.
     std::set<std::string> runnable;
@@ -1256,6 +1320,7 @@ void ScanRomDirectories() {
 
     std::wstring catPath = GetAppDir() + L"\\games_catalog.json";
     std::ofstream catOut; catOut.open(catPath.c_str());
+    std::vector<CabinetRec> cabinetRecs;
     catOut << "{\n  \"games\": [\n";
 
     int totalFound = 0;
@@ -1361,6 +1426,15 @@ void ScanRomDirectories() {
                             skipped++;
                             continue;
                         }
+                        // The same for FBNeo: a set that is not in its own list, or is only a
+                        // BIOS, which it refuses to start as a game.
+                        if (target.system == "fbneo" && !fbneoSets.empty()) {
+                            auto fi = fbneoSets.find(stem);
+                            if (fi == fbneoSets.end() || fi->second.isBios) {
+                                fbneoSkipped++;
+                                continue;
+                            }
+                        }
 
                         std::string id = target.system + "_" + stem;
                         std::string cleanRomPath = entry.path().generic_string();
@@ -1375,7 +1449,13 @@ void ScanRomDirectories() {
                         XboxMeta xbox;
                         if (target.system == "groovymame" || target.system == "fbneo") {
                             auto it = mameTitles.find(stem);
-                            if (it != mameTitles.end()) title = it->second;
+                            if (it != mameTitles.end()) {
+                                title = it->second;
+                            } else if (target.system == "fbneo") {
+                                auto fi = fbneoSets.find(stem);
+                                if (fi != fbneoSets.end() && !fi->second.description.empty())
+                                    title = fi->second.description;
+                            }
                         } else if (target.system == "rpcs3") {
                             // "NPUA80105" is a title id, not a name. PARAM.SFO has the name.
                             std::string sfo = Ps3TitleFor(entry.path());
@@ -1435,11 +1515,20 @@ void ScanRomDirectories() {
                             }
                         }
 
+                        if (target.system == "fbneo") {
+                            auto fi = fbneoSets.find(stem);
+                            if (fi != fbneoSets.end()) {
+                                year  = AsciiFold(fi->second.year);
+                                maker = AsciiFold(fi->second.manufacturer);
+                            }
+                        }
+
                         catOut << "      \"videoMode\": \"" << JsonEscape(videoMode) << "\",\n";
                         catOut << "      \"year\": \"" << JsonEscape(year) << "\",\n";
                         catOut << "      \"manufacturer\": \"" << JsonEscape(maker) << "\",\n";
                         catOut << "      \"resolution\": \"" << JsonEscape(videoMode) << "\"\n";
                         catOut << "    }";
+                        cabinetRecs.push_back({ target.system, target.systemName, id, title, videoMode, year, maker });
                         totalFound++;
                     }
                 }
@@ -1455,9 +1544,11 @@ void ScanRomDirectories() {
 
     catOut << "\n  ]\n}\n";
     catOut.close();
+    WriteCabinetCatalog(cabinetRecs, GetAppDir() + L"\\games_catalog_cabinet.json");
 
     std::wstring status = L"Status: Scanned " + std::to_wstring(totalFound) + L" game(s). Catalog saved.";
     if (skipped > 0) status += L" (" + std::to_wstring(skipped) + L" set(s) left out: MAME cannot run them.)";
+    if (fbneoSkipped > 0) status += L" (" + std::to_wstring(fbneoSkipped) + L" file(s) left out: FBNeo does not support them.)";
     if (pkgsSeen > 0) status += L" (" + std::to_wstring(pkgsSeen) +
                                L" PS3 .pkg installer(s) ignored - install them in RPCS3 first.)";
     SetWindowText(hStaticStatus, status.c_str());
@@ -1850,8 +1941,10 @@ DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
                 std::string reply = "PHANTOM_HOST_ONLINE:" + std::to_string(port) + ":8088";
                 sendto(g_udpSocket, reply.c_str(), (int)reply.length(), 0, (sockaddr*)&clientAddr, clientLen);
             } else if (msg == "GET_CATALOG") {
-                std::wstring catPath = GetAppDir() + L"\\games_catalog.json";
-                std::ifstream f; f.open(catPath.c_str());
+                // The cabinet's own, compact catalog (see WriteCabinetCatalog), else the full one.
+                std::wstring catPath = GetAppDir() + L"\\games_catalog_cabinet.json";
+                if (!fs::exists(catPath)) catPath = GetAppDir() + L"\\games_catalog.json";
+                std::ifstream f; f.open(catPath.c_str(), std::ios::binary);
                 std::string catData = "";
                 if (f.is_open()) {
                     std::stringstream ss;
