@@ -14,9 +14,11 @@
  *   This is the single biggest difference from Phantom Arcade's framebuffer frontend,
  *   which drew 1px-stroke scale-1 text because /dev/fb0 on the menu core is 480p.
  *
- *   Arcade CRT overscan. Real cabinet monitors lose the edges, so content keeps a
- *   PH_SAFE_X / PH_SAFE_Y margin and nothing load-bearing touches it. The core's own
- *   OSD "CRT H/V offset" options remain the fine adjustment.
+ *   Overscan. Real cabinet monitors lose the edges, and a TV can lose far more, and
+ *   unevenly - one that hides 20 lines at the top can hide 45 at the bottom. So content
+ *   stays inside a per-edge safe area (ph_safe) that is set from the launcher's own
+ *   screen-adjust page, and only backgrounds run out to the edge. The core's OSD "CRT H/V
+ *   offset" options remain the fine adjustment for a CRT.
  *
  * Colours are written as 0xRRGGBB and swapped to the framebuffer's B,G,R byte order
  * by put_px(), so the constants here read the same way they do in Phantom Arcade's
@@ -57,23 +59,40 @@
 
 /* ---- layout ------------------------------------------------------------------ */
 
-#define PH_SAFE_X   16
-#define PH_SAFE_Y   8
-
-/* Sized for 720x480. The list gets everything left over: 15 rows of 90 columns, where
- * the first version managed 11 rows of 45 on the same screen. */
-#define HEAD_Y      0
+/* Sized for 720x480. The heights below are fixed; where each band sits is not - it follows
+ * the safe area. The list takes whatever is left between the tab bar and the detail line:
+ * 15 rows of 90 columns with no margins, where the first version managed 11 rows of 45. */
 #define HEAD_H      44
-#define TAB_Y       48
 #define TAB_H       28
-#define LIST_Y      80
-#define LIST_H      338
 #define LIST_HDR_H  24
 #define ROW_H       20
-#define DETAIL_Y    422
 #define DETAIL_H    24
-#define FOOT_Y      450
 #define FOOT_H      30
+
+typedef struct
+{
+	int l, r;          /* left and right safe edges, in pixels from each side */
+	int head_y;        /* top of the wordmark band's content */
+	int tab_y;
+	int list_y, list_h;
+	int detail_y;
+	int foot_y;
+} ph_layout;
+
+static void layout(const ph_ui *u, ph_layout *L)
+{
+	L->l = u->safe.l;
+	L->r = u->safe.r;
+	L->head_y = u->safe.t;
+	L->tab_y = L->head_y + 48;
+	L->foot_y = u->h - u->safe.b - FOOT_H;
+	L->detail_y = L->foot_y - 4 - DETAIL_H;
+	L->list_y = L->tab_y + TAB_H + 4;
+	L->list_h = L->detail_y - 4 - L->list_y;
+	if (L->list_h < LIST_HDR_H + 4 + ROW_H) L->list_h = LIST_HDR_H + 4 + ROW_H;
+}
+
+#define LAYOUT ph_layout L; layout(u, &L)
 
 #define GLYPH_W 8
 #define GLYPH_H 12
@@ -356,9 +375,10 @@ const ph_game *ph_ui_selected(const ph_ui *u)
 	return &u->games[idx[u->sel]];
 }
 
-static int visible_rows(void)
+static int visible_rows(const ph_ui *u)
 {
-	return (LIST_H - LIST_HDR_H - 4) / ROW_H;
+	LAYOUT;
+	return (L.list_h - LIST_HDR_H - 4) / ROW_H;
 }
 
 /* Pixel budget the selected row's title gets. Shared by the renderer and the marquee
@@ -366,8 +386,9 @@ static int visible_rows(void)
  * scrolls that does not need to, or sits clipped and still. */
 static int title_window(const ph_ui *u, const ph_game *g, int n, int *out_sys_x, int *out_sys_w)
 {
-	int w = u->w - 2 * PH_SAFE_X;
-	int bar_w = (n > visible_rows()) ? 14 : 0;
+	LAYOUT;
+	int w = u->w - L.l - L.r;
+	int bar_w = (n > visible_rows(u)) ? 14 : 0;
 
 	/* The system name is capped before the title is measured, so one absurdly long
 	 * hardware string cannot squeeze every title down to an ellipsis. */
@@ -376,8 +397,8 @@ static int title_window(const ph_ui *u, const ph_game *g, int n, int *out_sys_x,
 	int sys_w = (int)strlen(sys) * PH_NARROW_W;
 	if (sys_w > sys_cap) sys_w = sys_cap;
 
-	int tx = PH_SAFE_X + 30;
-	int sys_x = PH_SAFE_X + w - 12 - bar_w - sys_w;
+	int tx = L.l + 30;
+	int sys_x = L.l + w - 12 - bar_w - sys_w;
 	int tw = sys_x - tx - 16;
 	if (tw < 32) tw = 32;
 
@@ -388,7 +409,7 @@ static int title_window(const ph_ui *u, const ph_game *g, int n, int *out_sys_x,
 
 static void fix_scroll(ph_ui *u, int n)
 {
-	int rows = visible_rows();
+	int rows = visible_rows(u);
 	if (u->sel < 0) u->sel = 0;
 	if (u->sel >= n) u->sel = n ? n - 1 : 0;
 	if (u->sel < u->scroll) u->scroll = u->sel;
@@ -408,6 +429,11 @@ void ph_ui_init(ph_ui *u, uint8_t *fb, int w, int h)
 	u->host_port = 0;
 	u->host_state = PH_HOST_SEARCHING;
 	u->view = PH_VIEW_LIST;
+	u->safe.l = PH_SAFE_DEF_L;
+	u->safe.t = PH_SAFE_DEF_T;
+	u->safe.r = PH_SAFE_DEF_R;
+	u->safe.b = PH_SAFE_DEF_B;
+	u->safe_saved = u->safe;
 	u->dirty = 1;
 }
 
@@ -473,6 +499,156 @@ void ph_ui_reclamp(ph_ui *u, const char *keep_id)
 	u->dirty = 1;
 }
 
+int ph_ui_rows(const ph_ui *u)
+{
+	return visible_rows(u);
+}
+
+int ph_ui_page(ph_ui *u, int dir)
+{
+	int idx[PH_MAX_GAMES];
+	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
+	if (n <= 0 || dir == 0) return 0;
+
+	int before = u->sel;
+	u->sel += dir * visible_rows(u);
+	if (u->sel < 0) u->sel = 0;
+	if (u->sel >= n) u->sel = n - 1;
+	fix_scroll(u, n);
+
+	if (u->sel == before) return 0;
+	u->marquee_t0 = u->tick_ms;
+	u->marquee_px = 0;
+	u->dirty = 1;
+	return 1;
+}
+
+/* The letter a title files under: A-Z whatever its case, everything else as one group. */
+static int letter_key(const char *t)
+{
+	char c = t ? t[0] : 0;
+	if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+	return (c >= 'A' && c <= 'Z') ? c : 0;
+}
+
+int ph_ui_letter(ph_ui *u, int dir)
+{
+	int idx[PH_MAX_GAMES];
+	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
+	if (n <= 0 || dir == 0) return 0;
+
+	int cur = letter_key(u->games[idx[u->sel]].title);
+	int to = u->sel;
+
+	if (dir > 0)
+	{
+		int i = u->sel;
+		while (i < n && letter_key(u->games[idx[i]].title) == cur) i++;
+		to = (i >= n) ? 0 : i;              /* past the last letter wraps to the first */
+	}
+	else
+	{
+		int start = u->sel;
+		while (start > 0 && letter_key(u->games[idx[start - 1]].title) == cur) start--;
+		if (start < u->sel)
+		{
+			to = start;                     /* first press goes to the top of this letter */
+		}
+		else if (start > 0)
+		{
+			int k = letter_key(u->games[idx[start - 1]].title);
+			int i = start - 1;
+			while (i > 0 && letter_key(u->games[idx[i - 1]].title) == k) i--;
+			to = i;                         /* then to the top of the one before */
+		}
+		else
+		{
+			int k = letter_key(u->games[idx[n - 1]].title);
+			int i = n - 1;
+			while (i > 0 && letter_key(u->games[idx[i - 1]].title) == k) i--;
+			to = i;                         /* before the first letter wraps to the last */
+		}
+	}
+
+	if (to == u->sel) return 0;
+	u->sel = to;
+	fix_scroll(u, n);
+	u->marquee_t0 = u->tick_ms;
+	u->marquee_px = 0;
+	u->dirty = 1;
+	return 1;
+}
+
+static int clamp_even(int v, int max)
+{
+	if (v < 0) v = 0;
+	if (v > max) v = max;
+	return v & ~1;
+}
+
+void ph_ui_set_safe(ph_ui *u, int l, int t, int r, int b)
+{
+	u->safe.l = clamp_even(l, PH_SAFE_MAX_X);
+	u->safe.t = clamp_even(t, PH_SAFE_MAX_Y);
+	u->safe.r = clamp_even(r, PH_SAFE_MAX_X);
+	u->safe.b = clamp_even(b, PH_SAFE_MAX_Y);
+
+	/* The list shows more or fewer rows now, so the scroll position may no longer be valid. */
+	int idx[PH_MAX_GAMES];
+	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
+	fix_scroll(u, n);
+	u->dirty = 1;
+}
+
+void ph_ui_adjust_begin(ph_ui *u)
+{
+	u->safe_saved = u->safe;
+	u->adj_edge = 1;       /* the bottom is the edge a TV most often hides too much of */
+	u->view = PH_VIEW_ADJUST;
+	u->dirty = 1;
+}
+
+int ph_ui_adjust_edge(ph_ui *u, int dir)
+{
+	u->adj_edge = (u->adj_edge + (dir < 0 ? 3 : 1)) & 3;
+	u->dirty = 1;
+	return 1;
+}
+
+int ph_ui_adjust_move(ph_ui *u, int delta)
+{
+	int *p;
+	int max;
+	switch (u->adj_edge)
+	{
+	case 0:  p = &u->safe.t; max = PH_SAFE_MAX_Y; break;
+	case 1:  p = &u->safe.b; max = PH_SAFE_MAX_Y; break;
+	case 2:  p = &u->safe.l; max = PH_SAFE_MAX_X; break;
+	default: p = &u->safe.r; max = PH_SAFE_MAX_X; break;
+	}
+	int v = clamp_even(*p + delta, max);
+	if (v == *p) return 0;
+	*p = v;
+	u->dirty = 1;
+	return 1;
+}
+
+void ph_ui_adjust_reset(ph_ui *u)
+{
+	u->safe.l = PH_SAFE_DEF_L;
+	u->safe.t = PH_SAFE_DEF_T;
+	u->safe.r = PH_SAFE_DEF_R;
+	u->safe.b = PH_SAFE_DEF_B;
+	u->dirty = 1;
+}
+
+void ph_ui_adjust_end(ph_ui *u, int keep)
+{
+	if (!keep) u->safe = u->safe_saved;
+	u->view = PH_VIEW_LIST;
+	ph_ui_set_safe(u, u->safe.l, u->safe.t, u->safe.r, u->safe.b);   /* re-clamp the scroll */
+}
+
 int ph_ui_animate(ph_ui *u, uint32_t tick_ms)
 {
 	u->tick_ms = tick_ms;
@@ -528,12 +704,15 @@ static int ntw(const char *s)
 
 static void draw_header(ph_ui *u)
 {
-	vgrad(u, 0, HEAD_Y, u->w, HEAD_H - 4, C_HEAD_A, C_HEAD_B);
-	rect(u, 0, HEAD_Y + HEAD_H - 4, u->w, 4, C_AMBER);
+	LAYOUT;
+	/* The band itself runs to the top of the screen so there is no stripe of bare
+	 * background above it; only the text is held inside the margin. */
+	vgrad(u, 0, 0, u->w, L.head_y + HEAD_H - 4, C_HEAD_A, C_HEAD_B);
+	rect(u, 0, L.head_y + HEAD_H - 4, u->w, 4, C_AMBER);
 
 	/* Wordmark stays square-scaled and chunky - it is the one thing meant to read from
 	 * across a room, and it is short enough that the width costs nothing. */
-	text_sh(u, PH_SAFE_X, HEAD_Y + 6, "PHANTOM ARCADE", C_AMBER, C_AMBER_DK, 3);
+	text_sh(u, L.l, L.head_y + 6, "PHANTOM ARCADE", C_AMBER, C_AMBER_DK, 3);
 
 	const char *label;
 	uint32_t led;
@@ -550,11 +729,11 @@ static void draw_header(ph_ui *u)
 	else
 		addr[0] = 0;
 
-	int xr = u->w - PH_SAFE_X;
-	text_n_right(u, xr, HEAD_Y + 4, label, C_TEXT_DIM);
-	if (addr[0]) text_n_right(u, xr, HEAD_Y + 22, addr, C_TEXT_MUTE);
+	int xr = u->w - L.r;
+	text_n_right(u, xr, L.head_y + 4, label, C_TEXT_DIM);
+	if (addr[0]) text_n_right(u, xr, L.head_y + 22, addr, C_TEXT_MUTE);
 
-	rect(u, xr - ntw(label) - 16, HEAD_Y + 8, 8, 8, led);
+	rect(u, xr - ntw(label) - 16, L.head_y + 8, 8, 8, led);
 }
 
 /* Width of tab t's box, padding included. */
@@ -565,6 +744,7 @@ static int tab_width(const char *label)
 
 static void draw_tabs(ph_ui *u)
 {
+	LAYOUT;
 	static const char *tabs[PH_TAB_COUNT] =
 		{ "ALL", "MAME", "FBNEO", "DREAMCAST", "PS2", "PS3", "XBOX",
 		  "GC/WII", "PC", "RETROARCH" };
@@ -576,7 +756,7 @@ static void draw_tabs(ph_ui *u)
 	static const char *MORE_L = "<";
 	static const char *MORE_R = ">";
 
-	rect(u, 0, TAB_Y, u->w, TAB_H, C_TABBAR);
+	rect(u, 0, L.tab_y, u->w, TAB_H, C_TABBAR);
 
 	/* Position within the filtered list, parked at the right end of the strip. Measured
 	 * first because the tabs get whatever width it does not want. */
@@ -586,8 +766,8 @@ static void draw_tabs(ph_ui *u)
 	snprintf(cnt, sizeof(cnt), "%d/%d", n ? u->sel + 1 : 0, n);
 
 	const int cnt_w = ntw(cnt) + 12;
-	const int strip_l = PH_SAFE_X;
-	int strip_r = u->w - PH_SAFE_X - cnt_w;
+	const int strip_l = L.l;
+	int strip_r = u->w - L.r - cnt_w;
 	if (strip_r < strip_l) strip_r = strip_l;
 
 	/* The strip scrolls rather than being limited to what fits: the tab count follows
@@ -618,7 +798,7 @@ static void draw_tabs(ph_ui *u)
 	int x = strip_l;
 	if (first > 0)
 	{
-		text_n(u, x, TAB_Y + 6, MORE_L, C_TEXT_MUTE);
+		text_n(u, x, L.tab_y + 6, MORE_L, C_TEXT_MUTE);
 		x += ntw(MORE_L) + TAB_GAP;
 	}
 
@@ -627,23 +807,23 @@ static void draw_tabs(ph_ui *u)
 		int tw = tab_width(tabs[t]);
 		if (t == u->tab)
 		{
-			box(u, x, TAB_Y + 1, tw, TAB_H - 4, C_AMBER, C_AMBER_HI, 0);
-			text_n(u, x + 8, TAB_Y + 6, tabs[t], 0x1A1200);
+			box(u, x, L.tab_y + 1, tw, TAB_H - 4, C_AMBER, C_AMBER_HI, 0);
+			text_n(u, x + 8, L.tab_y + 6, tabs[t], 0x1A1200);
 		}
 		else
 		{
-			box(u, x, TAB_Y + 1, tw, TAB_H - 4, C_INACTIVE, C_BORDER, 0);
-			text_n(u, x + 8, TAB_Y + 6, tabs[t], C_TEXT_MUTE);
+			box(u, x, L.tab_y + 1, tw, TAB_H - 4, C_INACTIVE, C_BORDER, 0);
+			text_n(u, x + 8, L.tab_y + 6, tabs[t], C_TEXT_MUTE);
 		}
 		x += tw + TAB_GAP;
 	}
 
 	if (last < PH_TAB_COUNT - 1 && x + ntw(MORE_R) <= strip_r)
-		text_n(u, x, TAB_Y + 6, MORE_R, C_TEXT_MUTE);
+		text_n(u, x, L.tab_y + 6, MORE_R, C_TEXT_MUTE);
 
-	text_n_right(u, u->w - PH_SAFE_X, TAB_Y + 6, cnt, C_TEXT_MUTE);
+	text_n_right(u, u->w - L.r, L.tab_y + 6, cnt, C_TEXT_MUTE);
 
-	rect(u, 0, TAB_Y + TAB_H, u->w, 2, C_BORDER);
+	rect(u, 0, L.tab_y + TAB_H, u->w, 2, C_BORDER);
 }
 
 /* The empty states. Each one names the reason and the fix; none of them pretends
@@ -656,7 +836,7 @@ static void draw_empty(ph_ui *u, int x, int y, int w, int any_games)
 	if (any_games)
 	{
 		text_n(u, cx, cy, "No titles in this category.", C_AMBER);
-		text_n(u, cx, cy + 26, "Press LEFT / RIGHT to change platform.", C_TEXT_DIM);
+		text_n(u, cx, cy + 26, "Press L / R to change platform.", C_TEXT_DIM);
 		return;
 	}
 
@@ -673,7 +853,7 @@ static void draw_empty(ph_ui *u, int x, int y, int w, int any_games)
 	default:
 		text_n(u, cx, cy, "No host found.", C_RED);
 		text_n(u, cx, cy + 26, "Start Phantom Arcade Manager on the PC,", C_TEXT_DIM);
-		text_n(u, cx, cy + 48, "then press REFRESH to search again.", C_TEXT_DIM);
+		text_n(u, cx, cy + 48, "then press Y (REFRESH) to search again.", C_TEXT_DIM);
 		if (u->host_ip[0])
 		{
 			char s[96];
@@ -687,28 +867,29 @@ static void draw_empty(ph_ui *u, int x, int y, int w, int any_games)
 
 static void draw_list(ph_ui *u)
 {
-	int x = PH_SAFE_X;
-	int w = u->w - 2 * PH_SAFE_X;
+	LAYOUT;
+	int x = L.l;
+	int w = u->w - L.l - L.r;
 
-	box(u, x, LIST_Y, w, LIST_H, C_CARD, C_BORDER, C_BORDER_HI);
+	box(u, x, L.list_y, w, L.list_h, C_CARD, C_BORDER, C_BORDER_HI);
 
 	/* column header */
-	rect(u, x + 2, LIST_Y + 2, w - 4, LIST_HDR_H - 2, C_PANEL_DK);
-	text_n(u, x + 12, LIST_Y + 5, "GAME TITLE", C_TEXT_MUTE);
-	text_n_right(u, x + w - 12, LIST_Y + 5, "SYSTEM", C_TEXT_MUTE);
-	rect(u, x + 2, LIST_Y + LIST_HDR_H, w - 4, 2, C_BORDER);
+	rect(u, x + 2, L.list_y + 2, w - 4, LIST_HDR_H - 2, C_PANEL_DK);
+	text_n(u, x + 12, L.list_y + 5, "GAME TITLE", C_TEXT_MUTE);
+	text_n_right(u, x + w - 12, L.list_y + 5, "SYSTEM", C_TEXT_MUTE);
+	rect(u, x + 2, L.list_y + LIST_HDR_H, w - 4, 2, C_BORDER);
 
 	int idx[PH_MAX_GAMES];
 	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
 
 	if (n == 0)
 	{
-		draw_empty(u, x, LIST_Y + LIST_HDR_H, w, u->count > 0);
+		draw_empty(u, x, L.list_y + LIST_HDR_H, w, u->count > 0);
 		return;
 	}
 
-	int rows = visible_rows();
-	int inner_y = LIST_Y + LIST_HDR_H + 4;
+	int rows = visible_rows(u);
+	int inner_y = L.list_y + LIST_HDR_H + 4;
 	int bar_w = (n > rows) ? 14 : 0;
 
 	for (int r = 0; r < rows; r++)
@@ -774,10 +955,11 @@ static void draw_list(ph_ui *u)
 
 static void draw_detail(ph_ui *u)
 {
-	int x = PH_SAFE_X;
-	int w = u->w - 2 * PH_SAFE_X;
+	LAYOUT;
+	int x = L.l;
+	int w = u->w - L.l - L.r;
 
-	box(u, x, DETAIL_Y, w, DETAIL_H, C_PANEL_DK, C_BORDER, 0);
+	box(u, x, L.detail_y, w, DETAIL_H, C_PANEL_DK, C_BORDER, 0);
 
 	/* A transient message takes the whole bar. Without this the only place status text
 	 * appeared was the busy overlay, so a launch that timed out dropped silently back
@@ -785,14 +967,14 @@ static void draw_detail(ph_ui *u)
 	 * status after a few seconds. */
 	if (u->status[0] && u->view != PH_VIEW_BUSY)
 	{
-		text_n_clip(u, x + 12, DETAIL_Y + 4, u->status, C_AMBER, w - 24);
+		text_n_clip(u, x + 12, L.detail_y + 4, u->status, C_AMBER, w - 24);
 		return;
 	}
 
 	const ph_game *g = ph_ui_selected(u);
 	if (!g)
 	{
-		text_n(u, x + 12, DETAIL_Y + 4, "--", C_TEXT_MUTE);
+		text_n(u, x + 12, L.detail_y + 4, "--", C_TEXT_MUTE);
 		return;
 	}
 
@@ -808,7 +990,7 @@ static void draw_detail(ph_ui *u)
 	else if (g->year[0])                snprintf(left, sizeof(left), "%s", g->year);
 	else if (g->maker[0])               snprintf(left, sizeof(left), "%s", g->maker);
 	else                                snprintf(left, sizeof(left), "%s", g->sysname[0] ? g->sysname : g->system);
-	text_n_clip(u, x + 12, DETAIL_Y + 4, left, C_TEXT_DIM, w - 24 - 40 * PH_NARROW_W);
+	text_n_clip(u, x + 12, L.detail_y + 4, left, C_TEXT_DIM, w - 24 - 40 * PH_NARROW_W);
 
 	/* Right: the timing the host reported. Omitted entirely when unknown rather than
 	 * filled in with a stock 15.734kHz that may be wrong for this title. */
@@ -827,37 +1009,249 @@ static void draw_detail(ph_ui *u)
 	{
 		snprintf(right, sizeof(right), "timing from host at launch");
 	}
-	text_n_right(u, x + w - 12, DETAIL_Y + 4, right, C_CYAN);
+	text_n_right(u, x + w - 12, L.detail_y + 4, right, C_CYAN);
+}
+
+/* ---- button legend ----------------------------------------------------------- */
+
+/* The four face buttons in MiSTer's SNES-style colours - A red, B yellow, X blue, Y green -
+ * so the key at the bottom matches the pad in the user's hands. The core names the pad's ten
+ * positions A, B, X, Y, L, R, Select, Start, L2, R2 in that order (input.cpp), and phantom.cpp
+ * reads exactly those. */
+#define C_BTN_A 0xE04444
+#define C_BTN_B 0xE0B020
+#define C_BTN_X 0x4A86E8
+#define C_BTN_Y 0x18C070
+
+static int isqrt_i(int v)
+{
+	int r = 0;
+	while ((r + 1) * (r + 1) <= v) r++;
+	return r;
+}
+
+/* A filled disc, built from 2px-tall bands like everything else here. */
+static void disc(ph_ui *u, int x, int y, int d, uint32_t rgb)
+{
+	int R = d / 2;
+	for (int j = 0; j < d; j += 2)
+	{
+		int dy = (j + 1) - R;
+		int half = isqrt_i(R * R - dy * dy);
+		rect(u, x + R - half, y + j, half * 2, 2, rgb);
+	}
+}
+
+/* A face button: coloured disc with its letter. 18px so the narrow glyph (8 wide, 16 inked
+ * rows) sits inside it. */
+static void badge(ph_ui *u, int x, int y, uint32_t rgb, char ch)
+{
+	disc(u, x, y, 18, rgb);
+	glyph_s(u, x + 5, y + 1, ch, 0x101010, 1, 2);
+}
+
+/* A shoulder button or Select: a labelled key cap. Returns its width. */
+static int keycap(ph_ui *u, int x, int y, const char *label)
+{
+	int w = ntw(label) + 12;
+	rect(u, x, y, w, 18, C_BORDER_HI);
+	rect(u, x + 2, y + 2, w - 4, 14, C_INACTIVE);
+	text_n(u, x + 6, y + 1, label, C_TEXT);
+	return w;
+}
+
+/* The D-pad as a plus, with the two arms the item uses lit. */
+static void dpad(ph_ui *u, int x, int y, int vertical)
+{
+	rect(u, x, y + 6, 20, 8, C_BORDER_HI);
+	rect(u, x + 6, y, 8, 20, C_BORDER_HI);
+	if (vertical)
+	{
+		rect(u, x + 6, y, 8, 8, C_AMBER);
+		rect(u, x + 6, y + 12, 8, 8, C_AMBER);
+	}
+	else
+	{
+		rect(u, x, y + 6, 8, 8, C_AMBER);
+		rect(u, x + 12, y + 6, 8, 8, C_AMBER);
+	}
+}
+
+enum { LG_MOVE, LG_PAGE, LG_SYSTEM, LG_LETTER, LG_LAUNCH, LG_REFRESH, LG_SCREEN, LG_COUNT };
+
+/* Which items go first when the margins leave too little width. */
+static const int lg_drop_order[LG_COUNT] =
+	{ LG_SCREEN, LG_LETTER, LG_PAGE, LG_REFRESH, LG_SYSTEM, LG_MOVE, LG_LAUNCH };
+
+static int lg_width(int it)
+{
+	switch (it)
+	{
+	case LG_MOVE:    return 20 + 6 + ntw("MOVE");
+	case LG_PAGE:    return 20 + 6 + ntw("PAGE");
+	case LG_SYSTEM:  return (ntw("L") + 12) + 4 + (ntw("R") + 12) + 6 + ntw("SYSTEM");
+	case LG_LETTER:  return (ntw("L2") + 12) + 4 + (ntw("R2") + 12) + 6 + ntw("A-Z");
+	case LG_LAUNCH:  return 18 + 6 + ntw("LAUNCH");
+	case LG_REFRESH: return 18 + 6 + ntw("REFRESH");
+	default:         return (ntw("SEL") + 12) + 6 + ntw("SCREEN");
+	}
+}
+
+static int lg_draw(ph_ui *u, int it, int x, int y)
+{
+	switch (it)
+	{
+	case LG_MOVE:
+		dpad(u, x, y, 1);
+		text_n(u, x + 26, y + 1, "MOVE", C_TEXT_DIM);
+		break;
+	case LG_PAGE:
+		dpad(u, x, y, 0);
+		text_n(u, x + 26, y + 1, "PAGE", C_TEXT_DIM);
+		break;
+	case LG_SYSTEM:
+	{
+		int a = keycap(u, x, y, "L");
+		int b = keycap(u, x + a + 4, y, "R");
+		text_n(u, x + a + 4 + b + 6, y + 1, "SYSTEM", C_TEXT_DIM);
+		break;
+	}
+	case LG_LETTER:
+	{
+		int a = keycap(u, x, y, "L2");
+		int b = keycap(u, x + a + 4, y, "R2");
+		text_n(u, x + a + 4 + b + 6, y + 1, "A-Z", C_TEXT_DIM);
+		break;
+	}
+	case LG_LAUNCH:
+		badge(u, x, y, C_BTN_A, 'A');
+		text_n(u, x + 24, y + 1, "LAUNCH", C_TEXT);
+		break;
+	case LG_REFRESH:
+		badge(u, x, y, C_BTN_Y, 'Y');
+		text_n(u, x + 24, y + 1, "REFRESH", C_TEXT_DIM);
+		break;
+	default:
+	{
+		int a = keycap(u, x, y, "SEL");
+		text_n(u, x + a + 6, y + 1, "SCREEN", C_TEXT_DIM);
+		break;
+	}
+	}
+	return lg_width(it);
 }
 
 static void draw_footer(ph_ui *u)
 {
-	rect(u, 0, FOOT_Y, u->w, FOOT_H, C_PANEL_DK);
-	rect(u, 0, FOOT_Y, u->w, 2, C_BORDER);
+	LAYOUT;
 
-	int y = FOOT_Y + 7;
-	int x = PH_SAFE_X;
+	/* The panel runs to the bottom edge of the screen; the key inside it stays above the margin. */
+	rect(u, 0, L.foot_y, u->w, u->h - L.foot_y, C_PANEL_DK);
+	rect(u, 0, L.foot_y, u->w, 2, C_BORDER);
 
-	arrow(u, x, y + 1, 14, PH_ARROW_UP, C_AMBER);
-	arrow(u, x + 18, y + 1, 14, PH_ARROW_DOWN, C_AMBER);
-	x += 38;
-	text_n(u, x, y, "SELECT", C_TEXT_DIM);
-	x += ntw("SELECT") + 22;
+	enum { GAP = 14 };
+	int avail = u->w - L.l - L.r;
+	int shown[LG_COUNT];
+	int total = 0, count = 0;
+	for (int i = 0; i < LG_COUNT; i++)
+	{
+		shown[i] = 1;
+		total += lg_width(i);
+		count++;
+	}
+	total += GAP * (count - 1);
 
-	arrow(u, x, y + 1, 14, PH_ARROW_LEFT, C_CYAN);
-	arrow(u, x + 18, y + 1, 14, PH_ARROW_RIGHT, C_CYAN);
-	x += 38;
-	text_n(u, x, y, "PLATFORM", C_TEXT_DIM);
-	x += ntw("PLATFORM") + 22;
+	/* Too narrow for the whole key: drop the least important items until it fits. */
+	for (int k = 0; k < LG_COUNT && total > avail; k++)
+	{
+		int it = lg_drop_order[k];
+		shown[it] = 0;
+		total -= lg_width(it) + GAP;
+	}
 
-	rect(u, x, y + 3, 12, 12, C_RED);
-	x += 18;
-	text_n(u, x, y, "LAUNCH", C_TEXT);
-	x += ntw("LAUNCH") + 22;
+	int y = L.foot_y + 6;
+	int x = L.l;
+	for (int i = 0; i < LG_COUNT; i++)
+	{
+		if (!shown[i]) continue;
+		x += lg_draw(u, i, x, y) + GAP;
+	}
+}
 
-	rect(u, x, y + 3, 12, 12, C_YELLOW);
-	x += 18;
-	text_n(u, x, y, "REFRESH", C_TEXT_DIM);
+/* ---- the screen-adjust page --------------------------------------------------- */
+
+static void frame(ph_ui *u, int x, int y, int w, int h, int th, uint32_t rgb)
+{
+	rect(u, x, y, w, th, rgb);
+	rect(u, x, y + h - th, w, th, rgb);
+	rect(u, x, y, th, h, rgb);
+	rect(u, x + w - th, y, th, h, rgb);
+}
+
+static void draw_adjust(ph_ui *u)
+{
+	rect(u, 0, 0, u->w, u->h, C_BG);
+
+	/* The whole raster, in red. Whatever of this frame cannot be seen is being hidden by the display. */
+	frame(u, 0, 0, u->w, u->h, 4, C_RED);
+
+	const int l = u->safe.l, t = u->safe.t;
+	const int w = u->w - u->safe.l - u->safe.r;
+	const int h = u->h - u->safe.t - u->safe.b;
+
+	/* The safe rectangle, in amber, with the edge being moved drawn heavier and brighter. */
+	frame(u, l, t, w, h, 2, C_AMBER_DK);
+	switch (u->adj_edge)
+	{
+	case 0: rect(u, l, t, w, 4, C_AMBER_HI); break;
+	case 1: rect(u, l, t + h - 4, w, 4, C_AMBER_HI); break;
+	case 2: rect(u, l, t, 4, h, C_AMBER_HI); break;
+	default: rect(u, l + w - 4, t, 4, h, C_AMBER_HI); break;
+	}
+	/* Corner brackets, so the corners are findable on a display that rounds them. */
+	for (int c = 0; c < 4; c++)
+	{
+		int cx = (c & 1) ? l + w - 24 : l;
+		int cy = (c & 2) ? t + h - 24 : t;
+		rect(u, cx, (c & 2) ? cy + 20 : cy, 24, 4, C_AMBER);
+		rect(u, (c & 1) ? cx + 20 : cx, cy, 4, 24, C_AMBER);
+	}
+
+	int cx = u->w / 2;
+	text_sh(u, cx - (int)strlen("SCREEN ADJUST") * 12, t + 18, "SCREEN ADJUST", C_AMBER, C_AMBER_DK, 3);
+
+	const char *help1 = "Move each edge in until the whole amber box is on screen.";
+	const char *help2 = "UP shrinks the box, DOWN grows it. Everything the launcher shows stays inside it.";
+	text_n(u, cx - ntw(help1) / 2, t + 62, help1, C_TEXT_DIM);
+	text_n(u, cx - ntw(help2) / 2, t + 82, help2, C_TEXT_DIM);
+
+	static const char *names[4] = { "TOP", "BOTTOM", "LEFT", "RIGHT" };
+	int vals[4] = { u->safe.t, u->safe.b, u->safe.l, u->safe.r };
+	int ry = t + 120;
+	for (int i = 0; i < 4; i++)
+	{
+		int sel = (i == u->adj_edge);
+		int rx = cx - 130;
+		rect(u, rx, ry, 260, 26, sel ? C_ROW_SEL : C_CARD);
+		if (sel) rect(u, rx, ry, 6, 26, C_AMBER);
+		text_n(u, rx + 18, ry + 5, names[i], sel ? C_AMBER_HI : C_TEXT_DIM);
+		char v[16];
+		snprintf(v, sizeof(v), "%d px", vals[i]);
+		text_n_right(u, rx + 244, ry + 5, v, sel ? C_AMBER_HI : C_TEXT);
+		ry += 30;
+	}
+
+	/* This page's own key, centred near the bottom of the safe area. */
+	int ky = t + h - 48;
+	enum { GAP = 14 };
+	int kw = (20 + 6 + ntw("EDGE")) + GAP + (20 + 6 + ntw("SIZE")) + GAP + (18 + 6 + ntw("SAVE")) +
+	         GAP + (18 + 6 + ntw("CANCEL")) + GAP + (18 + 6 + ntw("RESET"));
+	int kx = cx - kw / 2;
+	dpad(u, kx, ky, 0);       text_n(u, kx + 26, ky + 1, "EDGE", C_TEXT_DIM);   kx += 20 + 6 + ntw("EDGE") + GAP;
+	dpad(u, kx, ky, 1);       text_n(u, kx + 26, ky + 1, "SIZE", C_TEXT_DIM);   kx += 20 + 6 + ntw("SIZE") + GAP;
+	badge(u, kx, ky, C_BTN_A, 'A');  text_n(u, kx + 24, ky + 1, "SAVE", C_TEXT);        kx += 18 + 6 + ntw("SAVE") + GAP;
+	badge(u, kx, ky, C_BTN_B, 'B');  text_n(u, kx + 24, ky + 1, "CANCEL", C_TEXT_DIM);  kx += 18 + 6 + ntw("CANCEL") + GAP;
+	badge(u, kx, ky, C_BTN_Y, 'Y');  text_n(u, kx + 24, ky + 1, "RESET", C_TEXT_DIM);
 }
 
 /* The busy overlay. There is deliberately no percentage and no countdown: the core
@@ -867,10 +1261,14 @@ static void draw_footer(ph_ui *u)
  * setInit path), so the transition is driven by the real event. */
 static void draw_busy(ph_ui *u)
 {
+	LAYOUT;
 	int bw = 560;
 	int bh = 150;
-	int bx = (u->w - bw) / 2;
-	int by = (u->h - bh) / 2;
+	int span = u->w - L.l - L.r;
+	if (bw > span) bw = span;
+	int bx = L.l + (span - bw) / 2;
+	int by = u->safe.t + (u->h - u->safe.t - u->safe.b - bh) / 2;
+	if (by < 0) by = 0;
 
 	box(u, bx, by, bw, bh, 0x161826, C_AMBER, C_AMBER_DK);
 
@@ -903,12 +1301,20 @@ static void draw_busy(ph_ui *u)
 		     (i <= lit) ? C_AMBER : C_AMBER_DK);
 	}
 
-	text_n(u, bx + 20, by + 126, "B cancels", C_TEXT_MUTE);
+	badge(u, bx + 20, by + 122, C_BTN_B, 'B');
+	text_n(u, bx + 44, by + 123, "CANCEL", C_TEXT_MUTE);
 }
 
 void ph_ui_render(ph_ui *u)
 {
 	if (!u->fb) return;
+
+	if (u->view == PH_VIEW_ADJUST)
+	{
+		draw_adjust(u);
+		u->dirty = 0;
+		return;
+	}
 
 	rect(u, 0, 0, u->w, u->h, C_BG);
 

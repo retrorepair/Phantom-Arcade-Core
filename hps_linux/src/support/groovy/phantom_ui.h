@@ -60,8 +60,28 @@ typedef enum
 typedef enum
 {
 	PH_VIEW_LIST = 0,  /* browsing */
-	PH_VIEW_BUSY       /* a LAUNCH has gone out; waiting for the host's first frame */
+	PH_VIEW_BUSY,      /* a LAUNCH has gone out; waiting for the host's first frame */
+	PH_VIEW_ADJUST     /* the screen-adjust page: set how much of each edge the display hides */
 } ph_view;
+
+/* How many pixels of each edge of the 720x480 canvas the display may hide. A TV's overscan
+ * is not symmetric - one that loses 20 lines at the top can lose 45 at the bottom - so each
+ * edge is its own number. Everything the launcher draws that has to be read lives inside the
+ * rectangle these leave; only backgrounds run out to the edge. A CRT that shows the whole
+ * raster wants all four at zero. Values are even: an odd margin would put an edge on one field
+ * of the interlaced scan only. */
+typedef struct
+{
+	int l, t, r, b;
+} ph_safe;
+
+/* Broadcast "title safe" is 90% of the picture: 5% either side, 36px across and 24px down. */
+#define PH_SAFE_DEF_L 36
+#define PH_SAFE_DEF_T 24
+#define PH_SAFE_DEF_R 36
+#define PH_SAFE_DEF_B 24
+#define PH_SAFE_MAX_X 120
+#define PH_SAFE_MAX_Y 100
 
 /* Category tabs. These filter on ph_game.system, so they are a property of the
  * launcher, not of the host's catalog: a host that serves only MAME still shows all
@@ -97,6 +117,11 @@ typedef struct
 	int sel;
 	int scroll;
 
+	/* display overscan; see ph_safe */
+	ph_safe safe;
+	ph_safe safe_saved;   /* what to go back to if the adjust page is cancelled */
+	int     adj_edge;     /* 0 top, 1 bottom, 2 left, 3 right: the edge the adjust page is moving */
+
 	/* host link, for the header */
 	ph_host_state host_state;
 	char          host_ip[64];
@@ -129,6 +154,25 @@ void ph_ui_render(ph_ui *u);
 /* Navigation. Each returns 1 when something changed and a redraw is owed. */
 int ph_ui_move(ph_ui *u, int dy);
 int ph_ui_tab(ph_ui *u, int dx);
+
+/* Move by a screenful. Clamps at the ends rather than wrapping: a page jump that wraps
+ * lands somewhere unrelated, where a single step wrapping is easy to follow. */
+int ph_ui_page(ph_ui *u, int dir);
+
+/* Jump to the first title of the next (dir > 0) or the current/previous (dir < 0) letter.
+ * Titles that do not start with a letter are one group, ahead of "A". */
+int ph_ui_letter(ph_ui *u, int dir);
+
+/* Rows the list shows at once with the current margins. */
+int ph_ui_rows(const ph_ui *u);
+
+/* Safe area. set clamps to the allowed range and rounds each value down to even. */
+void ph_ui_set_safe(ph_ui *u, int l, int t, int r, int b);
+void ph_ui_adjust_begin(ph_ui *u);
+int  ph_ui_adjust_edge(ph_ui *u, int dir);          /* choose the edge to move */
+int  ph_ui_adjust_move(ph_ui *u, int delta);        /* move it: + is further in from the edge */
+void ph_ui_adjust_reset(ph_ui *u);                  /* back to the defaults */
+void ph_ui_adjust_end(ph_ui *u, int keep);          /* keep=0 restores what it was on entry */
 
 /* Advance animation only. Returns 1 if the frame would differ from the last one. */
 int ph_ui_animate(ph_ui *u, uint32_t tick_ms);

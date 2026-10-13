@@ -36,6 +36,14 @@
 #include "phantom.h"
 #include "user_io.h" /* JOY_* - the same bit values the core uses (found via -I hps_linux/src) */
 
+/* The Groovy core's ten pad positions in order - A, B, X, Y, L, R, Select, Start, L2, R2 - as bits
+ * 4..13 of the mask. user_io.h's JOY_SELECT/JOY_START (0x40/0x80) are the older names for what are
+ * X and Y here. */
+#define GJ_X      0x0040
+#define GJ_Y      0x0080
+#define GJ_SELECT 0x0400
+#define GJ_START  0x0800
+
 /* Must match what phantom.cpp is built with (tools/run_phantom_input_test.sh passes the same
  * values to both), shortened so the session-end scenarios run in seconds. */
 #ifndef T_CLOSE_GRACE
@@ -187,6 +195,25 @@ static void check(bool ok, const char *fmt, ...)
 
 static void section(const char *s) { std::printf("\n%s\n", s); }
 
+/* Does the launcher's settings file contain this line? */
+static bool ini_has(const char *line)
+{
+    FILE *f = fopen(TEST_DIR "/phantom.ini", "r");
+    if (!f)
+        return false;
+    char buf[256];
+    bool hit = false;
+    while (fgets(buf, sizeof(buf), f)) {
+        size_t n = strlen(buf);
+        while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+            buf[--n] = 0;
+        if (!strcmp(buf, line))
+            hit = true;
+    }
+    fclose(f);
+    return hit;
+}
+
 /* ---- scenarios -------------------------------------------------------------------- */
 
 int main()
@@ -306,9 +333,9 @@ int main()
     section("5. the exit hotkey (Start+Select held) kills the game; what comes after?");
     int kills_before = count_rx("KILL");
     launches_before  = count_rx("LAUNCH:");
-    pad(JOY_START | JOY_SELECT);
+    pad(GJ_START | GJ_SELECT);
     pump(1300);
-    pad(JOY_START | JOY_SELECT | JOY_BTN1); /* the third event is what completes the hold */
+    pad(GJ_START | GJ_SELECT | JOY_BTN1); /* the third event is what completes the hold */
     pump(50);
     check(count_rx("KILL") == kills_before + 1, "hotkey sent KILL (%d)", count_rx("KILL") - kills_before);
     check(phantom_owns_screen() == 1, "launcher took the screen back");
@@ -318,6 +345,59 @@ int main()
         tap(JOY_BTN1, 60);
     check(count_rx("LAUNCH:") == launches_before,
           "mashing after the hotkey launched %d games (must be 0)", count_rx("LAUNCH:") - launches_before);
+
+    /* ---------------------------------------------------------------------------- */
+    section("5b. X and Y held together are NOT the exit hotkey (they used to be)");
+    phantom_idle_leave(); /* a game is streaming */
+    pump(100);
+    kills_before = count_rx("KILL");
+    pad(GJ_X | GJ_Y);
+    pump(1600); /* longer than the 1.2s hold */
+    pad(GJ_X | GJ_Y | JOY_BTN1);
+    pump(50);
+    pad(0);
+    pump(40);
+    check(count_rx("KILL") == kills_before, "holding X+Y for 1.6s sent %d KILLs (must be 0)", count_rx("KILL") - kills_before);
+    check(phantom_owns_screen() == 0, "and the game kept the screen");
+
+    /* ---------------------------------------------------------------------------- */
+    section("5c. Y refreshes; Select opens the screen-adjust page, which saves, cancels and resets");
+    phantom_idle_enter();
+    pump(2200); /* past the takeover guard */
+
+    int catalog0 = count_rx("GET_CATALOG");
+    tap(GJ_Y);
+    check(count_rx("GET_CATALOG") > catalog0, "Y asked the host for the catalog again");
+    pump(400);
+
+    launches_before = count_rx("LAUNCH:");
+    tap(GJ_SELECT); /* adjust page opens with the bottom edge selected */
+    for (int i = 0; i < 6; i++)
+        tap(JOY_UP); /* up shrinks the box: +2 each */
+    tap(JOY_BTN1);   /* A saves */
+    check(count_rx("LAUNCH:") == launches_before, "A on the adjust page saved rather than launching a game");
+    check(ini_has("SAFE_B=36"), "six presses of Up moved the bottom margin from 24 to 36 and saved it");
+    check(ini_has("SAFE_T=24") && ini_has("SAFE_L=36") && ini_has("SAFE_R=36"), "the other edges are untouched");
+
+    tap(GJ_SELECT);
+    for (int i = 0; i < 5; i++)
+        tap(JOY_UP);
+    tap(JOY_BTN2); /* B cancels */
+    check(ini_has("SAFE_B=36"), "cancelling leaves the saved margins as they were");
+
+    tap(GJ_SELECT);
+    tap(JOY_RIGHT); /* next edge: left */
+    for (int i = 0; i < 4; i++)
+        tap(JOY_UP);
+    tap(JOY_BTN1);
+    check(ini_has("SAFE_L=44") && ini_has("SAFE_B=36"), "Right chose the left edge; 4 x Up made it 44 (bottom stays 36)");
+
+    tap(GJ_SELECT);
+    tap(GJ_Y); /* Y resets to the defaults */
+    tap(JOY_BTN1);
+    check(ini_has("SAFE_L=36") && ini_has("SAFE_T=24") && ini_has("SAFE_R=36") && ini_has("SAFE_B=24"),
+          "Y then A restores the default margins");
+    check(count_rx("LAUNCH:") == launches_before, "none of that launched a game");
 
     /* ---------------------------------------------------------------------------- */
     section("6. the keyboard takes the same road: Enter/Space launch, WASD navigate");

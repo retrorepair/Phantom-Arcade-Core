@@ -95,6 +95,7 @@ int main(int argc, char **argv)
 	const char *out = argc > 1 ? argv[1] : "phantom_preview.ppm";
 	const char *tsv = 0;
 	int busy = 0, empty = 0, offline = 0, tab = 0, sel = 0;
+	int adjust = 0, edge = 1, sl = -1, st = -1, sr = -1, sb = -1;
 	uint32_t t = 0;
 
 	for (int i = 2; i < argc; i++)
@@ -105,6 +106,9 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--tab") && i + 1 < argc) tab = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--sel") && i + 1 < argc) sel = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--time") && i + 1 < argc) t = (uint32_t)strtoul(argv[++i], 0, 10);
+		else if (!strcmp(argv[i], "--adjust")) adjust = 1;
+		else if (!strcmp(argv[i], "--edge") && i + 1 < argc) edge = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--safe") && i + 1 < argc) sscanf(argv[++i], "%d,%d,%d,%d", &sl, &st, &sr, &sb);
 		else if (argv[i][0] != '-') tsv = argv[i];
 	}
 
@@ -120,6 +124,8 @@ int main(int argc, char **argv)
 
 	ui.tab = tab;
 	ui.sel = sel;
+	if (sl >= 0) ph_ui_set_safe(&ui, sl, st, sr, sb);
+	if (adjust) { ph_ui_adjust_begin(&ui); ui.adj_edge = edge; }
 	ph_ui_reclamp(&ui, 0);
 	ph_ui_animate(&ui, t);
 

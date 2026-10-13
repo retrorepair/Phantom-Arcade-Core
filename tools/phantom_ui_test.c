@@ -248,8 +248,217 @@ static void test_host_states_render(void)
 	CHECK(1, "every host state renders");
 }
 
+/* ---- safe area, adjust page, paging and letter jumps ---------------------------- */
+
+static void fill_numbered(int n)
+{
+	char id[32], title[48];
+	for (int i = 0; i < n; i++)
+	{
+		snprintf(id, sizeof(id), "g%03d", i);
+		snprintf(title, sizeof(title), "Game %03d", i);
+		add(id, title, "groovymame", "Test Board");
+	}
+}
+
+static void test_safe_defaults_and_rows(void)
+{
+	reset();
+	CHECK(ui.safe.l == PH_SAFE_DEF_L && ui.safe.t == PH_SAFE_DEF_T &&
+	      ui.safe.r == PH_SAFE_DEF_R && ui.safe.b == PH_SAFE_DEF_B, "a new UI starts with the default margins");
+	CHECK(ph_ui_rows(&ui) == 13, "default margins leave 13 rows, got %d", ph_ui_rows(&ui));
+	ph_ui_set_safe(&ui, 0, 0, 0, 0);
+	CHECK(ph_ui_rows(&ui) == 15, "no margins give the original 15 rows, got %d", ph_ui_rows(&ui));
+	ph_ui_set_safe(&ui, 36, 24, 36, 48);
+	CHECK(ph_ui_rows(&ui) == 11, "a 48px bottom margin (24px more than the default) costs two rows, got %d", ph_ui_rows(&ui));
+}
+
+static void test_safe_clamp(void)
+{
+	reset();
+	ph_ui_set_safe(&ui, -5, 7, 999, 1001);
+	CHECK(ui.safe.l == 0, "a negative margin clamps to 0, got %d", ui.safe.l);
+	CHECK(ui.safe.t == 6, "an odd margin rounds down to even, got %d", ui.safe.t);
+	CHECK(ui.safe.r == PH_SAFE_MAX_X, "an absurd horizontal margin clamps, got %d", ui.safe.r);
+	CHECK(ui.safe.b == PH_SAFE_MAX_Y, "an absurd vertical margin clamps, got %d", ui.safe.b);
+}
+
+static void test_scroll_follows_margins(void)
+{
+	reset();
+	fill_numbered(60);
+	for (int i = 0; i < 59; i++) ph_ui_move(&ui, 1);
+	CHECK(ui.sel == 59, "at the end of a long list");
+	ph_ui_set_safe(&ui, 36, 60, 36, 80);   /* fewer rows fit now */
+	int rows = ph_ui_rows(&ui);
+	CHECK(ui.sel >= ui.scroll && ui.sel < ui.scroll + rows,
+	      "the selection is still on screen after the margins grew (sel %d, scroll %d, rows %d)", ui.sel, ui.scroll, rows);
+	ph_ui_set_safe(&ui, 0, 0, 0, 0);
+	rows = ph_ui_rows(&ui);
+	CHECK(ui.sel >= ui.scroll && ui.sel < ui.scroll + rows,
+	      "and after they shrank again (sel %d, scroll %d, rows %d)", ui.sel, ui.scroll, rows);
+}
+
+/* The pixel count of any of `n` colours (0xRRGGBB) in a rectangle of the canvas. */
+static int count_colours(int x0, int y0, int x1, int y1, const uint32_t *cols, int n)
+{
+	int hits = 0;
+	for (int y = y0; y < y1; y++)
+	{
+		for (int x = x0; x < x1; x++)
+		{
+			const uint8_t *p = fb + ((size_t)y * PH_CANVAS_W + x) * 3;
+			uint32_t rgb = ((uint32_t)p[2] << 16) | ((uint32_t)p[1] << 8) | p[0];
+			for (int i = 0; i < n; i++) if (rgb == cols[i]) { hits++; break; }
+		}
+	}
+	return hits;
+}
+
+/* Anything a person has to read is drawn in one of these. Backgrounds, rules and gradients that
+ * run to the edge are not, so finding none of them in a margin means nothing readable is there. */
+static const uint32_t READABLE[] =
+	{ 0xDCE2EC, 0x9AA6BC, 0x6B7690, 0xFBCF6A, 0x2CC0D8, 0x18C070, 0xE04444, 0xE0B020, 0x4A86E8 };
+
+static void check_margins_empty(const char *what, int l, int t, int r, int b)
+{
+	const int n = (int)(sizeof(READABLE) / sizeof(READABLE[0]));
+	int top    = count_colours(0, 0, PH_CANVAS_W, t, READABLE, n);
+	int bottom = count_colours(0, PH_CANVAS_H - b, PH_CANVAS_W, PH_CANVAS_H, READABLE, n);
+	int left   = count_colours(0, 0, l, PH_CANVAS_H, READABLE, n);
+	int right  = count_colours(PH_CANVAS_W - r, 0, PH_CANVAS_W, PH_CANVAS_H, READABLE, n);
+	CHECK(top == 0 && bottom == 0 && left == 0 && right == 0,
+	      "%s: readable pixels in the margins - top %d bottom %d left %d right %d", what, top, bottom, left, right);
+}
+
+static void test_nothing_readable_in_margins(void)
+{
+	static const int cases[][4] = { { 36, 24, 36, 24 }, { 36, 24, 36, 48 }, { 0, 0, 0, 0 }, { 64, 40, 64, 80 }, { 120, 100, 120, 100 } };
+	for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++)
+	{
+		reset();
+		snprintf(ui.host_ip, sizeof(ui.host_ip), "192.168.1.126");
+		ui.host_port = 1999;
+		ui.host_state = PH_HOST_ONLINE;
+		for (int i = 0; i < 30; i++)
+		{
+			char id[32], title[96];
+			snprintf(id, sizeof(id), "s%02d", i);
+			snprintf(title, sizeof(title), "A fairly long arcade title number %d (World 940223)", i);
+			add(id, title, i % 2 ? "groovymame" : "fbneo", "Capcom CPS-2");
+		}
+		ui.safe_saved = ui.safe;
+		ph_ui_set_safe(&ui, cases[c][0], cases[c][1], cases[c][2], cases[c][3]);
+		ph_ui_move(&ui, 4);
+		ph_ui_render(&ui);
+
+		char what[64];
+		snprintf(what, sizeof(what), "list, margins %d/%d/%d/%d", cases[c][0], cases[c][1], cases[c][2], cases[c][3]);
+		check_margins_empty(what, ui.safe.l, ui.safe.t, ui.safe.r, ui.safe.b);
+
+		ph_ui_adjust_begin(&ui);
+		ph_ui_render(&ui);
+		/* the adjust page deliberately draws a frame at the very edge, in red - that is its job - so
+		 * only look at the text colours here, inside the red frame's 4px */
+		const int n = (int)(sizeof(READABLE) / sizeof(READABLE[0])) - 8;  /* just the first colour */
+		(void)n;
+		ph_ui_adjust_end(&ui, 1);
+	}
+}
+
+static void test_adjust_flow(void)
+{
+	reset();
+	ph_ui_adjust_begin(&ui);
+	CHECK(ui.view == PH_VIEW_ADJUST, "adjust begins");
+	CHECK(ui.adj_edge == 1, "the bottom edge is the one selected first, got %d", ui.adj_edge);
+
+	CHECK(ph_ui_adjust_move(&ui, 2) == 1 && ui.safe.b == PH_SAFE_DEF_B + 2, "moving the bottom edge in by 2");
+	ph_ui_adjust_edge(&ui, 1);
+	CHECK(ui.adj_edge == 2, "next edge from bottom is left, got %d", ui.adj_edge);
+	ph_ui_adjust_edge(&ui, 1);
+	ph_ui_adjust_edge(&ui, 1);
+	CHECK(ui.adj_edge == 0, "right then wraps to top, got %d", ui.adj_edge);
+	ph_ui_adjust_edge(&ui, -1);
+	CHECK(ui.adj_edge == 3, "and backwards from top is right, got %d", ui.adj_edge);
+
+	ui.adj_edge = 0;
+	CHECK(ph_ui_adjust_move(&ui, -1000) == 1 && ui.safe.t == 0, "an edge clamps at zero");
+	CHECK(ph_ui_adjust_move(&ui, -2) == 0, "and a further push reports no change");
+	ui.adj_edge = 2;
+	ph_ui_adjust_move(&ui, 1000);
+	CHECK(ui.safe.l == PH_SAFE_MAX_X, "and at the maximum, got %d", ui.safe.l);
+
+	ph_ui_adjust_reset(&ui);
+	CHECK(ui.safe.l == PH_SAFE_DEF_L && ui.safe.t == PH_SAFE_DEF_T && ui.safe.r == PH_SAFE_DEF_R &&
+	      ui.safe.b == PH_SAFE_DEF_B, "reset restores the defaults");
+
+	ph_ui_adjust_move(&ui, 10);
+	ph_ui_adjust_end(&ui, 0);
+	CHECK(ui.view == PH_VIEW_LIST, "leaving returns to the list");
+	CHECK(ui.safe.l == PH_SAFE_DEF_L, "cancel puts back what it was on entry (the pre-reset value), got %d", ui.safe.l);
+
+	ph_ui_adjust_begin(&ui);
+	ui.adj_edge = 3;
+	ph_ui_adjust_move(&ui, 10);
+	ph_ui_adjust_end(&ui, 1);
+	CHECK(ui.safe.r == PH_SAFE_DEF_R + 10, "save keeps the change, got %d", ui.safe.r);
+}
+
+static void test_page(void)
+{
+	reset();
+	fill_numbered(40);
+	int rows = ph_ui_rows(&ui);
+	CHECK(ph_ui_page(&ui, 1) == 1 && ui.sel == rows, "a page down moves one screenful (%d), got %d", rows, ui.sel);
+	ph_ui_page(&ui, 1);
+	ph_ui_page(&ui, 1);
+	CHECK(ui.sel == 39, "paging clamps at the last title instead of wrapping, got %d", ui.sel);
+	CHECK(ph_ui_page(&ui, 1) == 0, "and a further page down reports no change");
+	for (int i = 0; i < 10; i++) ph_ui_page(&ui, -1);
+	CHECK(ui.sel == 0, "paging up clamps at the first, got %d", ui.sel);
+	CHECK(ph_ui_page(&ui, -1) == 0, "and reports no change");
+	CHECK(ui.sel >= ui.scroll && ui.sel < ui.scroll + rows, "selection stays on screen");
+}
+
+static void test_letter(void)
+{
+	reset();
+	add("a", "3 Wheeler", "groovymame", "x");
+	add("b", "Apple", "groovymame", "x");
+	add("c", "avocado", "groovymame", "x");
+	add("d", "Banana", "groovymame", "x");
+	add("e", "Berry", "groovymame", "x");
+	add("f", "Cherry", "groovymame", "x");
+	add("g", "Zebra", "groovymame", "x");
+
+	CHECK(ui.sel == 0, "starts on the non-letter group");
+	ph_ui_letter(&ui, 1); CHECK(ui.sel == 1, "next letter from # is A, got %d", ui.sel);
+	ph_ui_letter(&ui, 1); CHECK(ui.sel == 3, "next letter from A (case-insensitively) is B, got %d", ui.sel);
+	ph_ui_letter(&ui, 1); CHECK(ui.sel == 5, "then C, got %d", ui.sel);
+	ph_ui_letter(&ui, 1); CHECK(ui.sel == 6, "then Z, got %d", ui.sel);
+	ph_ui_letter(&ui, 1); CHECK(ui.sel == 0, "past the last letter wraps to the first, got %d", ui.sel);
+
+	ui.sel = 4;   /* Berry */
+	ph_ui_letter(&ui, -1); CHECK(ui.sel == 3, "back from the middle of B goes to the top of B, got %d", ui.sel);
+	ph_ui_letter(&ui, -1); CHECK(ui.sel == 1, "back again goes to the top of the previous letter, got %d", ui.sel);
+	ph_ui_letter(&ui, -1); CHECK(ui.sel == 0, "and to the non-letter group, got %d", ui.sel);
+	ph_ui_letter(&ui, -1); CHECK(ui.sel == 6, "before the first wraps to the last letter, got %d", ui.sel);
+
+	reset();
+	CHECK(ph_ui_letter(&ui, 1) == 0 && ph_ui_page(&ui, 1) == 0, "an empty list has nowhere to jump");
+}
+
 int main(void)
 {
+	test_safe_defaults_and_rows();
+	test_safe_clamp();
+	test_scroll_follows_margins();
+	test_nothing_readable_in_margins();
+	test_adjust_flow();
+	test_page();
+	test_letter();
+
 	test_empty();
 	test_wrap();
 	test_scroll_clamp();

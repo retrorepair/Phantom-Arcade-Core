@@ -173,6 +173,9 @@ static void trim(char *s)
 /* phantom.ini is Phantom Arcade's existing file and keeps its existing keys, so an
  * installation that already had one keeps working untouched. IDLE_SCREEN and
  * EXIT_HOTKEY are new and default to the launcher being on. */
+/* The display's overscan margins, left/top/right/bottom, as saved by the screen-adjust page. */
+static int safe_cfg[4] = { PH_SAFE_DEF_L, PH_SAFE_DEF_T, PH_SAFE_DEF_R, PH_SAFE_DEF_B };
+
 static void load_config(void)
 {
 	FILE *f = fopen(PH_INI, "r");
@@ -211,8 +214,15 @@ static void load_config(void)
 		{
 			exit_hotkey = (!strcasecmp(val, "off") || !strcmp(val, "0")) ? 0 : 1;
 		}
+		else if (!strcmp(key, "SAFE_L")) safe_cfg[0] = atoi(val);
+		else if (!strcmp(key, "SAFE_T")) safe_cfg[1] = atoi(val);
+		else if (!strcmp(key, "SAFE_R")) safe_cfg[2] = atoi(val);
+		else if (!strcmp(key, "SAFE_B")) safe_cfg[3] = atoi(val);
 	}
 	fclose(f);
+
+	/* ph_ui_set_safe clamps and rounds, so a hand-edited value cannot break the layout. */
+	ph_ui_set_safe(&ui, safe_cfg[0], safe_cfg[1], safe_cfg[2], safe_cfg[3]);
 }
 
 void phantom_save_config(void)
@@ -231,6 +241,7 @@ void phantom_save_config(void)
 	        idle_mode == PHANTOM_IDLE_LOGO ? "logo" :
 	        idle_mode == PHANTOM_IDLE_OFF  ? "off"  : "launcher");
 	fprintf(f, "EXIT_HOTKEY=%s\n", exit_hotkey ? "on" : "off");
+	fprintf(f, "SAFE_L=%d\nSAFE_T=%d\nSAFE_R=%d\nSAFE_B=%d\n", ui.safe.l, ui.safe.t, ui.safe.r, ui.safe.b);
 	fclose(f);
 }
 
@@ -251,6 +262,17 @@ static void cache_save(void)
 		        g->id, g->title, g->system, g->sysname, g->mode, g->year, g->maker);
 	}
 	fclose(f);
+}
+
+/* The list is in title order whatever order the host or the cache gave it, because the
+ * jump-to-letter buttons only mean something on a sorted list. Case-insensitive, with the id
+ * to settle ties so the order is the same every time. */
+static int cmp_game(const void *a, const void *b)
+{
+	const ph_game *x = (const ph_game *)a;
+	const ph_game *y = (const ph_game *)b;
+	int c = strcasecmp(x->title, y->title);
+	return c ? c : strcmp(x->id, y->id);
 }
 
 static void cache_load(void)
@@ -290,6 +312,7 @@ static void cache_load(void)
 		if (n > 6 && fld[6]) snprintf(g->maker, sizeof(g->maker), "%s", fld[6]);
 	}
 	fclose(f);
+	if (ui.count) qsort(ui.games, (size_t)ui.count, sizeof(ph_game), cmp_game);
 	if (ui.count) LOGP("loaded %d cached titles\n", ui.count);
 }
 
@@ -387,6 +410,7 @@ static void parse_catalog(const char *buf, int len)
 		return;
 	}
 
+	qsort(tmp, (size_t)n, sizeof(ph_game), cmp_game);
 	memcpy(ui.games, tmp, sizeof(ph_game) * (size_t)n);
 	ui.count = n;
 	ph_ui_reclamp(&ui, keep);
@@ -881,6 +905,23 @@ void phantom_idle_poll(void)
 
 /* ---- input -------------------------------------------------------------------- */
 
+/* The core names the pad's ten positions A, B, X, Y, L, R, Select, Start, L2, R2, in that order
+ * (input.cpp, groovy_btns), a pad is mapped to them in that order, and position n arrives as bit
+ * 4+n of the mask. user_io.h still carries the Minimig-era names for the first of those bits -
+ * JOY_SELECT is 0x40 and JOY_START is 0x80 - but here those are X and Y. The launcher used them
+ * as Select and Start, so "refresh" was really the Y button, and the exit hotkey was X and Y held
+ * together: two face buttons a fighting game uses. These are the real ones. */
+#define GJ_A       0x0010
+#define GJ_B       0x0020
+#define GJ_X       0x0040
+#define GJ_Y       0x0080
+#define GJ_L       0x0100
+#define GJ_R       0x0200
+#define GJ_SELECT  0x0400
+#define GJ_START   0x0800
+#define GJ_L2      0x1000
+#define GJ_R2      0x2000
+
 /* Edge detection against the previous mask: user_io_digital_joystick() is called on
  * every change, and a held direction must not free-run the list. Auto-repeat is
  * deliberate and matches an arcade stick: a pause, then acceleration. (State: see the
@@ -915,6 +956,7 @@ int phantom_joystick(unsigned char joy, uint32_t mask)
 	if (!owns_screen) return 0;
 
 	uint32_t pressed = mask & ~prev;
+	const int adjusting = (ui.view == PH_VIEW_ADJUST);
 
 	int dx, dy;
 	int held = nav_from(mask, &dx, &dy);
@@ -923,8 +965,16 @@ int phantom_joystick(unsigned char joy, uint32_t mask)
 	int pdx, pdy;
 	if (nav_from(pressed, &pdx, &pdy))
 	{
-		if (pdy) ph_ui_move(&ui, pdy);
-		if (pdx) ph_ui_tab(&ui, pdx);
+		if (adjusting)
+		{
+			if (pdx) ph_ui_adjust_edge(&ui, pdx);
+			if (pdy) ph_ui_adjust_move(&ui, -pdy * 2);   /* up shrinks the box, down grows it */
+		}
+		else
+		{
+			if (pdy) ph_ui_move(&ui, pdy);
+			if (pdx) ph_ui_page(&ui, pdx);
+		}
 		rep_at[joy] = now_ms() + REP_DELAY;
 		rep_dir[joy] = pdy ? pdy : 0;
 		rep_n[joy] = 0;
@@ -934,7 +984,23 @@ int phantom_joystick(unsigned char joy, uint32_t mask)
 		rep_dir[joy] = 0;
 	}
 
-	if (pressed & JOY_BTN1)
+	if (adjusting)
+	{
+		if (pressed & GJ_A)      { ph_ui_adjust_end(&ui, 1); phantom_save_config(); }
+		else if (pressed & GJ_B) { ph_ui_adjust_end(&ui, 0); }
+		else if (pressed & GJ_Y) { ph_ui_adjust_reset(&ui); }
+		return 1;
+	}
+
+	if (ui.view == PH_VIEW_LIST)
+	{
+		if (pressed & GJ_L)  ph_ui_tab(&ui, -1);
+		if (pressed & GJ_R)  ph_ui_tab(&ui,  1);
+		if (pressed & GJ_L2) ph_ui_letter(&ui, -1);
+		if (pressed & GJ_R2) ph_ui_letter(&ui,  1);
+	}
+
+	if (pressed & GJ_A)
 	{
 		if (ui.view == PH_VIEW_BUSY)
 		{
@@ -950,15 +1016,20 @@ int phantom_joystick(unsigned char joy, uint32_t mask)
 		return 1;
 	}
 
-	/* JOY_START is JOY_BTN4 (user_io.h), so this is the one Start/BTN4 binding. */
-	if (pressed & JOY_START)
+	if (pressed & GJ_Y)
 	{
 		phantom_request_refresh();
 		if (live_host[0]) send_to(live_host, "GET_CATALOG");
 		return 1;
 	}
 
-	if (pressed & JOY_BTN2)
+	if ((pressed & GJ_SELECT) && ui.view == PH_VIEW_LIST)
+	{
+		ph_ui_adjust_begin(&ui);
+		return 1;
+	}
+
+	if (pressed & GJ_B)
 	{
 		if (ui.view == PH_VIEW_BUSY)
 		{
@@ -984,7 +1055,8 @@ static void repeat_tick(void)
 		if (!rep_dir[j]) continue;
 		if ((int32_t)(t - rep_at[j]) < 0) continue;
 
-		ph_ui_move(&ui, rep_dir[j]);
+		if (ui.view == PH_VIEW_ADJUST) ph_ui_adjust_move(&ui, -rep_dir[j] * 2);
+		else                           ph_ui_move(&ui, rep_dir[j]);
 		rep_n[j]++;
 		uint32_t gap = REP_FAST - (uint32_t)rep_n[j] * 6;
 		if ((int32_t)gap < REP_FLOOR) gap = REP_FLOOR;
@@ -1000,6 +1072,25 @@ int phantom_keyboard(uint16_t key, int press)
 	/* These are Linux input event codes, not HID usages: input.cpp reads /dev/input
 	 * and passes ev->code straight through (user_io_kbd(ev->code, ev->value)). The
 	 * translation to PS/2 happens after this point, in get_ps2_code(). */
+	if (ui.view == PH_VIEW_ADJUST)
+	{
+		switch (key)
+		{
+		case KEY_LEFT:  ph_ui_adjust_edge(&ui, -1); break;
+		case KEY_RIGHT: ph_ui_adjust_edge(&ui,  1); break;
+		case KEY_UP:    ph_ui_adjust_move(&ui,  2); break;
+		case KEY_DOWN:  ph_ui_adjust_move(&ui, -2); break;
+		case KEY_ENTER:
+		case KEY_KPENTER:
+		case KEY_SPACE: ph_ui_adjust_end(&ui, 1); phantom_save_config(); break;
+		case KEY_ESC:
+		case KEY_BACKSPACE: ph_ui_adjust_end(&ui, 0); break;
+		case KEY_R:     ph_ui_adjust_reset(&ui); break;
+		default: break;
+		}
+		return 1;
+	}
+
 	switch (key)
 	{
 	case KEY_UP:
@@ -1007,10 +1098,16 @@ int phantom_keyboard(uint16_t key, int press)
 	case KEY_DOWN:
 	case KEY_S:     ph_ui_move(&ui,  1); break;
 	case KEY_LEFT:
-	case KEY_A:     ph_ui_tab(&ui, -1); break;
+	case KEY_PAGEUP:   ph_ui_page(&ui, -1); break;
 	case KEY_RIGHT:
-	case KEY_D:
+	case KEY_PAGEDOWN: ph_ui_page(&ui,  1); break;
+	case KEY_A:     ph_ui_page(&ui, -1); break;
+	case KEY_D:     ph_ui_page(&ui,  1); break;
+	case KEY_Q:     ph_ui_tab(&ui, -1); break;
+	case KEY_E:
 	case KEY_TAB:   ph_ui_tab(&ui,  1); break;
+	case KEY_COMMA: ph_ui_letter(&ui, -1); break;
+	case KEY_DOT:   ph_ui_letter(&ui,  1); break;
 
 	case KEY_ENTER:
 	case KEY_KPENTER:
@@ -1019,6 +1116,10 @@ int phantom_keyboard(uint16_t key, int press)
 	case KEY_ESC:
 	case KEY_BACKSPACE:
 		if (ui.view == PH_VIEW_BUSY) { ui.view = PH_VIEW_LIST; awaiting_video = 0; ui.dirty = 1; }
+		break;
+
+	case KEY_F2:
+		if (ui.view == PH_VIEW_LIST) ph_ui_adjust_begin(&ui);
 		break;
 
 	case KEY_F5:
@@ -1038,7 +1139,7 @@ int phantom_exit_hotkey(unsigned char joy, uint32_t mask)
 
 	/* Start+Select held together. The hold is what keeps this from firing during a
 	 * game that legitimately uses both buttons. */
-	int combo = (mask & JOY_START) && (mask & JOY_SELECT);
+	int combo = (mask & GJ_START) && (mask & GJ_SELECT);
 	uint32_t t = now_ms();
 
 	if (!combo)
