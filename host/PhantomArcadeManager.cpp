@@ -1366,12 +1366,14 @@ void ScanRomDirectories() {
                         std::string cleanRomPath = entry.path().generic_string();
 
                         // Arcade sets get MAME's own description, which carries the region.
-                        // Everything else keeps the filename: Dolphin, PCSX2 and Flycast have
-                        // no equivalent list to ask, and inventing titles for them would be
-                        // guessing.
+                        // FBNeo names its sets the way MAME does ("ssf2t", "kof98"), so the same
+                        // list gives its zips real titles too; a set MAME has no entry for keeps
+                        // the zip's name. Everything else keeps the filename: Dolphin, PCSX2 and
+                        // Flycast have no equivalent list to ask, and inventing titles for them
+                        // would be guessing.
                         std::string title = stem;
                         XboxMeta xbox;
-                        if (target.system == "groovymame") {
+                        if (target.system == "groovymame" || target.system == "fbneo") {
                             auto it = mameTitles.find(stem);
                             if (it != mameTitles.end()) title = it->second;
                         } else if (target.system == "rpcs3") {
