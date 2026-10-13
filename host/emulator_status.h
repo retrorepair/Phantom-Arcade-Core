@@ -69,6 +69,32 @@ inline std::set<DWORD> PidsOwningUdpEndpoint() {
     return pids;
 }
 
+// The process ids of every running process whose executable name is in `lowerNames`, optionally
+// only those that own a UDP endpoint (see PidsOwningUdpEndpoint). This is what lets "stop the
+// game" reach an emulator the daemon did not start itself - a Fightcade match is started by the
+// Fightcade client, so the daemon has no pid for it.
+inline std::vector<DWORD> PidsOfProcessesNamed(const std::set<std::wstring>& lowerNames, bool needUdp = false) {
+    std::vector<DWORD> out;
+    if (lowerNames.empty()) return out;
+
+    std::set<DWORD> udpPids;
+    if (needUdp) udpPids = PidsOwningUdpEndpoint();
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return out;
+
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+        std::wstring n = pe.szExeFile;
+        for (auto& c : n) c = (wchar_t)towlower(c);
+        if (lowerNames.count(n) && (!needUdp || udpPids.count(pe.th32ProcessID)))
+            out.push_back(pe.th32ProcessID);
+    }
+    CloseHandle(snap);
+    return out;
+}
+
 // Is any process running whose executable name is in `lowerNames` (lower-case file names,
 // no path)? This is what catches a game the daemon did not launch itself - a Fightcade match
 // is started by the Fightcade client - which is exactly the case that must not be interrupted.

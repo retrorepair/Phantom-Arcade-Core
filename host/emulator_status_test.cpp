@@ -76,6 +76,16 @@ int main() {
     sendto(s, "x", 1, 0, (sockaddr*)&to, sizeof(to));
     check(PidsOwningUdpEndpoint().count(GetCurrentProcessId()) != 0, "after a send-only UDP socket it owns one");
     check(AnyProcessNamed({ self }, true), "and now counts as streaming");
+    {
+        auto pids = PidsOfProcessesNamed({ self }, true);
+        bool found = false;
+        for (DWORD p : pids) if (p == GetCurrentProcessId()) found = true;
+        check(found, "PidsOfProcessesNamed returns this process's pid while it has a UDP socket");
+        auto probePids = PidsOfProcessesNamed({ L"emu_status_probe.exe" }, true);
+        check(probePids.empty(), "and returns nothing for the probe, which has none (so an idle emulator is never killed)");
+        auto probeAny = PidsOfProcessesNamed({ L"emu_status_probe.exe" }, false);
+        check(probeAny.size() == 1 && probeAny[0] == pi.dwProcessId, "without the UDP requirement it finds exactly the probe's pid");
+    }
     closesocket(s);
     WSACleanup();
 

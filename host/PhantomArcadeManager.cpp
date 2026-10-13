@@ -1780,7 +1780,7 @@ static bool LaunchedEmulatorAlive() {
 // be interrupted. An emulator that is only open has no UDP socket, so it does not count: with
 // RPCS3 left at its game list, every other game's exit would otherwise look like a blip and
 // the launcher would stay away for the cabinet's whole hold.
-static bool AnyConfiguredEmulatorRunning() {
+static std::set<std::wstring> ConfiguredEmulatorNames() {
     std::set<std::wstring> names;
     for (int i = 0; i < g_emuCount; i++) {
         std::wstring exe = GetText(g_emus[i].exeEdit);
@@ -1789,7 +1789,11 @@ static bool AnyConfiguredEmulatorRunning() {
         for (auto& c : exe) c = (wchar_t)towlower(c);
         if (!exe.empty()) names.insert(exe);
     }
-    return AnyProcessNamed(names, /*needUdp=*/true);
+    return names;
+}
+
+static bool AnyConfiguredEmulatorRunning() {
+    return AnyProcessNamed(ConfiguredEmulatorNames(), /*needUdp=*/true);
 }
 
 static bool EmulatorRunning() {
@@ -1881,14 +1885,24 @@ DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
                 std::string reply = "ACK:LAUNCH:OK:" + gameId;
                 sendto(g_udpSocket, reply.c_str(), (int)reply.length(), 0, (sockaddr*)&clientAddr, clientLen);
             } else if (msg == "KILL") {
-                if (g_activePid > 0) {
-                    HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, g_activePid);
+                // "Stop the game": the one this daemon started, and also any configured emulator
+                // that is streaming but was started by something else - a Fightcade match is started
+                // by the Fightcade client, which leaves the daemon with no pid for it. Without this
+                // the core closed the stream, the emulator's auto-reconnect reopened it a moment
+                // later, and "return to launcher" only flickered. An emulator that is merely open
+                // owns no UDP socket, so it is left alone.
+                std::set<DWORD> toKill;
+                if (g_activePid > 0) toKill.insert(g_activePid);
+                for (DWORD pid : PidsOfProcessesNamed(ConfiguredEmulatorNames(), /*needUdp=*/true))
+                    toKill.insert(pid);
+                for (DWORD pid : toKill) {
+                    HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
                     if (hProc) {
                         TerminateProcess(hProc, 0);
                         CloseHandle(hProc);
                     }
-                    g_activePid = 0;
                 }
+                g_activePid = 0;
                 const char* reply = "ACK:KILL:OK";
                 sendto(g_udpSocket, reply, (int)strlen(reply), 0, (sockaddr*)&clientAddr, clientLen);
             } else if (msg == "PING") {
