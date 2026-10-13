@@ -130,6 +130,11 @@ NVIDIA Control Panel's "Prefer maximum performance" for `xemu.exe` is the user's
   an equal amount of the next audio unless `vram_synced & !vga_frameskip`; and 44.1 kHz audio drains at
   24.576 MHz/562 = 43,729/s, 0.84% slower than sent (it did not show up as a problem). If it returns,
   get the tester's `config\groovy.log` at Log level 1 and the exact command line first.
+  Latest from the tester (21:31): Super Street Fighter II Turbo, heard "most in voices" ("try Dhalsim and throw a
+  few fireballs"); the Phantom build is still affected but "not nearly as bad" as stock NLC. They start matches from the
+  Fightcade client on the PC while the Phantom core is loaded on the MiSTer (the daemon running); Phantom does not start
+  Fightcade. The user could not reproduce it in training, Test Game or standalone, so this waits on the tester's
+  log and a reproduction; voice-heavy moments (Dhalsim's fireball call) are the thing to try.
 - **GameCube/Wii disc titles**: the disc header at 0x20 has the real title, like Xbox. Offered,
   not answered.
 - **Unify the vendored Groovy client.** All copies now carry `rioFence`, but they still diverge:
