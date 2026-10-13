@@ -1772,9 +1772,11 @@ static bool LaunchedEmulatorAlive() {
     return ProcessAliveSince(g_activePid.load(), g_activeStart.load());
 }
 
-// Any emulator at all, by the executables named in the settings. A Fightcade match is started
-// by the Fightcade client, not by us, and that is precisely the case that must not be
-// interrupted.
+// Any emulator that is streaming, by the executables named in the settings. A Fightcade match
+// is started by the Fightcade client, not by us, and that is precisely the case that must not
+// be interrupted. An emulator that is only open has no UDP socket, so it does not count: with
+// RPCS3 left at its game list, every other game's exit would otherwise look like a blip and
+// the launcher would stay away for the cabinet's whole hold.
 static bool AnyConfiguredEmulatorRunning() {
     std::set<std::wstring> names;
     for (int i = 0; i < g_emuCount; i++) {
@@ -1784,7 +1786,7 @@ static bool AnyConfiguredEmulatorRunning() {
         for (auto& c : exe) c = (wchar_t)towlower(c);
         if (!exe.empty()) names.insert(exe);
     }
-    return AnyProcessNamed(names);
+    return AnyProcessNamed(names, /*needUdp=*/true);
 }
 
 static bool EmulatorRunning() {

@@ -51,6 +51,34 @@ int main() {
     check(!AnyProcessNamed({ L"definitely_not_running_anywhere.exe" }), "a name nothing is running under is not found");
     check(!AnyProcessNamed({}), "an empty name list matches nothing");
 
+    std::printf("an emulator that is open but not streaming (no UDP socket) versus one that is\n");
+    check(!AnyProcessNamed({ L"emu_status_probe.exe" }, true),
+          "the probe is running but owns no UDP socket: not counted when UDP is required");
+    check(AnyProcessNamed({ L"emu_status_probe.exe" }, false), "and is still counted when it is not");
+
+    // This process stands in for a streaming emulator: send-only UDP socket, never bound by hand,
+    // exactly how the Groovy client's video socket gets its ephemeral port.
+    wchar_t selfPath[MAX_PATH];
+    GetModuleFileNameW(NULL, selfPath, MAX_PATH);
+    std::wstring self = selfPath;
+    self = self.substr(self.find_last_of(L"\\/") + 1);
+    for (auto& c : self) c = (wchar_t)towlower(c);
+
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    check(!PidsOwningUdpEndpoint().count(GetCurrentProcessId()), "before it opens a socket this process owns no UDP endpoint");
+    check(!AnyProcessNamed({ self }, true), "so it does not count as streaming");
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in to = {};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(9);                 // discard; nothing needs to be listening
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sendto(s, "x", 1, 0, (sockaddr*)&to, sizeof(to));
+    check(PidsOwningUdpEndpoint().count(GetCurrentProcessId()) != 0, "after a send-only UDP socket it owns one");
+    check(AnyProcessNamed({ self }, true), "and now counts as streaming");
+    closesocket(s);
+    WSACleanup();
+
     TerminateProcess(pi.hProcess, 0);
     WaitForSingleObject(pi.hProcess, 5000);
     CloseHandle(pi.hThread);
