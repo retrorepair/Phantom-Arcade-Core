@@ -274,6 +274,8 @@ gcc -O2 -Wall -Wextra -Ihps_linux/src/support/groovy \
 gcc -O2 -Ihps_linux/src/support/groovy -o /tmp/p \
     tools/phantom_preview.c hps_linux/src/support/groovy/phantom_ui.c
 /tmp/p out.ppm --busy          # render any screen to a file and look at it
+/tmp/p out.ppm --big 298765 --sel 123456 --have 0,123460   # a huge library, some rows still on their way
+/tmp/p out.ppm --bg picture.ppm   # the menu over a dimmed picture (720x480 P6), the game list half see-through
 ```
 
 The cabinet's paged library is tested against the PC's real reply code, under the address and

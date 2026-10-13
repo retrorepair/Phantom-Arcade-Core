@@ -652,6 +652,71 @@ static void test_source_shrinks(void)
 	CHECK(ui.sel == 0 && ui.scroll == 0 && ph_ui_selected(&ui) == 0, "an emptied library leaves nothing selected");
 }
 
+/* ---- a picture behind the menu --------------------------------------------------------- */
+
+static void test_background(void)
+{
+	static uint8_t pic[PH_CANVAS_W * PH_CANVAS_H * 3], dim[PH_CANVAS_W * PH_CANVAS_H * 3];
+	memset(pic, 0xC0, sizeof(pic));
+	ph_ui_dim(dim, pic, sizeof(dim), 50);
+	CHECK(dim[0] == 0x60 && dim[sizeof(dim) - 1] == 0x60, "dimming to half takes 0xC0 to 0x60, got 0x%02X", dim[0]);
+	ph_ui_dim(dim, pic, sizeof(dim), 0);
+	CHECK(dim[100] == 0, "dimming to nothing is black");
+	ph_ui_dim(dim, pic, sizeof(dim), 100);
+	CHECK(dim[100] >= 0xBF, "dimming to a hundred percent keeps the picture (0x%02X)", dim[100]);
+	ph_ui_dim(dim, pic, sizeof(dim), 50);
+
+	/* no picture: exactly the flat background, as before */
+	reset();
+	ph_ui_render(&ui);
+	const uint8_t flat0 = fb[(300 * PH_CANVAS_W + 4) * 3 + 0];
+	CHECK(flat0 == 0x12, "without a picture the margin is the plain background (0x%02X)", flat0);
+
+	/* with one: the margin, which no panel covers, is the picture itself */
+	reset();
+	ui.bg = dim;
+	ui.bg_alpha = 128;
+	ph_ui_render(&ui);
+	const uint8_t *m = &fb[(300 * PH_CANVAS_W + 4) * 3];
+	CHECK(m[0] == 0x60 && m[1] == 0x60 && m[2] == 0x60, "outside every panel the picture shows as it is (%02X %02X %02X)", m[0], m[1], m[2]);
+
+	/* a panel is the picture seen through its colour: strictly between the two, and the same for a different picture
+	 * in the proportion the opacity says */
+	const int y = ui.safe.t + 48 + 28 + 4 + 24 + 4 + 100;   /* inside the empty list card, below its text */
+	const int x = ui.safe.l + 20;
+	const uint8_t *p = &fb[(y * PH_CANVAS_W + x) * 3];
+	/* C_CARD is 0x1B1D2A: B 0x2A G 0x1D R 0x1B, at half opacity over 0x60 */
+	CHECK(p[0] >= 0x44 && p[0] <= 0x46 && p[1] >= 0x3D && p[1] <= 0x3F && p[2] >= 0x3C && p[2] <= 0x3E,
+	      "a panel at half opacity is half picture, half its own colour (%02X %02X %02X)", p[0], p[1], p[2]);
+
+	/* the amber rule under the header is solid however translucent the panels are: it is a thing to find, not to see through */
+	const uint8_t *r = &fb[((ui.safe.t + 44 - 4 + 1) * PH_CANVAS_W + 4) * 3];
+	CHECK(r[0] == 0x20 && r[1] == 0xA0 && r[2] == 0xF0, "the header rule stays solid amber (%02X %02X %02X)", r[0], r[1], r[2]);
+
+	/* text is solid too: some pixel of the wordmark is exactly the amber it is drawn in */
+	int solid = 0;
+	for (int yy = ui.safe.t + 6; yy < ui.safe.t + 6 + 24 && !solid; yy++)
+		for (int xx = ui.safe.l; xx < ui.safe.l + 200; xx++)
+		{
+			const uint8_t *q = &fb[(yy * PH_CANVAS_W + xx) * 3];
+			if (q[0] == 0x20 && q[1] == 0xA0 && q[2] == 0xF0) { solid = 1; break; }
+		}
+	CHECK(solid, "the wordmark is drawn solid over the picture");
+
+	/* the screen-adjust page is a measuring tool: the picture is not behind it */
+	ph_ui_adjust_begin(&ui);
+	ph_ui_render(&ui);
+	const uint8_t *a = &fb[(300 * PH_CANVAS_W + 60) * 3];
+	CHECK(!(a[0] == 0x60 && a[1] == 0x60 && a[2] == 0x60), "the adjust page has no picture behind it");
+	ph_ui_adjust_end(&ui, 0);
+
+	/* picture removed: back to flat */
+	ui.bg = 0;
+	ui.dirty = 1;
+	ph_ui_render(&ui);
+	CHECK(fb[(300 * PH_CANVAS_W + 4) * 3] == 0x12, "taking the picture away restores the plain background");
+}
+
 int main(void)
 {
 	test_safe_defaults_and_rows();
@@ -667,6 +732,7 @@ int main(void)
 	test_source_missing_rows();
 	test_source_states();
 	test_source_shrinks();
+	test_background();
 
 	test_empty();
 	test_wrap();

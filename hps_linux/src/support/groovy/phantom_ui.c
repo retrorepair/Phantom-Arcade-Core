@@ -121,6 +121,10 @@ static inline void put_px(ph_ui *u, int x, int y, uint32_t rgb)
 	p[2] = (uint8_t)((rgb >> 16) & 0xff); /* R */
 }
 
+/* Draw something solid whatever the current opacity is: the things that must read as solid (the amber rules, the
+ * selected tab, the cursor, the button badges) so a picture behind the menu cannot wash them out. */
+#define OPAQUE(u, stmt) do { int _sa = (u)->alpha; (u)->alpha = 0; stmt; (u)->alpha = _sa; } while (0)
+
 static void rect(ph_ui *u, int x, int y, int w, int h, uint32_t rgb)
 {
 	if (x < 0) { w += x; x = 0; }
@@ -128,6 +132,25 @@ static void rect(ph_ui *u, int x, int y, int w, int h, uint32_t rgb)
 	if (x + w > u->w) w = u->w - x;
 	if (y + h > u->h) h = u->h - y;
 	if (w <= 0 || h <= 0) return;
+
+	if (u->alpha)
+	{
+		/* Translucent: blend with what is on the canvas already, which is the picture and whatever panels went
+		 * down before this one. out = under * (1 - a) + colour * a, per channel. */
+		const unsigned a = (unsigned)u->alpha, ia = 256u - a;
+		const unsigned cb = (rgb & 0xff) * a, cg = ((rgb >> 8) & 0xff) * a, cr = ((rgb >> 16) & 0xff) * a;
+		for (int j = 0; j < h; j++)
+		{
+			uint8_t *p = u->fb + ((size_t)(y + j) * u->w + x) * 3;
+			for (int i = 0; i < w; i++, p += 3)
+			{
+				p[0] = (uint8_t)((p[0] * ia + cb) >> 8);
+				p[1] = (uint8_t)((p[1] * ia + cg) >> 8);
+				p[2] = (uint8_t)((p[2] * ia + cr) >> 8);
+			}
+		}
+		return;
+	}
 
 	/* Build one row then replicate it; the inner loop is a byte copy rather than a
 	 * per-pixel channel split, which matters because this fills ~1MB a frame. */
@@ -142,6 +165,14 @@ static void rect(ph_ui *u, int x, int y, int w, int h, uint32_t rgb)
 	{
 		memcpy(u->fb + ((size_t)(y + j) * u->w + x) * 3, first, (size_t)w * 3);
 	}
+}
+
+void ph_ui_dim(uint8_t *dst, const uint8_t *src, size_t n, int keep_percent)
+{
+	if (keep_percent < 0) keep_percent = 0;
+	if (keep_percent > 100) keep_percent = 100;
+	const unsigned k = (unsigned)keep_percent * 256u / 100u;
+	for (size_t i = 0; i < n; i++) dst[i] = (uint8_t)((src[i] * k) >> 8);
 }
 
 static void vgrad(ph_ui *u, int x, int y, int w, int h, uint32_t c1, uint32_t c2)
@@ -192,6 +223,8 @@ static void glyph_s(ph_ui *u, int x, int y, char c, uint32_t rgb, int sx, int sy
 	if (idx < 0 || idx >= 95) idx = 31; /* '?' */
 	const uint8_t *g = font8x12[idx];
 
+	const int sa = u->alpha;   /* text is what has to be read: never translucent */
+	u->alpha = 0;
 	for (int r = FONT_TOP; r <= FONT_BOT; r++)
 	{
 		uint8_t row = g[r];
@@ -202,6 +235,7 @@ static void glyph_s(ph_ui *u, int x, int y, char c, uint32_t rgb, int sx, int sy
 			rect(u, x + b * sx, y + (r - FONT_TOP) * sy, sx, sy, rgb);
 		}
 	}
+	u->alpha = sa;
 }
 
 static void glyph(ph_ui *u, int x, int y, char c, uint32_t rgb, int s)
@@ -789,7 +823,7 @@ static void draw_header(ph_ui *u)
 	/* The band itself runs to the top of the screen so there is no stripe of bare
 	 * background above it; only the text is held inside the margin. */
 	vgrad(u, 0, 0, u->w, L.head_y + HEAD_H - 4, C_HEAD_A, C_HEAD_B);
-	rect(u, 0, L.head_y + HEAD_H - 4, u->w, 4, C_AMBER);
+	OPAQUE(u, rect(u, 0, L.head_y + HEAD_H - 4, u->w, 4, C_AMBER));
 
 	/* Wordmark stays square-scaled and chunky - it is the one thing meant to read from
 	 * across a room, and it is short enough that the width costs nothing. */
@@ -817,7 +851,7 @@ static void draw_header(ph_ui *u)
 	text_n_right(u, xr, L.head_y + 4, label, C_TEXT_DIM);
 	if (addr[0]) text_n_right(u, xr, L.head_y + 22, addr, C_TEXT_MUTE);
 
-	rect(u, xr - ntw(label) - 16, L.head_y + 8, 8, 8, led);
+	OPAQUE(u, rect(u, xr - ntw(label) - 16, L.head_y + 8, 8, 8, led));
 }
 
 /* Width of tab t's box, padding included. */
@@ -890,7 +924,7 @@ static void draw_tabs(ph_ui *u)
 		int tw = tab_width(tabs[t]);
 		if (t == u->tab)
 		{
-			box(u, x, L.tab_y + 1, tw, TAB_H - 4, C_AMBER, C_AMBER_HI, 0);
+			OPAQUE(u, box(u, x, L.tab_y + 1, tw, TAB_H - 4, C_AMBER, C_AMBER_HI, 0));
 			text_n(u, x + 8, L.tab_y + 6, tabs[t], 0x1A1200);
 		}
 		else
@@ -960,7 +994,7 @@ static void draw_empty(ph_ui *u, int x, int y, int w, int any_games)
 	(void)w;
 }
 
-static void draw_list(ph_ui *u)
+static void draw_list_body(ph_ui *u)
 {
 	LAYOUT;
 	int x = L.l;
@@ -999,9 +1033,14 @@ static void draw_list(ph_ui *u)
 
 		if (sel)
 		{
-			rect(u, x + 2, ry, w - 4, ROW_H, C_ROW_SEL);
-			rect(u, x + 2, ry, 6, ROW_H, C_AMBER);
-			arrow(u, x + 12, ry + 4, 12, PH_ARROW_RIGHT, C_AMBER);
+			{
+				const int sa = u->alpha;
+				if (sa) u->alpha = sa + 80 > 255 ? 255 : sa + 80;   /* the cursor row must stand out of a see-through list */
+				rect(u, x + 2, ry, w - 4, ROW_H, C_ROW_SEL);
+				u->alpha = sa;
+			}
+			OPAQUE(u, rect(u, x + 2, ry, 6, ROW_H, C_AMBER));
+			OPAQUE(u, arrow(u, x + 12, ry + 4, 12, PH_ARROW_RIGHT, C_AMBER));
 		}
 		else
 		{
@@ -1054,6 +1093,16 @@ static void draw_list(ph_ui *u)
 		rect(u, bx, track_y, 6, track_h, C_PANEL_DK);
 		rect(u, bx, bar_y, 6, bar_h, C_BORDER_HI);
 	}
+}
+
+/* The list is drawn at its own opacity: it is the biggest thing on screen and the one a picture is most worth having
+ * behind, so it is the most see-through. Everything in it that is text stays solid regardless. */
+static void draw_list(ph_ui *u)
+{
+	const int sa = u->alpha;
+	if (sa) u->alpha = u->bg_list_alpha > 0 ? u->bg_list_alpha : PH_BG_LIST_ALPHA;
+	draw_list_body(u);
+	u->alpha = sa;
 }
 
 static void draw_detail(ph_ui *u)
@@ -1138,12 +1187,15 @@ static int isqrt_i(int v)
 static void disc(ph_ui *u, int x, int y, int d, uint32_t rgb)
 {
 	int R = d / 2;
+	const int sa = u->alpha;   /* the button colours are the point of the legend: solid */
+	u->alpha = 0;
 	for (int j = 0; j < d; j += 2)
 	{
 		int dy = (j + 1) - R;
 		int half = isqrt_i(R * R - dy * dy);
 		rect(u, x + R - half, y + j, half * 2, 2, rgb);
 	}
+	u->alpha = sa;
 }
 
 /* A face button: coloured disc with its letter. 18px so the narrow glyph (8 wide, 16 inked
@@ -1374,7 +1426,7 @@ static void draw_busy(ph_ui *u)
 	int by = u->safe.t + (u->h - u->safe.t - u->safe.b - bh) / 2;
 	if (by < 0) by = 0;
 
-	box(u, bx, by, bw, bh, 0x161826, C_AMBER, C_AMBER_DK);
+	OPAQUE(u, box(u, bx, by, bw, bh, 0x161826, C_AMBER, C_AMBER_DK));
 
 	text(u, bx + 20, by + 16, "STARTING STREAM", C_AMBER, 2);
 	text_n_clip(u, bx + 20, by + 56, u->busy_title, C_TEXT, bw - 40);
@@ -1413,14 +1465,26 @@ void ph_ui_render(ph_ui *u)
 {
 	if (!u->fb) return;
 
+	u->alpha = 0;
 	if (u->view == PH_VIEW_ADJUST)
 	{
+		/* The screen-adjust page is a measuring tool and stays plain: a picture behind the margins would make
+		 * the edges harder to see, not easier. */
 		draw_adjust(u);
 		u->dirty = 0;
 		return;
 	}
 
-	rect(u, 0, 0, u->w, u->h, C_BG);
+	if (u->bg)
+	{
+		/* Start from the picture, then lay the panels over it translucently. */
+		memcpy(u->fb, u->bg, (size_t)u->w * u->h * 3);
+		u->alpha = u->bg_alpha > 0 ? u->bg_alpha : PH_BG_PANEL_ALPHA;
+	}
+	else
+	{
+		rect(u, 0, 0, u->w, u->h, C_BG);
+	}
 
 	draw_header(u);
 	draw_tabs(u);

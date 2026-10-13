@@ -2,8 +2,11 @@
 
 This session: the launcher stopped taking the screen from a game that is still being played
 (verified on the MiSTer), the daemon's "is a game running" check was fixed after the first real
-exit exposed it, FBNeo was built from the fork for the first time, and every build that exists
-was deployed and put on GitHub as a release. Everything below is committed and pushed.
+exit exposed it, FBNeo was built from the fork for the first time, every build that exists was
+deployed and put on GitHub as a release - and then the launcher was reworked for TVs that
+overscan (screen-adjust page, MiSTer-standard button colours and controls) and for libraries of
+hundreds of thousands of games (paged catalog, fast incremental scan). Everything below is
+committed and pushed; the last release is `v2026.10.13.7`.
 
 ## State of the repos and releases
 
@@ -12,7 +15,7 @@ All verified against `retrorepair`, not `origin` — in the emulator forks `orig
 
 | Repo | Branch | Head | Release `v2026.10.13` asset |
 |---|---|---|---|
-| Phantom-Arcade-Core | `main` | `1d92577` | **`v2026.10.13.2`**: `MiSTer_phantom`, `PhantomArcadeManager.exe`, `Phantom_Arcade.rbf`, `SHA256SUMS.txt` (`v2026.10.13` and `.1` are marked superseded) |
+| Phantom-Arcade-Core | `main` | `838bcc6` | **`v2026.10.13.7`**: `MiSTer_phantom`, `PhantomArcadeManager.exe`, `Phantom_Arcade.rbf`, `SHA256SUMS.txt` (every earlier `v2026.10.13*` is marked superseded) |
 | retrorepair/dolphin | `groovy-nlc` | `b9d320863` | `Dolphin-GroovyNLC-…-win64.zip` |
 | retrorepair/86Box | `groovy-nlc` | `5593d3c24` | `86Box-GroovyNLC-…-win64.zip` |
 | retrorepair/pcsx2 | `groovy-upstream-sync` | `a445baeb2` | `PCSX2-GroovyNLC-…-win64.zip` |
@@ -34,13 +37,25 @@ from the client's `emulator\fbneo` folder, not the repo. See `memory/fightcade-c
 
 ## Deploy state (verified by md5 against the repo)
 
-- **MiSTer card:** one `/media/fat/MiSTer_phantom` (current), one `_Utility/Phantom_Arcade.rbf`
-  (the unmodified upstream bitstream). `MiSTer_phantom.prev` removed. The core is loaded now; the
-  binary is exec'd on every core load, so **no reboot is needed** — an earlier note saying otherwise
-  was wrong. Standing rule from the user: leave the card clean and startable from the menu, not
+- **MiSTer card:** one `/media/fat/MiSTer_phantom` (md5 `9326e12818c0`, = `build_output\` = the
+  `.7` release asset), one `_Utility/Phantom_Arcade.rbf` (the unmodified upstream bitstream); the
+  only other thing is `MiSTer.ini.prephantom`, a backup of the user's own ini. `phantom.ini` holds
+  the user's saved screen margins (`SAFE_L/T/R/B`) - leave it alone.
+  **Deploying a new `MiSTer_phantom` over a running one reboots the board when the core is reloaded**
+  (seen five times). Not a launcher bug: `fpga_load_rbf` ends in `app_restart`, which `execl`s
+  `/proc/self/exe`; after `mv` replaces the file that link reads `... (deleted)`, the `execl` fails and
+  Main_MiSTer takes its own "Something went wrong. Rebooting..." path. It lands at the menu; load the
+  core from there (`load_core` from the menu state is fine, and a reload with nothing replaced is
+  harmless). An earlier note here saying "no reboot is needed" was wrong. `/tmp` on the board is
+  cleared by that reboot. Standing rule from the user: leave the card clean and startable from the menu, not
   dependent on my scripts, and release every build — `memory/deploy-standard-user-reachable.md`.
-- **PC:** `C:\PhantomArcade\PhantomArcadeManager.exe` = `build_output\` = release asset. The
-  daemon is running (started for testing).
+- **PC:** `C:\PhantomArcade\PhantomArcadeManager.exe` (md5 `38f28e1107f3`) = `build_output\` = the
+  `.7` release asset. The daemon is running with the user's own `phantom_config.json` (checked
+  byte-for-byte after a test that swapped it for a synthetic-library config and back). New files it
+  keeps beside the exe: `phantom_index.bin` (the last scan), `fbneo_sets.cache` (FBNeo's supported
+  list, keyed by its exe), `mame_rejects.txt` (sets MAME rejected, keyed by a fingerprint of its
+  folder). `games_catalog.json` / `games_catalog_cabinet.json` there are stale leftovers; nothing
+  reads them any more.
 - **FBNeo:** `C:\Emulators\fbneo\fcadefbneo.exe` is the new build, with Fightcade's DLLs copied in
   (from the official package, never run) and `config\fcadefbneo.ini` seeded with
   `bGroovyEnabled 1` / `szGroovyHost 192.168.1.204`. The verbst exe is `fcadefbneo.exe.verbst`.
@@ -116,6 +131,82 @@ build also logs `win32_dxgi_present: FBO incomplete (status=0x8CDD)` and falls b
 `SDL_GL_SwapWindow`. I made no power or GPU setting changes. If a reboot does not help, the
 NVIDIA Control Panel's "Prefer maximum performance" for `xemu.exe` is the user's to set.
 
+## What landed later in the session: overscan, controls, and large libraries
+
+### The launcher fits TVs that overscan, and uses MiSTer's own button colours
+The user's TV hid the top third of the title and everything below the info bar. The layout now has a
+per-edge safe area (`ph_safe`, defaults 36/24/36/24, saved as `SAFE_L/T/R/B` in `phantom.ini`) set on a
+screen-adjust page: **Select** opens it, Left/Right picks an edge, Up/Down moves it (Up shrinks the box),
+A saves, B cancels, Y resets. Backgrounds still fill the raster; text and the legend stay inside. The
+legend is A red, B yellow, X blue, Y green with L/R/L2/R2/Select as key caps, and **the pad bits were
+wrong before**: `user_io.h`'s `JOY_SELECT`/`JOY_START` (0x40/0x80) are the X/Y positions in this core, so
+"refresh" was Y and the exit hotkey was X+Y. The core's ten positions are A, B, X, Y, L, R, Select, Start,
+L2, R2 = bits 0x10...0x2000 (confirmed from the saved pad map). The exit hotkey is now Start+Select.
+Controls: Up/Down move; Left/Right page (held: accelerating); L/R platform; L2/R2 letter; A launch; B back
+out of a launch; Y rescan+refresh; Select screen adjust. **The user confirmed the screen looks right on
+their TV.**
+
+### Libraries of hundreds of thousands of games
+Why: the catalog was one JSON file (rewritten per scan, searched as text per launch) sent to the cabinet in
+one 60,000-byte datagram into `PH_MAX_GAMES 512`, and MAME was asked about every set on one command line
+(Windows stops at ~32,000 characters, so a few thousand sets failed and the filter silently switched off).
+
+PC (`host/`, header-only and portable except the walk): `game_index.h` (the index; wire format documented at
+its top; 300,000 games ~36 MB, built sorted in ~0.5 s, a page in ~13 us), `rom_enum.h` (FindFirstFileEx walk,
+~4x `std::filesystem`), `library_scan.h` (incremental scan; services for MAME/PARAM.SFO/XBE come in as
+callbacks so the test can count calls). Cabinet: `phantom_cat.c/h` (the paged client, pure C),
+`phantom_ui` row-source interface + placeholders, `phantom.cpp` driving it. Protocol, version/STALE
+semantics and launch-by-position are in the README's "Large libraries" section.
+
+Behaviours worth knowing: unchanged rescan asks MAME zero times; if anything under the MAME folder changes,
+rejected sets are asked again (a missing parent may have appeared); a rescan that finds nothing new does not
+bump the version (`IndexEquivalent`, which includes size and mtime); the cabinet notices a rescan on the PC
+within ~10 s or at the next page it lacks; a launch quoting an old version gets `ACK:LAUNCH:STALE` and the
+cabinet says "The library changed - choose again"; an older PC is served the old way after ~1.5 s and a PC
+replaced by a different build (older or newer) is noticed without pressing anything. Arcade set names that
+differ only by case are one game (`kinst.zip` and a `Kinst` folder).
+
+**Measured, on this PC and MiSTer:** 300,000 files walked in ~0.25 s; a scan with nothing changed ~0.4 s; a
+260,000-title synthetic library (empty files with plausible names in `%TEMP%\pa_ps2_260k`, made by
+`make_big_library.py`, not kept in the repo) listed within 1.2 s of the daemon starting, 81 MB resident,
+incremental rescan ~1 s; on the MiSTer five letter jumps landed on exactly the host's table
+(70991/260001), 30 fast mixed keys left all 13 rows loaded, `LAUNCH:@ver:*:index` resolved to the right id
+(the FBNeo command line was `fcadefbneo.exe <that game>`), a real FBNeo launch streamed, and stopping it
+returned to the launcher at the same cursor. The real library lists 1,258 games, the same set the old daemon
+listed (checked id by id, zero field differences).
+
+How the hardware was driven (reusable): `tools/mister_fbdump.py` reads the launcher's canvas out of DDR
+and `tools/mister_inject.py` presses keys through uinput (both copied to `/tmp` on the board over scp, they
+vanish on reboot; keys now include `pgup pgdn comma dot q e f2`, and `--settle 0.5` no longer parses as a
+key). A test copy of the daemon cannot serve the MiSTer from `%TEMP%`: only the exact path
+`C:\PhantomArcade\PhantomArcadeManager.exe` has an inbound firewall rule, so the scale test ran the real
+daemon with a swapped config and put everything back.
+
+Side findings: the daemon used to add a firewall rule (with an elevation prompt) on **every start** -
+there are 43 "Phantom Arcade Manager" rules, 6 of them for the live path; it now looks first, but the
+duplicates are the user's to clean up (needs admin). `--no-firewall` skips the check for a test copy.
+`tools/phantom_input_test.cpp` now has a fake host that speaks the paged catalog using the daemon's own
+`game_index.h`, so each side is tested against the other's real code.
+
+Not done / ideas: the cabinet shows no per-tab counts in the tab strip; there is no type-to-search; MAME's
+own first-time verification of a huge new set is as slow as `mame -verifyroms`; the user asked, for fun, about a
+dimmed game snapshot behind a translucent menu and downloading title/snap images per game. **The look has a
+working prototype in the renderer, not on the cabinet:** `ph_ui.bg` (a 720x480 BGR888 picture, dimmed with
+`ph_ui_dim`) makes the canvas start as the picture and every panel a translucent layer over it (`rect()` blends
+when `ph_ui.alpha` is set; text, the amber rules, the cursor and the button badges are drawn solid; the screen-adjust
+page ignores the picture). The header/tab strip/detail line/legend are 200/255 opaque (`PH_BG_PANEL_ALPHA`) and the
+game list is 128/255, i.e. **50% see-through, which is what the user asked for** (`PH_BG_LIST_ALPHA`; 60% was tried and
+read fine too). It is exercised by `phantom_ui_test.c` (10 checks) and `tools/phantom_preview.c --bg picture.ppm [--dim N]
+[--panels A] [--list A]`; the mockup the user saw was the user's own SSF2T ranking screen captured from the running emulator
+window (`grab_running.ps1`-style: GetClientRect + CopyFromScreen, resized to 720x480), nothing downloaded. **Not done:**
+`phantom.cpp` does not load a picture yet (the obvious next step is a file such as `/media/fat/config/phantom_bg.ppm`
+read at idle-enter, which would let the user judge it on their TV), nothing is deployed or released for it, and the picture
+for each game would come from the PC on request. Assessment given for the rest: transport is moderate (the PC resizes and
+sends one image after the cursor rests; Imlib2/libpng and miniz are already linked into the cabinet build), and the hard part
+is matching titles to pictures: ProgettoSNAPS packs for MAME/FBNeo (exact by set name), libretro-thumbnails for consoles
+(exact No-Intro/Redump names), ScreenScraper for odd names (the user's own account; I cannot create one), PS3
+`ICON0.PNG`/`PIC1.PNG` beside `PARAM.SFO` for free. Each source needs the user's say-so before anything is downloaded.
+
 ## Open
 
 - **xemu**: the reboot test above, then a release.
@@ -163,5 +254,6 @@ whole card without a timeout — the games folder takes minutes.
 user's own `phantom_config.json`, `mame_titles.txt` and `mister\`, so deploy by copying the exe over
 the top and leave everything else alone. The daemon serves `games_catalog.json` from the folder
 its own exe is in, so two copies means two catalogs; search the whole drive before declaring there
-is only one. Its startup scan takes ~85 s, and the cabinet only re-fetches when the host goes from
-offline to online, so restart the launcher to push a new catalog.
+is only one. The scan runs in the background after start (the window is usable and the cabinet is served the last scan
+at once); the cabinet picks up a new library within ~10 s, or press Y on it to have the PC look for changes
+now.

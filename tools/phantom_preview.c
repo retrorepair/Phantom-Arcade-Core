@@ -10,6 +10,10 @@
  *       ../hps_linux/src/support/groovy/phantom_ui.c
  *   ./phantom_preview out.ppm [catalog.tsv] [--busy] [--empty] [--offline] [--tab N]
  *       [--big N [--have LO,HI]] [--scanning] [--loading]
+ *       [--bg picture.ppm [--dim PERCENT] [--panels ALPHA] [--list ALPHA]]
+ *
+ * --bg puts a 720x480 P6 picture behind the whole launcher, dimmed to --dim percent (default 50), with the
+ * panels drawn over it at --panels opacity (0..255, default 200) and the game list at --list (default 128: half see-through).
  *
  * --big N shows a library of N titles the way a host-backed list does (no array behind it); --have LO,HI
  * says which rows have arrived, the rest drawing as placeholders.
@@ -94,6 +98,26 @@ static int big_letter(void *ctx, int tab, int k)
 	return k >= 27 ? big_n : k == 0 ? 0 : (int)(((long)(k - 1) * big_n + 25) / 26);
 }
 
+/* A 720x480 binary PPM, as BGR888 in dst. */
+static int load_ppm_bgr(const char *path, uint8_t *dst)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f) return 0;
+	int w = 0, h = 0, mx = 0;
+	if (fscanf(f, "P6 %d %d %d", &w, &h, &mx) != 3 || w != PH_CANVAS_W || h != PH_CANVAS_H || mx != 255)
+	{
+		fclose(f);
+		return 0;
+	}
+	fgetc(f);   /* the single whitespace after the header */
+	size_t n = (size_t)w * h * 3;
+	size_t got = fread(dst, 1, n, f);
+	fclose(f);
+	if (got != n) return 0;
+	for (size_t i = 0; i < n; i += 3) { uint8_t r = dst[i]; dst[i] = dst[i + 2]; dst[i + 2] = r; }
+	return 1;
+}
+
 static void load_tsv(const char *path)
 {
 	FILE *f = fopen(path, "r");
@@ -132,6 +156,8 @@ int main(int argc, char **argv)
 	const char *tsv = 0;
 	int busy = 0, empty = 0, offline = 0, tab = 0, sel = 0;
 	int adjust = 0, edge = 1, sl = -1, st = -1, sr = -1, sb = -1, scanning = 0, loading = 0;
+	const char *bgfile = 0;
+	int dim = 50, panels = PH_BG_PANEL_ALPHA, listalpha = PH_BG_LIST_ALPHA;
 	uint32_t t = 0;
 
 	for (int i = 2; i < argc; i++)
@@ -145,6 +171,10 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--adjust")) adjust = 1;
 		else if (!strcmp(argv[i], "--big") && i + 1 < argc) big_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--have") && i + 1 < argc) sscanf(argv[++i], "%d,%d", &have_lo, &have_hi);
+		else if (!strcmp(argv[i], "--bg") && i + 1 < argc) bgfile = argv[++i];
+		else if (!strcmp(argv[i], "--dim") && i + 1 < argc) dim = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--panels") && i + 1 < argc) panels = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--list") && i + 1 < argc) listalpha = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--scanning")) scanning = 1;
 		else if (!strcmp(argv[i], "--loading")) loading = 1;
 		else if (!strcmp(argv[i], "--edge") && i + 1 < argc) edge = atoi(argv[++i]);
@@ -169,6 +199,16 @@ int main(int argc, char **argv)
 	}
 	ui.lib_scanning = scanning;
 	ui.lib_loading = loading;
+
+	static uint8_t bg_raw[PH_CANVAS_W * PH_CANVAS_H * 3], bg_dim[PH_CANVAS_W * PH_CANVAS_H * 3];
+	if (bgfile)
+	{
+		if (!load_ppm_bgr(bgfile, bg_raw)) { fprintf(stderr, "cannot read a 720x480 P6 picture from %s\n", bgfile); return 1; }
+		ph_ui_dim(bg_dim, bg_raw, sizeof(bg_dim), dim);
+		ui.bg = bg_dim;
+		ui.bg_alpha = panels;
+		ui.bg_list_alpha = listalpha;
+	}
 
 	ui.tab = tab;
 	ui.sel = sel;

@@ -13,6 +13,7 @@
 #ifndef PHANTOM_UI_H
 #define PHANTOM_UI_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -123,6 +124,11 @@ typedef struct
 #define PH_TAB_RA     9
 #define PH_TAB_COUNT  10
 
+/* How solid the panels are over a background picture, out of 255. The list is half see-through; the header,
+ * tab strip, detail line and legend are more solid because they carry small text and the button colours. */
+#define PH_BG_PANEL_ALPHA 200
+#define PH_BG_LIST_ALPHA  128
+
 typedef struct
 {
 	/* canvas */
@@ -165,6 +171,15 @@ typedef struct
 	uint32_t marquee_t0;
 	int      marquee_px;
 
+	/* An optional picture behind the whole launcher. When set, the canvas starts as this picture instead of the
+	 * flat background, and every panel is drawn as a translucent layer over whatever is already there, so the
+	 * picture shows through; text and the button badges stay fully opaque. The picture is the caller's: 720x480
+	 * BGR888, already dimmed (ph_ui_dim). bg_alpha is how opaque the panels are, 0..255. */
+	const uint8_t *bg;
+	int            bg_alpha;       /* opacity of the header, tab strip, detail line and legend; 0 = PH_BG_PANEL_ALPHA */
+	int            bg_list_alpha;  /* opacity of the game list itself, the part most worth seeing through; 0 = PH_BG_LIST_ALPHA */
+	int            alpha;     /* internal: the opacity rect() is drawing at right now; 0 = solid */
+
 	int dirty; /* set by any state change; phantom.cpp clears it after presenting */
 } ph_ui;
 
@@ -191,6 +206,10 @@ int ph_ui_seek(ph_ui *u, int rows);
  * Titles that do not start with a letter are one group, ahead of "A". Does nothing until the letter table
  * is known. */
 int ph_ui_letter(ph_ui *u, int dir);
+
+/* Copy n bytes of BGR888 from src to dst, keeping keep_percent of the brightness. A snapshot behind a menu has
+ * to sit well below the text's brightness or it fights it; half is a good start. */
+void ph_ui_dim(uint8_t *dst, const uint8_t *src, size_t n, int keep_percent);
 
 /* Titles in tab `tab`, from whichever source the list has. */
 int ph_ui_tab_count(const ph_ui *u, int tab);
