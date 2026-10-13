@@ -87,7 +87,11 @@ private:
 #ifdef _WIN32
             int n = send(s, data, (int)std::min<size_t>(size, 1u << 20), 0);
 #else
+            #ifdef MSG_NOSIGNAL
+            ssize_t n = send(s, data, size, MSG_NOSIGNAL);
+            #else
             ssize_t n = send(s, data, size, 0);
+            #endif
 #endif
             if (n <= 0) return false;
             data += n;
