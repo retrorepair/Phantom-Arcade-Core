@@ -1,4 +1,5 @@
 #include "groovymister.h"
+#include "browser_monitor.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -1115,6 +1116,16 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 	}
 
 	if (m_dumpFrames) DumpFrame(field);   // corpus capture: raw pre-compression frame
+	// Optional read-only tap of the exact RGB frame before compression. Disabled by
+	// default; the monitor copies pixels into its own buffer and never blocks the
+	// CRT sender on a browser client.
+	if (m_nlcWidth > 0 && m_RGBSize > 0)
+	{
+		const int monitorBpp = (m_rgbMode == 1) ? 4 : (m_rgbMode == 2) ? 2 : 3;
+		const int monitorHeight = (int)(m_RGBSize / ((size_t)m_nlcWidth * monitorBpp));
+		if (monitorHeight > 0)
+			gm_browser_monitor_publish(m_pBufferBlit[field], m_nlcWidth, monitorHeight, m_rgbMode);
+	}
 	uint32_t cSize = 0;
 	uint32_t cSizeDelta = 0;
 	uint32_t bytesToSend = 0;
