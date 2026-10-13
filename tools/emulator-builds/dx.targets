@@ -1,0 +1,9 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- FBNeo's project looks for the DirectX SDK (June 2010) under Program Files (x86), which needs an admin
+       installer. This points at the same Include/Lib extracted to a user folder instead, ahead of the Windows SDK
+       so its Windows-7 xaudio2.h wins over the Windows 8+ one. -->
+  <PropertyGroup>
+    <IncludePath>C:\Users\joelw\dxsdk\DXSDK\Include;$(IncludePath)</IncludePath>
+    <LibraryPath>C:\Users\joelw\dxsdk\DXSDK\Lib\x86;$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
+</Project>

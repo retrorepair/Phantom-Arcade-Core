@@ -1,154 +1,144 @@
-# Handoff — 2026-10-07
+# Handoff — 2026-10-13
 
-Dolphin and 86Box joined the GroovyNLC set this session, and the launcher grew the tabs,
-the launch path and the metadata to carry them. Everything below is committed and pushed.
+This session: the launcher stopped taking the screen from a game that is still being played
+(verified on the MiSTer), the daemon's "is a game running" check was fixed after the first real
+exit exposed it, FBNeo was built from the fork for the first time, and every build that exists
+was deployed and put on GitHub as a release. Everything below is committed and pushed.
 
-## State of the repos
+## State of the repos and releases
 
 All verified against `retrorepair`, not `origin` — in the emulator forks `origin` is
-**verbst's** repo and cannot be pushed to (403). That is why pcsx2 and xemu looked pushed
-for days and were not.
+**verbst's** repo and cannot be pushed to (403).
 
-| Repo | Branch | Head |
-|---|---|---|
-| Phantom-Arcade-Core | `main` | `447816f2d` |
-| retrorepair/dolphin | `groovy-nlc` | `b9d320863` |
-| retrorepair/86Box | `groovy-nlc` | `5593d3c24` |
-| retrorepair/pcsx2 | `groovy-upstream-sync` | `a445baeb2` |
-| retrorepair/xemu | `groovy-upstream-sync` | `c5d840daa` |
-| retrorepair/flycast-dojo | `groovy-rio-buffer-lifetime` | `c07861d6b` |
-| retrorepair/rpcs3 | `groovy-upstream-sync` | `b98401e09` |
+| Repo | Branch | Head | Release `v2026.10.13` asset |
+|---|---|---|---|
+| Phantom-Arcade-Core | `main` | `1d2950b` | **`v2026.10.13.1`**: `MiSTer_phantom`, `PhantomArcadeManager.exe`, `Phantom_Arcade.rbf`, `SHA256SUMS.txt` (`v2026.10.13` is marked superseded) |
+| retrorepair/dolphin | `groovy-nlc` | `b9d320863` | `Dolphin-GroovyNLC-…-win64.zip` |
+| retrorepair/86Box | `groovy-nlc` | `5593d3c24` | `86Box-GroovyNLC-…-win64.zip` |
+| retrorepair/pcsx2 | `groovy-upstream-sync` | `a445baeb2` | `PCSX2-GroovyNLC-…-win64.zip` |
+| retrorepair/flycast-dojo | `groovy-rio-buffer-lifetime` | `c07861d6b` | `Flycast-Dojo-GroovyNLC-…-win64.zip` |
+| retrorepair/rpcs3 | `groovy-upstream-sync` | `b98401e09` | `RPCS3-GroovyNLC-…-win64.zip` |
+| retrorepair/fightcade-fbneo | `groovy-rio-buffer-lifetime` | `7df342987` | `FBNeo-Fightcade-GroovyNLC-…-win32.zip` (`fcadefbneo.exe` only) |
+| retrorepair/xemu | `groovy-upstream-sync` | `c5d840daa` | **none** — built, not validated, see below |
 
-Working trees are clean apart from two things that should stay uncommitted: an untracked
-`dependency_cache/` in rpcs3, and a moved `core/deps/breakpad` submodule pointer in
-flycast-dojo.
+Each zip is built from that fork's own build output, not from the deployed folder (which has
+the user's configs); the five that existed already were checked as newer than every tracked
+source file, PCSX2's even embeds its commit hash. Dolphin was rebuilt from clean HEAD (the
+version string was `-dirty`). RetroArch was dropped by the user and has no release; its local
+commit (`4848fa7fd`, the RIO fix) is not pushed anywhere.
 
-## Open — do this first
+**Fightcade is two programs.** `fightcade-fbneo` is only the emulator (`fcadefbneo.exe`); the
+Fightcade client (lobby/matchmaking) is separate, not in the repo, and launches the emulator with a
+`quark:` argument. Nothing in the client needs changing. `ggponet.dll` and the other DLLs come
+from the client's `emulator\fbneo` folder, not the repo. See `memory/fightcade-client-is-separate.md`.
 
-**The MiSTer needs a reboot.** `/media/fat/MiSTer_phantom` is current (md5
-`16eb5f1c2433e09e276570056a2e4c1d`), but the running process is PID 3553 from 2026-10-06
-20:02 and has not picked it up. `MiSTer.ini` has `main=MiSTer_phantom`, so that binary *is*
-the main MiSTer process, and `/etc/inittab` starts it with `::sysinit:`, not `respawn` —
-a core reload does not restart it. Reboot, or load another core and come back. Until then
-the GC/WII and PC tabs are on the device but not on screen.
+## Deploy state (verified by md5 against the repo)
+
+- **MiSTer card:** one `/media/fat/MiSTer_phantom` (current), one `_Utility/Phantom_Arcade.rbf`
+  (the unmodified upstream bitstream). `MiSTer_phantom.prev` removed. The core is loaded now; the
+  binary is exec'd on every core load, so **no reboot is needed** — an earlier note saying otherwise
+  was wrong. Standing rule from the user: leave the card clean and startable from the menu, not
+  dependent on my scripts, and release every build — `memory/deploy-standard-user-reachable.md`.
+- **PC:** `C:\PhantomArcade\PhantomArcadeManager.exe` = `build_output\` = release asset. The
+  daemon is running (started for testing).
+- **FBNeo:** `C:\Emulators\fbneo\fcadefbneo.exe` is the new build, with Fightcade's DLLs copied in
+  (from the official package, never run) and `config\fcadefbneo.ini` seeded with
+  `bGroovyEnabled 1` / `szGroovyHost 192.168.1.204`. The verbst exe is `fcadefbneo.exe.verbst`.
+  Groovy output has no command-line switch; it is ini-only.
+- **xemu:** the deployed exe is verbst's, put back after a failed test of the new build.
 
 ## What landed
 
-### Dolphin — new GroovyNLC integration
-`Source/Core/VideoCommon/GroovyMiSTer/`, the PCSX2 engine ported to Dolphin's GPU and
-config: video thread scales/reads back/packs, sender thread owns the socket. Verified on
-hardware with Super Mario Galaxy at the console's native 640x456 — not the internal
-resolution — and confirmed by eye on the CRT.
+### The core holds the screen for a game that is still being played
+The user will not accept even a flash of the launcher mid-match. When a stream ends (CMD_CLOSE or
+the keepalive timing out at 5 s) `phantom_session_ended()` waits >= 2.5 s, asks the daemon
+`STATUS`, and holds the picture up to 20 s only if it answers RUNNING. **Tested on the MiSTer**
+with FBNeo streaming Super Street Fighter II Turbo: freezing the process for 10-19 s logs
+`[TIMEOUT][no client activity 5000ms][holding the screen]`, no `[MODE][720x480…]` launcher lines
+appear, and the stream carries on when it resumes; a clean exit returns to the launcher in
+seconds. **Not looked at by eye:** what the CRT showed during the hold. The core log is
+block-buffered, so lines can appear well after the event.
 
-- Audio two ways: a tap in `Mixer::Mix` mirrors any backend's output, and a new **MiSTer**
-  sound backend drains the mixer itself for no host device at all.
-- Settings → **MiSTer** pane, all `Config*` widgets bound straight to `Config::Info`, so
-  the pane holds no state and needs no save step.
-- `arcade_15` by default. On the tri-sync default a 480p title arrived as 31 kHz
-  progressive, which is right for a PC monitor and useless for the CRT.
+### The daemon's STATUS was wrong on the user's machine, and is fixed
+It counted any configured emulator whose process was running. With RPCS3 left open at its game
+list, a clean exit from another game held the dead game's last frame for the whole 20 s. It
+now counts an emulator only if it owns a UDP socket (`GetExtendedUdpTable`): a process streaming to
+a MiSTer always does (FBNeo: two), an idle one never (RPCS3: none). The bias is deliberate — a
+wrong "running" costs a held frame, a wrong "idle" costs the launcher flashing mid-match.
+`host/emulator_status_test.cpp` has 15 checks against real processes and a real socket.
+Residual: an emulator that is open *and* holds a UDP socket while idle still counts, so the launcher
+can take up to 20 s to return then. See `memory/hold-the-screen-daemon-status.md`.
 
-Needs VS 2026 Build Tools (`...\Microsoft Visual Studio\18\BuildTools\...\vcvars64.bat`),
-installed this session — see `memory/dolphin-needs-vs2026.md`.
+### FBNeo builds, and the build is Visual Studio
+`7df342987` untracks 2094 `obj/` files the previous commit swept in with `git add -A`. The MinGW
+makefile is not a way to build this tree (no Lua, Quark/GGPO, overlay, detectors, TMS34010/i4x00,
+ws2_32 — hundreds of undefined references). What works: VS 2022 v143 x86, perl + nasm, the
+DirectX SDK June 2010 headers/libs (extracted with 7-Zip from the installer into
+`C:\Users\joelw\dxsdk`, injected with an MSBuild `ForceImportAfterCppTargets` file), a clone of
+`fightcadeorg/fightcade-detectors` next to the repo (`C:\Users\joelw\Documents\groovy-forks\fightcade-detectors`,
+rev `b9e0e40`, 314 detectors compiled in — without them round counters and ranked reporting silently
+stop), `run_scripts.bat`, then `msbuild fbneo_vs2015.vcxproj /p:Configuration=Release /p:Platform=Win32`.
+**Compare section sizes with a known-good exe**: a first build with a stale generated driver list
+linked fine and was 450 KB of code short. Full recipe and the traps (`NoDefaultCurrentDirectoryInExePath`,
+WSL's `bash.exe` shadowing MSYS bash) in `memory/windows-build-gotchas.md`.
+Tested: starts and runs ssf2t with Fightcade's DLLs, and **streams to the MiSTer** (session open,
+~60 fps, `sendFailed=0`, the RIO fence fired once with no timeout). Not tested: a netplay match.
 
-### 86Box — two real bugs behind the "480p" complaint
-1. **Interlace was a lie.** A whole progressive frame was being announced as interlace
-   mode 1, *fields from client*, so the core read half the lines it was sent. It sends
-   mode 2 now and the core splits the frame. The blit byte budget follows the wire value
-   for the same reason.
-2. **The blit hook throttled emulation.** `video_blit_memtoscreen_monitor` calls
-   `video_wait_for_blit_monitor` on the *emulation* thread, so encode + raster-chase was
-   charged to the emulated machine — 70 Hz VGA fell to 14 Hz, and because the refresh was
-   measured by counting those calls it fed back into the modeline and spiralled. There is
-   a sender thread now, and the refresh comes from `mon_actualrenderedframes`, which is
-   latched per *emulated* second.
+### xemu: built, not released
+`c5d840daa8`, version `0.8.136-0-NLC-v1.0-26-gc5d840daa8`, Groovy compiled in; packaged in
+`groovy-forks\xemu\dist\` (stripped exe, 26 DLLs including libslirp from the build tree and curl's
+transitive chain — `get_deps.py` only copies direct imports, which is what produced the
+missing-DLL dialogs in the first test). It has not run successfully here: **it crashes at start,
+and so did the deployed verbst build in one run, at the same address inside `nvoglv64.dll`
+(`+0x10C3E2D`, `0xC0000409`)**. At the same time the stock build ran at 7-37 fresh frames/s with
+the NVIDIA GPU sitting in P8 at 300-400 MHz of 2100. That is the NVIDIA driver in a bad state, the
+same shape as the earlier slideshow that a laptop reboot cleared; network (wired GbE, 0 ms), CPU
+and leftover processes were all fine. **Next: reboot, then A/B old vs new on Halo 2** (scripts
+`run-xemu-gpu.ps1` and `minidump_exc.py` are in `tools/emulator-builds/`; the logic is in
+`memory/xemu-nvidia-driver-bad-state.md`) and release if the new build is no worse. The new
+build also logs `win32_dxgi_present: FBO incomplete (status=0x8CDD)` and falls back to
+`SDL_GL_SwapWindow`. I made no power or GPU setting changes. If a reboot does not help, the
+NVIDIA Control Panel's "Prefer maximum performance" for `xemu.exe` is the user's to set.
 
-Audio is wired (it existed but nothing called it), monitor preset and interlacing are
-settings, and there is a **MiSTer** page in Tools → Settings.
+## Open
 
-### Launcher
-- GC/WII and PC tabs; the strip **scrolls** now, anchored on the selection, so the tab
-  count can keep growing. Verified by rendering off-target at a narrow width.
-- **Launching from the PC window never worked, for any system** — both the button and the
-  double-click rebuilt an id by stripping `[system] ` off the display text, which has no
-  `<key>_` prefix. Real ids are kept beside the rows now.
-- 86Box VMs are named after their folder (every one stemmed to `86box` and collided),
-  container extensions are stripped (`...Sunshine.nkit` → `...Sunshine`), and labels no
-  longer wrap into the row beneath.
-- Xbox discs read their own `default.xbe` certificate: `eps-h2u.iso` → **Halo 2**,
-  Microsoft, 2004.
-
-## Next
-
-- **Deploy the launcher takeover fix** (`build_output/MiSTer_phantom`, built but NOT on the MiSTer -
-  copying it needs a reboot, so it is the user's call). Users reported other games loading
-  mid-game on Phantom Arcade but not on plain GroovyNLC. Cause: when a session ends - a keepalive
-  stall, a client reconnect, or the Start+Select hold - `setClose()` -> `phantom_idle_enter()` hands
-  the pad to the launcher, and the next BTN1/Enter launches the highlighted row, which the daemon
-  answers by killing the running emulator. Three defects: `prev_mask` was only updated while the
-  launcher was on screen (a button held in-game counted as freshly pressed); nothing stopped a
-  button being mashed straight through the handover (a press launches, the next backs out of the
-  loading screen, so ten presses made five launches); and the D-pad moves the tab, so in-game
-  D-pad mashing could land on another system before the launching press. Steady state is NOT
-  affected: while a game streams the launcher consumes 0 pad events and the emulator gets all of
-  them. Fixed with always-tracked edge state plus a guard (`T_TAKEOVER_GUARD`, 1.5 s) that holds
-  launches off after taking the screen from a live stream and is pushed out by every press, so only
-  a pause releases it. Cost: a launch press within 1.5 s of the launcher appearing is ignored (the
-  hotkey exit, then an immediate A). `bash tools/run_phantom_input_test.sh` (under WSL) builds the
-  real `phantom.cpp` off-target with a fake daemon: 7 of 16 checks failed before, 0 after.
-- **FBNeo/Fightcade audio stutter (not our code; code-read only, not reproduced - no ROMs here).**
-  `GroovyAudioFrame` is called only inside `if (bDraw)` in `run.cpp`. Offline, Groovy paces one
-  drawn frame per raster so audio is steady. In netplay GGPO is the clock (`GroovyPacingActive()`
-  excludes `kNetGame`), frames are skipped for rift balance and their audio is dropped, and the
-  MiSTer gets irregular audio bursts against a constant-rate DAC. Fixing it means a jitter buffer
-  on the client side like xemu's/PCSX2's `AudioTap`, not a one-liner. verbst's fork, same on plain NLC.
-- **OutRun 2 will not boot in xemu, and it is the image, not the stack.** `OutRun 2 (USA).iso` is a
-  7.29 GB full redump with the XDVDFS filesystem at offset `0x18300000` behind a 0.38 GB video
-  partition. xemu only boots an xiso (filesystem at 0), so it sits at "insert Xbox disc". Halo 2
-  is 4.40 GB at offset 0 and boots fine. The fix is to copy bytes `0x18300000`..end into a new
-  file (6.91 GB); the original is not touched. Not done yet - it needs 6.91 GB and a decision
-  about where the result goes, because the scan dedupes by filename stem and a second
-  `OutRun 2 (USA)` in the same tree would collide. The scan could also flag a non-zero base as
-  unplayable instead of listing it; `XboxMetaFor` already finds the base.
-- **xemu was a slideshow, then was not.** Measured at 1.8 fresh frames/s with `present` at 64 ms
-  mean while NVIDIA rendered into a window the AMD iGPU owns; Groovy's own `send` (5 ms) and
-  `pace` (0.2 ms) were fine throughout. A reboot of the laptop cleared it, so the cause was host
-  state, not the forks. If it returns, see `memory/xemu-gl-vulkan-same-gpu.md`: never put xemu's
-  Vulkan device on a different GPU from its OpenGL capture - that gives fast black frames.
-- **GameCube/Wii disc titles.** Same treatment as Xbox — the disc header at 0x20 carries
-  the real title, so Galaxy and Sunshine could drop their `(Europe, Australia) (En,Fr,...)`
-  filename baggage. The user has been offered this and not yet answered.
-- **Unify the vendored Groovy client.** The copies have diverged: PCSX2's has
-  `gmw_set_keepalive` and a `rioServiceQueues()` patch that drains the RIO send completion
-  queue outside `WaitSync` — without it a host that paces itself fills the send CQ and
-  `RIOSend` starts failing silently, which is the shape of the halts. 86Box's copy lacks
-  both; 86Box's alone carries an `<algorithm>`/`<limits>` include fix it needs under
-  MinGW. See `memory/groovy-emulator-forks.md`.
-- **Jumbo frames** still untested: core side is ready, needs the OSD option on, client
-  MTU 3800 and a jumbo-capable path.
-- **Sunshine needs one click** — it is an NKit image and Dolphin's warning dialog blocks
-  batch mode. Tick "Don't show this again", or set `SkipNKitWarning = True` under
-  `[Interface]`.
-- 86Box has no keepalive. Harmless today: it does not advertise `GM_CAP_KEEPALIVE`, so the
-  core applies no idle timeout. It would need the newer client first.
+- **xemu**: the reboot test above, then a release.
+- **On-CRT check** of the hold: nobody has looked at the CRT while a stalled client was held.
+- **FBNeo netplay audio stutter (not our code; code-read only).** `GroovyAudioFrame` is called only
+  inside `if (bDraw)` in `run.cpp`; in netplay GGPO is the clock (`GroovyPacingActive()` excludes
+  `kNetGame`), skipped frames drop their audio, and the MiSTer gets bursts. Fix is a client-side
+  jitter buffer like xemu's/PCSX2's `AudioTap`. Same on verbst's fork.
+- **OutRun 2 will not boot in xemu — the image, not the stack.** It is a 7.29 GB full redump with
+  the XDVDFS filesystem at offset `0x18300000`; xemu needs an xiso (filesystem at 0). The fix is a
+  6.91 GB copy from that offset, original untouched. Not done: it needs the space and a decision
+  about where the result goes (the scan dedupes by filename stem). The user has not answered.
+- **GameCube/Wii disc titles**: the disc header at 0x20 has the real title, like Xbox. Offered,
+  not answered.
+- **Unify the vendored Groovy client.** All copies now carry `rioFence`, but they still diverge:
+  PCSX2's has `gmw_set_keepalive` and `rioServiceQueues()`; 86Box's lacks both and alone carries an
+  `<algorithm>`/`<limits>` fix it needs under MinGW. 86Box has no keepalive (harmless: it does not
+  advertise `GM_CAP_KEEPALIVE`).
+- **Jumbo frames** untested: core side ready; needs the OSD option, client MTU 3800 and a
+  jumbo-capable path.
+- **Sunshine needs one click** — an NKit image and Dolphin's warning dialog blocks batch mode.
+  Tick "Don't show this again" or set `SkipNKitWarning = True` under `[Interface]`.
+- The FBNeo fork's `makefile.mingw` fixes in `7070c01` are real defects but only get it as far as
+  the link; the VS build is the supported one.
 
 ## Where things live
 
 Forks under `C:\Users\joelw\Documents\groovy-forks\` except rpcs3
 (`C:\Users\joelw\Documents\rpcs3-groovy`), deployed to `C:\Emulators\<name>\`. MiSTer is
 `192.168.1.204`; its SSH host key is not in PuTTY's cache, so pass
-`-hostkey SHA256:FqNJOsj3FLUoMQxgn+cqGoXvVfENmVK4QFoSCMKl2lU` to plink/pscp or it hangs
-waiting for a confirmation it cannot read from stdin.
+`-hostkey SHA256:FqNJOsj3FLUoMQxgn+cqGoXvVfENmVK4QFoSCMKl2lU` to plink/pscp or it hangs. Load the
+core for a test with `echo "load_core /media/fat/_Utility/Phantom_Arcade.rbf" > /dev/MiSTer_cmd`;
+the core log is `/tmp/groovynlc.log` (absent until the core has been loaded). Do not `find` the
+whole card without a timeout — the games folder takes minutes.
 
-**The launcher the user runs is `C:\PhantomArcade\PhantomArcadeManager.exe`** - not
-`build_output\`, which is only the repo's shipped copy of the same build. That folder holds
-the user's own `phantom_config.json`, `mame_titles.txt` and `mister\`, so deploy by copying
-the exe over the top and leave everything else in it alone. This file used to say
-`build_output` was the one in use; that was wrong, and it left the real install on the Oct 3
-build - no Dolphin or 86Box rows, Xbox games named from their filenames - for a day.
-
-The daemon serves `games_catalog.json` from the **folder its own exe is in**, so two copies
-means two catalogs and whichever one is running wins. Twelve copies existed this session
-(eleven under `Documents`, deleted, plus this one at the top of C:). Search the whole drive
-before declaring there is only one. Its startup scan takes ~85 s before the list fills, and
-the cabinet only re-fetches when the host goes from offline to online, so restart the
-launcher to push a new catalog.
+**The launcher the user runs is `C:\PhantomArcade\PhantomArcadeManager.exe`** — not
+`build_output\`, which is only the repo's shipped copy of the same build. That folder holds the
+user's own `phantom_config.json`, `mame_titles.txt` and `mister\`, so deploy by copying the exe over
+the top and leave everything else alone. The daemon serves `games_catalog.json` from the folder
+its own exe is in, so two copies means two catalogs; search the whole drive before declaring there
+is only one. Its startup scan takes ~85 s, and the cabinet only re-fetches when the host goes from
+offline to online, so restart the launcher to push a new catalog.
