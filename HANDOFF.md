@@ -79,6 +79,28 @@ settings, and there is a **MiSTer** page in Tools → Settings.
 
 ## Next
 
+- **Deploy the launcher takeover fix** (`build_output/MiSTer_phantom`, built but NOT on the MiSTer -
+  copying it needs a reboot, so it is the user's call). Users reported other games loading
+  mid-game on Phantom Arcade but not on plain GroovyNLC. Cause: when a session ends - a keepalive
+  stall, a client reconnect, or the Start+Select hold - `setClose()` -> `phantom_idle_enter()` hands
+  the pad to the launcher, and the next BTN1/Enter launches the highlighted row, which the daemon
+  answers by killing the running emulator. Three defects: `prev_mask` was only updated while the
+  launcher was on screen (a button held in-game counted as freshly pressed); nothing stopped a
+  button being mashed straight through the handover (a press launches, the next backs out of the
+  loading screen, so ten presses made five launches); and the D-pad moves the tab, so in-game
+  D-pad mashing could land on another system before the launching press. Steady state is NOT
+  affected: while a game streams the launcher consumes 0 pad events and the emulator gets all of
+  them. Fixed with always-tracked edge state plus a guard (`T_TAKEOVER_GUARD`, 1.5 s) that holds
+  launches off after taking the screen from a live stream and is pushed out by every press, so only
+  a pause releases it. Cost: a launch press within 1.5 s of the launcher appearing is ignored (the
+  hotkey exit, then an immediate A). `bash tools/run_phantom_input_test.sh` (under WSL) builds the
+  real `phantom.cpp` off-target with a fake daemon: 7 of 16 checks failed before, 0 after.
+- **FBNeo/Fightcade audio stutter (not our code; code-read only, not reproduced - no ROMs here).**
+  `GroovyAudioFrame` is called only inside `if (bDraw)` in `run.cpp`. Offline, Groovy paces one
+  drawn frame per raster so audio is steady. In netplay GGPO is the clock (`GroovyPacingActive()`
+  excludes `kNetGame`), frames are skipped for rift balance and their audio is dropped, and the
+  MiSTer gets irregular audio bursts against a constant-rate DAC. Fixing it means a jitter buffer
+  on the client side like xemu's/PCSX2's `AudioTap`, not a one-liner. verbst's fork, same on plain NLC.
 - **OutRun 2 will not boot in xemu, and it is the image, not the stack.** `OutRun 2 (USA).iso` is a
   7.29 GB full redump with the XDVDFS filesystem at offset `0x18300000` behind a 0.38 GB video
   partition. xemu only boots an xiso (filesystem at 0), so it sits at "insert Xbox disc". Halo 2

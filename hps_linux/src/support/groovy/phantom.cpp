@@ -55,8 +55,14 @@ void     groovy_force_close(void);
 int      groovy_ps2_inputs_enabled(void);
 }
 
+/* Overridable so tools/phantom_input_test.cpp can build this file off-target against a
+ * scratch directory instead of a MiSTer's SD card. */
+#ifndef PH_INI
 #define PH_INI       "/media/fat/config/phantom.ini"
+#endif
+#ifndef PH_CACHE
 #define PH_CACHE     "/media/fat/config/phantom_catalog.tsv"
+#endif
 
 #define PH_DEF_PORT  1999
 
@@ -71,6 +77,9 @@ int      groovy_ps2_inputs_enabled(void);
  * running clock so the wait is visible rather than a guess. B cancels it sooner. */
 #define T_LAUNCH_WAIT  180000
 #define T_EXIT_HOLD      1200   /* Start+Select hold to kill the host emulator */
+/* After the launcher takes the screen from a running stream, how long the launch button
+ * must stay untouched before it will launch anything. See try_launch(). */
+#define T_TAKEOVER_GUARD 1500
 #define T_STATUS_SHOW    6000   /* how long a transient message sits in the detail bar */
 
 /* One 480i field is ~16.7ms; there is no point building frames faster than the CRT
@@ -86,6 +95,21 @@ static int       inited      = 0;
 static int       owns_screen = 0;
 static int       idle_mode   = PHANTOM_IDLE_LAUNCHER;
 static int       exit_hotkey = 1;
+
+/* Pad edge state and auto-repeat. Up here rather than beside the input code because the
+ * screen handover (idle_enter / idle_leave) has to be able to reset it. */
+static uint32_t  prev_mask[4];
+static uint32_t  rep_at[4];
+static int       rep_dir[4];
+static int       rep_n[4];
+
+/* The launcher took the screen from a stream that was running, which is the one moment a
+ * button being pressed was meant for a game. stream_was_live is set when a stream starts
+ * and consumed by the next takeover; the guard then holds launches off until the launch
+ * button has been left alone for T_TAKEOVER_GUARD. */
+static int       stream_was_live = 0;
+static int       guard_on        = 0;
+static uint32_t  guard_until     = 0;
 
 static int       sock = -1;
 static int       cfg_port = PH_DEF_PORT;
@@ -485,6 +509,33 @@ static void do_launch(void)
 	LOGP("launch %s\n", g->id);
 }
 
+static int launch_guarded(void)
+{
+	if (!guard_on) return 0;
+	if ((int32_t)(now_ms() - guard_until) >= 0)
+	{
+		guard_on = 0;
+		return 0;
+	}
+	return 1;
+}
+
+/* Every launch request from the pad or the keyboard goes through here.
+ *
+ * While the guard is up the request is swallowed, and it pushes the guard out again, so
+ * a button that is still being hit keeps the launcher shut and only a pause releases it.
+ * Anything shorter than that and mashing a button through the handover launches a game
+ * every second press. */
+static void try_launch(void)
+{
+	if (launch_guarded())
+	{
+		guard_until = now_ms() + T_TAKEOVER_GUARD;
+		return;
+	}
+	do_launch();
+}
+
 void phantom_send_kill(void)
 {
 	if (live_host[0]) send_to(live_host, "KILL");
@@ -579,6 +630,20 @@ int phantom_idle_enter(void)
 	ui.fb = shadow;
 	owns_screen = 1;
 	awaiting_video = 0;
+
+	/* Taking the screen from a running stream means whatever the user is doing with the
+	 * pad right now is aimed at a game, not at this menu. A session can end under them
+	 * for reasons they cannot see - a stalled emulator, a client reconnect, the exit
+	 * hotkey - and a press that lands first would launch whatever row is highlighted,
+	 * which the host answers by killing the game they were in. */
+	memset(rep_dir, 0, sizeof(rep_dir));
+	if (stream_was_live)
+	{
+		stream_was_live = 0;
+		guard_on = 1;
+		guard_until = now_ms() + T_TAKEOVER_GUARD;
+		LOGP("took the screen from a running stream; launches held off for %dms\n", T_TAKEOVER_GUARD);
+	}
 	ui.view = PH_VIEW_LIST;
 	ui.status[0] = 0;
 	ui.tick_ms = now_ms();
@@ -605,6 +670,9 @@ void phantom_idle_leave(void)
 	owns_screen = 0;
 	awaiting_video = 0;
 	ui.view = PH_VIEW_LIST;
+	stream_was_live = 1;
+	guard_on = 0;
+	memset(rep_dir, 0, sizeof(rep_dir));   /* a held stick must not keep scrolling a hidden list */
 	groovy_idle_end();
 	LOGP("host video started, launcher released the screen\n");
 }
@@ -718,11 +786,8 @@ void phantom_idle_poll(void)
 
 /* Edge detection against the previous mask: user_io_digital_joystick() is called on
  * every change, and a held direction must not free-run the list. Auto-repeat is
- * deliberate and matches an arcade stick: a pause, then acceleration. */
-static uint32_t prev_mask[4];
-static uint32_t rep_at[4];
-static int      rep_dir[4];
-static int      rep_n[4];
+ * deliberate and matches an arcade stick: a pause, then acceleration. (State: see the
+ * declarations at the top of the file.) */
 
 #define REP_DELAY  420
 #define REP_FAST   110
@@ -741,11 +806,17 @@ static int nav_from(uint32_t mask, int *dx, int *dy)
 
 int phantom_joystick(unsigned char joy, uint32_t mask)
 {
-	if (!owns_screen) return 0;
 	if (joy > 3) return 0;
 
+	/* Tracked whether or not the launcher is on screen. This used to sit below the
+	 * ownership check, so while a game ran it went stale: the launcher took the screen
+	 * holding the pad state from the last time it had been looked at, and every button
+	 * already held in the game read as freshly pressed. */
 	uint32_t prev = prev_mask[joy];
 	prev_mask[joy] = mask;
+
+	if (!owns_screen) return 0;
+
 	uint32_t pressed = mask & ~prev;
 
 	int dx, dy;
@@ -777,7 +848,7 @@ int phantom_joystick(unsigned char joy, uint32_t mask)
 		}
 		else
 		{
-			do_launch();
+			try_launch();
 		}
 		return 1;
 	}
@@ -846,7 +917,7 @@ int phantom_keyboard(uint16_t key, int press)
 
 	case KEY_ENTER:
 	case KEY_KPENTER:
-	case KEY_SPACE: do_launch(); break;
+	case KEY_SPACE: try_launch(); break;
 
 	case KEY_ESC:
 	case KEY_BACKSPACE:
