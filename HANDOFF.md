@@ -18,7 +18,7 @@ All verified against `retrorepair`, not `origin` — in the emulator forks `orig
 | retrorepair/pcsx2 | `groovy-upstream-sync` | `a445baeb2` | `PCSX2-GroovyNLC-…-win64.zip` |
 | retrorepair/flycast-dojo | `groovy-rio-buffer-lifetime` | `c07861d6b` | `Flycast-Dojo-GroovyNLC-…-win64.zip` |
 | retrorepair/rpcs3 | `groovy-upstream-sync` | `b98401e09` | `RPCS3-GroovyNLC-…-win64.zip` |
-| retrorepair/fightcade-fbneo | `groovy-rio-buffer-lifetime` | `7df342987` | `FBNeo-Fightcade-GroovyNLC-…-win32.zip` (`fcadefbneo.exe` only) |
+| retrorepair/fightcade-fbneo | `groovy-rio-buffer-lifetime` | `e27e0ebf9` | **`v2026.10.13.1`** `FBNeo-Fightcade-GroovyNLC-…-win32.zip` (`fcadefbneo.exe` only; `v2026.10.13` superseded) |
 | retrorepair/xemu | `groovy-upstream-sync` | `c5d840daa` | **none** — built, not validated, see below |
 
 Each zip is built from that fork's own build output, not from the deployed folder (which has
@@ -69,6 +69,14 @@ wrong "running" costs a held frame, a wrong "idle" costs the launcher flashing m
 Residual: an emulator that is open *and* holds a UDP socket while idle still counts, so the launcher
 can take up to 20 s to return then. See `memory/hold-the-screen-daemon-status.md`.
 
+### FBNeo keeps its EEPROM in local play (`e27e0ebf9`)
+Fightcade's emulator never loaded or saved the EEPROM (`@FC: Disable local save of EEPROM`), so CPS2 service-menu
+settings (demo sounds...) reset on every launch. They are now saved to `config\games\<game>.nv` and loaded again unless
+`is_netgame_or_recording()` (netplay, or recording/playback from power-on), decided once in `EEPROMInit`. Checked: a clean
+exit writes a 128-byte `ssf2t.nv` and a second launch reloads it unchanged. **Not checked:** a changed option surviving a
+relaunch, and the netgame guard in a real match. Deployed to `C:\Emulators\fbneo`; the user's Fightcade copy
+(`C:\Users\joelw\Documents\Fightcade\emulator\fbneo`) still has the previous exe.
+
 ### FBNeo never started from Phantom, now does
 The daemon passed FBNeo the ROM's full path; FBNeo compares each argument with every driver's short
 name for an exact match, so a path gives its "not supported" error window and no game. The FBNeo row now
@@ -112,14 +120,16 @@ NVIDIA Control Panel's "Prefer maximum performance" for `xemu.exe` is the user's
 
 - **xemu**: the reboot test above, then a release.
 - **On-CRT check** of the hold: nobody has looked at the CRT while a stalled client was held.
-- **FBNeo netplay audio stutter (not our code; code-read only).** `GroovyAudioFrame` is called only
-  inside `if (bDraw)` in `run.cpp`; in netplay GGPO is the clock (`GroovyPacingActive()` excludes
-  `kNetGame`), skipped frames drop their audio, and the MiSTer gets bursts. Fix is a client-side
-  jitter buffer like xemu's/PCSX2's `AudioTap`. Same on verbst's fork.
-- **OutRun 2 will not boot in xemu — the image, not the stack.** It is a 7.29 GB full redump with
-  the XDVDFS filesystem at offset `0x18300000`; xemu needs an xiso (filesystem at 0). The fix is a
-  6.91 GB copy from that offset, original untouched. Not done: it needs the space and a decision
-  about where the result goes (the scan dedupes by filename stem). The user has not answered.
+- **FBNeo audio stutter: not reproducible, parked.** A tester (D.Owls) reported it through Fightcade; the user
+  heard none standalone (44.1 kHz) or through Fightcade, in training mode or Test Game, and the tester never
+  replied. Fightcade starts the emulator two ways (from its own log): training mode
+  `<game> fbneo-training-mode\fbneo-training-mode.lua savestates\<game>_fbneo.fs` (offline, Groovy-paced) and Test
+  Game `quark:served,<game>,<id>,7001,0,null` (the netplay path, `kNetGame=1`). Facts worth keeping from the
+  FPGA source (`rtl/sound.v`): "Desired buffer" is only the pre-roll before playback starts, nothing refills it;
+  `sound_write_ready` is declared but never used, so the FIFO is never throttled; a starved FIFO makes it drop
+  an equal amount of the next audio unless `vram_synced & !vga_frameskip`; and 44.1 kHz audio drains at
+  24.576 MHz/562 = 43,729/s, 0.84% slower than sent (it did not show up as a problem). If it returns,
+  get the tester's `config\groovy.log` at Log level 1 and the exact command line first.
 - **GameCube/Wii disc titles**: the disc header at 0x20 has the real title, like Xbox. Offered,
   not answered.
 - **Unify the vendored Groovy client.** All copies now carry `rioFence`, but they still diverge:
