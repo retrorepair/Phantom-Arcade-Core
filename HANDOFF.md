@@ -12,7 +12,7 @@ All verified against `retrorepair`, not `origin` — in the emulator forks `orig
 
 | Repo | Branch | Head | Release `v2026.10.13` asset |
 |---|---|---|---|
-| Phantom-Arcade-Core | `main` | `1d2950b` | **`v2026.10.13.1`**: `MiSTer_phantom`, `PhantomArcadeManager.exe`, `Phantom_Arcade.rbf`, `SHA256SUMS.txt` (`v2026.10.13` is marked superseded) |
+| Phantom-Arcade-Core | `main` | `1d92577` | **`v2026.10.13.2`**: `MiSTer_phantom`, `PhantomArcadeManager.exe`, `Phantom_Arcade.rbf`, `SHA256SUMS.txt` (`v2026.10.13` and `.1` are marked superseded) |
 | retrorepair/dolphin | `groovy-nlc` | `b9d320863` | `Dolphin-GroovyNLC-…-win64.zip` |
 | retrorepair/86Box | `groovy-nlc` | `5593d3c24` | `86Box-GroovyNLC-…-win64.zip` |
 | retrorepair/pcsx2 | `groovy-upstream-sync` | `a445baeb2` | `PCSX2-GroovyNLC-…-win64.zip` |
@@ -68,6 +68,14 @@ wrong "running" costs a held frame, a wrong "idle" costs the launcher flashing m
 `host/emulator_status_test.cpp` has 15 checks against real processes and a real socket.
 Residual: an emulator that is open *and* holds a UDP socket while idle still counts, so the launcher
 can take up to 20 s to return then. See `memory/hold-the-screen-daemon-status.md`.
+
+### FBNeo never started from Phantom, now does
+The daemon passed FBNeo the ROM's full path; FBNeo compares each argument with every driver's short
+name for an exact match, so a path gives its "not supported" error window and no game. The FBNeo row now
+passes `{rom_stem}` (`ssf2t`). Found because the user tried it; it had never run before because no FBNeo ROM
+existed on this machine. Verified end to end: the MiSTer's own `LAUNCH:fbneo_ssf2t` datagram (sent from the
+MiSTer over SSH, `python3 -`) was ACKed and `fcadefbneo.exe ssf2t` came up streaming. The other rows were
+not re-checked; launches use the compiled defaults, not `phantom_config.json` (which only records them).
 
 ### FBNeo builds, and the build is Visual Studio
 `7df342987` untracks 2094 `obj/` files the previous commit swept in with `git add -A`. The MinGW
