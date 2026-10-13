@@ -42,6 +42,7 @@
 
 #include "phantom.h"
 #include "phantom_ui.h"
+#include "phantom_cat.h"
 #include "../../user_io.h"
 
 /* Hardware side, implemented in groovy.cpp. The launcher never touches SPI or the DDR
@@ -97,6 +98,21 @@ int      groovy_ps2_inputs_enabled(void);
 #endif
 #define T_STATUS_SHOW    6000   /* how long a transient message sits in the detail bar */
 
+/* The library: how often the host is asked whether it has a new one, and how long it may stay silent before the
+ * cabinet decides a different daemon has taken its place. Overridable for the same reason as the close timings. */
+#ifndef T_INFO_POLL
+#define T_INFO_POLL     10000   /* idle: a rescan is noticed within this */
+#endif
+#ifndef T_INFO_SCAN_POLL
+#define T_INFO_SCAN_POLL 1000   /* while the host is still scanning */
+#endif
+#ifndef T_INFO_PROBE
+#define T_INFO_PROBE    15000   /* a host that has never answered CATINFO is asked again this often, in case it was replaced */
+#endif
+#ifndef T_INFO_SILENT
+#define T_INFO_SILENT    4000   /* a poll unanswered this long starts the retries that end in falling back */
+#endif
+
 /* One 480i field is ~16.7ms; there is no point building frames faster than the CRT
  * can show them, and every frame costs a full-canvas copy into DDR. */
 #define PH_FRAME_MS        16
@@ -104,6 +120,17 @@ int      groovy_ps2_inputs_enabled(void);
 #define LOGP(...) do { printf("[PHANTOM] " __VA_ARGS__); fflush(stdout); } while (0)
 
 static ph_ui     ui;
+static pc_cat    cat;                /* the host's library, fetched a page at a time; see phantom_cat.h */
+static int       cat_paged   = 0;    /* the host speaks the paged catalog and ui.src reads from `cat` */
+static uint32_t  t_info_next = 0;    /* next CATINFO, to notice a rescan */
+static uint32_t  t_info_last = 0;
+static uint32_t  t_info_unanswered = 0;   /* when the oldest unanswered CATINFO poll went out; 0 = none */
+static uint32_t  t_legacy_at = 0;    /* when to give up on CATINFO and ask the older way; 0 = not waiting */
+static uint32_t  t_pump_next = 0;
+static int       info_tries  = 0;
+static int       info_answered = 0;   /* the host has answered CATINFO since it was last found */
+static int       rescan_after_online = 0;   /* REFRESH asked for a rescan; send it once the host is found again */
+static char      cat_host[64] = "";  /* whose library `cat` holds */
 static uint8_t  *shadow      = 0;   /* cached-RAM canvas; see groovy_idle_present */
 static uint32_t  t_presented = 0;
 static int       inited      = 0;
@@ -117,6 +144,9 @@ static uint32_t  prev_mask[4];
 static uint32_t  rep_at[4];
 static int       rep_dir[4];
 static int       rep_n[4];
+static uint32_t  repx_at[4];     /* the same for Left/Right, which page: held, it accelerates across the library */
+static int       repx_dir[4];
+static int       repx_n[4];
 
 /* The launcher took the screen from a stream that was running, which is the one moment a
  * button being pressed was meant for a game. stream_was_live is set when a stream starts
@@ -152,6 +182,7 @@ static uint32_t  hk_since = 0;
 static int       hk_fired = 0;
 
 static void repeat_tick(void);   /* defined with the rest of the input handling */
+static void send_to(const char *ip, const char *msg);   /* defined with the socket */
 
 /* ---- clock -------------------------------------------------------------------- */
 
@@ -271,7 +302,7 @@ static int cmp_game(const void *a, const void *b)
 {
 	const ph_game *x = (const ph_game *)a;
 	const ph_game *y = (const ph_game *)b;
-	int c = strcasecmp(x->title, y->title);
+	int c = pc_title_cmp(x->title, y->title);   /* the host's order, so the letter jumps agree with it */
 	return c ? c : strcmp(x->id, y->id);
 }
 
@@ -418,6 +449,185 @@ static void parse_catalog(const char *buf, int len)
 	LOGP("catalog: %d titles from %s\n", n, live_host);
 }
 
+/* ---- the paged library -------------------------------------------------------------- */
+
+/* A host that speaks the paged catalog answers CATINFO. One that does not (an older daemon) says nothing, and
+ * after a moment we ask the old way - the whole list in one datagram - and live with its limits. */
+static void request_library(void)
+{
+	if (!live_host[0]) return;
+
+	/* a different machine answering is a different library */
+	if (strcmp(cat_host, live_host))
+	{
+		pc_reset(&cat);
+		cat_paged = 0;
+		memset(&ui.src, 0, sizeof(ui.src));
+		snprintf(cat_host, sizeof(cat_host), "%s", live_host);
+	}
+
+	uint32_t t = now_ms();
+	send_to(live_host, "CATINFO");
+	t_info_last = t;
+	t_info_next = t + 1000;
+	info_tries = 1;
+	info_answered = 0;
+	t_info_unanswered = 0;
+	if (!cat_paged)
+	{
+		t_legacy_at = t + 1500;
+		ui.lib_loading = (ui.count == 0);
+		ui.dirty = 1;
+	}
+
+	if (rescan_after_online)
+	{
+		rescan_after_online = 0;
+		send_to(live_host, "RESCAN");
+	}
+}
+
+static void on_cat_event(int ev)
+{
+	switch (ev)
+	{
+	case PC_INFO_NEW:
+		if (!cat_paged) LOGP("host speaks the paged catalog\n");
+		cat_paged = 1;
+		info_answered = 1;
+		t_legacy_at = 0;
+		ui.src = pc_source(&cat);
+		ui.lib_loading = 0;
+		ui.lib_scanning = cat.scanning;
+		t_info_next = now_ms() + (cat.scanning ? T_INFO_SCAN_POLL : T_INFO_POLL);
+		t_info_unanswered = 0;
+		ph_ui_reclamp(&ui, 0);
+		ui.dirty = 1;
+		LOGP("library v%u: %d titles in %d systems%s\n", (unsigned)cat.ver, cat.total, cat.nsys, cat.scanning ? " (host still scanning)" : "");
+		break;
+	case PC_INFO:
+		info_answered = 1;
+		ui.lib_loading = 0;
+		t_info_unanswered = 0;
+		t_info_next = now_ms() + (cat.scanning ? T_INFO_SCAN_POLL : T_INFO_POLL);
+		if (ui.lib_scanning != cat.scanning)
+		{
+			ui.lib_scanning = cat.scanning;
+			ui.dirty = 1;
+		}
+		break;
+	case PC_PAGE_IN:
+	case PC_LETTERS_IN:
+		ui.dirty = 1;
+		break;
+	default:
+		break;
+	}
+}
+
+/* Keep the rows around the cursor on their way from the host. Cheap when nothing is missing, so it runs
+ * on a short timer rather than every pass of the poll loop. */
+static void pump_pages(uint32_t t)
+{
+	if (!cat_paged || !live_host[0] || !owns_screen || ui.view != PH_VIEW_LIST) return;
+
+	static int last_sel = -1, last_scroll = -1, last_tab = -1, dir = 0;
+	/* Moving to rows that are not here yet is the moment latency matters: ask at once. The timer only paces
+	 * the housekeeping - retries, and the read-ahead once the cursor has stopped. */
+	const int moved = (ui.sel != last_sel || ui.scroll != last_scroll || ui.tab != last_tab);
+	if (!moved && (int32_t)(t - t_pump_next) < 0) return;
+	t_pump_next = t + 30;
+
+	if (ui.sel != last_sel)
+	{
+		dir = (ui.sel > last_sel) ? 1 : -1;
+		last_sel = ui.sel;
+	}
+	last_scroll = ui.scroll;
+	last_tab = ui.tab;
+
+	int list = pc_list_for_tab(&cat, ui.tab);
+	int rows = ph_ui_rows(&ui);
+	char req[96];
+	for (int i = 0; i < 6 && pc_next_request(&cat, t, list, ui.scroll, ui.scroll + rows - 1, dir, req, sizeof(req)); i++)
+		send_to(live_host, req);
+}
+
+static void library_tick(uint32_t t)
+{
+	if (!live_host[0]) return;
+
+	if (!info_answered)
+	{
+		if (info_tries < 4)
+		{
+			/* CATINFO may simply have been lost; a few tries before deciding the host is an older one */
+			if ((int32_t)(t - t_info_next) >= 0)
+			{
+				send_to(live_host, "CATINFO");
+				info_tries++;
+				t_info_next = t + 1000;
+			}
+		}
+		else if (cat_paged && (int32_t)(t - t_info_next) >= 0)
+		{
+			/* It answered CATINFO before and does not now: an older daemon has taken its place. What we hold
+			 * is a library it cannot page, so drop it and ask the older way. */
+			LOGP("host no longer answers CATINFO: back to the whole-catalog request\n");
+			cat_paged = 0;
+			pc_reset(&cat);
+			memset(&ui.src, 0, sizeof(ui.src));
+			ui.lib_scanning = 0;
+			t_legacy_at = t;
+			ui.dirty = 1;
+		}
+	}
+
+	if (!cat_paged)
+	{
+		/* an older host never answers CATINFO: after a moment, ask for the whole list in one datagram */
+		if (t_legacy_at && (int32_t)(t - t_legacy_at) >= 0)
+		{
+			t_legacy_at = 0;
+			ui.lib_loading = 0;
+			send_to(live_host, "GET_CATALOG");
+			LOGP("no CATINFO answer: asking for the whole catalog\n");
+		}
+		/* ...and keep asking now and then. A host that is restarted does not look like a host that has just
+		 * appeared, so nothing else would tell us that the daemon on the other end has been replaced by one
+		 * that can page. An older daemon ignores the datagram, which costs nothing. */
+		if (!info_answered && info_tries >= 4 && (int32_t)(t - t_info_next) >= 0)
+		{
+			send_to(live_host, "CATINFO");
+			t_info_next = t + T_INFO_PROBE;
+		}
+		return;
+	}
+	if (!info_answered) return;
+
+	/* notice a rescan on the host: often while it is still working, rarely otherwise */
+	if ((cat.want_info && (int32_t)(t - t_info_last) >= 100) || (int32_t)(t - t_info_next) >= 0)
+	{
+		cat.want_info = 0;
+		t_info_last = t;
+		t_info_next = t + (cat.scanning ? T_INFO_SCAN_POLL : T_INFO_POLL);
+		send_to(live_host, "CATINFO");
+		if (!t_info_unanswered) t_info_unanswered = t;
+	}
+
+	/* A poll that is never answered means the daemon on the other end is not the one that was: start over, and the
+	 * retries decide whether it is an older one. */
+	if (t_info_unanswered && (int32_t)(t - t_info_unanswered) > T_INFO_SILENT)
+	{
+		t_info_unanswered = 0;
+		info_answered = 0;
+		info_tries = 1;
+		t_info_next = t + 1000;
+		return;
+	}
+	pump_pages(t);
+}
+
 /* ---- socket ------------------------------------------------------------------- */
 
 static void sock_open(void)
@@ -498,7 +708,7 @@ static void drain(void)
 			if (was != PH_HOST_ONLINE)
 			{
 				LOGP("host online at %s:%d\n", ip, cfg_port);
-				send_to(live_host, "GET_CATALOG");
+				request_library();
 			}
 		}
 		else if (!strncmp(buf, "STATUS:", 7))
@@ -507,18 +717,43 @@ static void drain(void)
 			 * waited on; an old host never sends it, which reads as "no answer". */
 			end_host = strstr(buf, "RUNNING") ? 1 : 0;
 		}
+		else if (!strncmp(buf, "ACK:LAUNCH:STALE", 16) || !strncmp(buf, "ACK:LAUNCH:NOTFOUND", 19) ||
+		         !strncmp(buf, "ACK:LAUNCH:BAD", 14))
+		{
+			/* The host's library is not the one this row came from (it was rescanned since the page was
+			 * fetched), so the position may now be a different game. Nothing was started; say so and
+			 * fetch the new list rather than guess. */
+			LOGP("host refused the launch: %s\n", buf);
+			awaiting_video = 0;
+			ui.view = PH_VIEW_LIST;
+			snprintf(ui.status, sizeof(ui.status), "The library changed - choose again.");
+			t_status_set = now_ms();
+			cat.want_info = 1;
+			ui.dirty = 1;
+		}
 		else if (!strncmp(buf, "ACK:LAUNCH", 10))
 		{
 			LOGP("host acked launch\n");
 			snprintf(ui.status, sizeof(ui.status), "Host is starting the emulator...");
 			ui.dirty = 1;
 		}
+		else if (!strncmp(buf, "CATINFO:", 8) || !strncmp(buf, "LETTERS:", 8) || !strncmp(buf, "LIST:", 5) ||
+		         !strncmp(buf, "STALE:", 6))
+		{
+			on_cat_event(pc_on_reply(&cat, buf, (int)n));
+		}
+		else if (!strncmp(buf, "RESCAN:", 7))
+		{
+			/* acknowledged; the host's CATINFO tells us when it is scanning and when it is done */
+			t_info_next = now_ms() + 300;
+		}
 		else if (!strncmp(buf, "ACK:KILL", 8))
 		{
 			LOGP("host acked kill\n");
 		}
-		else if (n > 8 && (buf[0] == '{' || strstr(buf, "\"id\"")))
+		else if (!cat_paged && n > 8 && (buf[0] == '{' || strstr(buf, "\"id\"")))
 		{
+			ui.lib_loading = 0;
 			parse_catalog(buf, (int)n);
 			ui.dirty = 1;
 		}
@@ -544,7 +779,18 @@ static void do_launch(void)
 	 * can decide whether to point the emulator at the MiSTer one. A host that does not
 	 * understand the suffix takes everything up to the first colon as the id. */
 	char msg[192];
-	snprintf(msg, sizeof(msg), "LAUNCH:%s:kbd=%d", g->id, groovy_ps2_inputs_enabled());
+	if (cat_paged)
+	{
+		/* By position, quoting the library's version: the cabinet holds a window of the list, not every id, and
+		 * the host refuses (rather than starts the wrong game) if the library has been rescanned since. */
+		int list = pc_list_for_tab(&cat, ui.tab);
+		snprintf(msg, sizeof(msg), "LAUNCH:@%u:%s:%d:kbd=%d", (unsigned)cat.ver, pc_list_key(&cat, list), ui.sel,
+		         groovy_ps2_inputs_enabled());
+	}
+	else
+	{
+		snprintf(msg, sizeof(msg), "LAUNCH:%s:kbd=%d", g->id, groovy_ps2_inputs_enabled());
+	}
 	send_to(live_host, msg);
 
 	snprintf(last_id, sizeof(last_id), "%s", g->id);
@@ -617,6 +863,9 @@ void phantom_return_to_launcher(void)
 
 void phantom_request_refresh(void)
 {
+	/* A paged host is asked to look for new and changed games once it has been found again; an older one has
+	 * nothing to rescan, and simply sends its list again. */
+	rescan_after_online = cat_paged;
 	live_host[0] = 0;
 	ui.host_state = PH_HOST_SEARCHING;
 	t_search_began = now_ms();
@@ -639,6 +888,7 @@ void phantom_init(void)
 	ui.host_port = cfg_port;
 	ui.host_state = PH_HOST_SEARCHING;
 
+	pc_init(&cat);
 	cache_load();
 	ph_ui_reclamp(&ui, 0);
 
@@ -657,6 +907,9 @@ void phantom_stop(void)
 	ui.fb = 0;
 	owns_screen = 0;
 	end_reason = 0;
+	pc_reset(&cat);
+	cat_paged = 0;
+	cat_host[0] = 0;
 	inited = 0;
 }
 
@@ -690,6 +943,7 @@ int phantom_idle_enter(void)
 	 * hotkey - and a press that lands first would launch whatever row is highlighted,
 	 * which the host answers by killing the game they were in. */
 	memset(rep_dir, 0, sizeof(rep_dir));
+	memset(repx_dir, 0, sizeof(repx_dir));
 	end_reason = 0;   /* whatever was being waited on has been decided, one way or another */
 	if (stream_was_live)
 	{
@@ -727,6 +981,7 @@ void phantom_idle_leave(void)
 	stream_was_live = 1;
 	guard_on = 0;
 	memset(rep_dir, 0, sizeof(rep_dir));   /* a held stick must not keep scrolling a hidden list */
+	memset(repx_dir, 0, sizeof(repx_dir));
 	groovy_idle_end();
 	LOGP("host video started, launcher released the screen\n");
 }
@@ -846,6 +1101,9 @@ void phantom_idle_poll(void)
 		}
 	}
 
+	/* The library: notice a rescan, and keep the rows around the cursor arriving. */
+	if (ui.host_state == PH_HOST_ONLINE) library_tick(t);
+
 	if (!owns_screen) return;
 
 	/* A launch that never produced video. Saying so and going back to the list beats
@@ -927,9 +1185,15 @@ void phantom_idle_poll(void)
  * deliberate and matches an arcade stick: a pause, then acceleration. (State: see the
  * declarations at the top of the file.) */
 
-#define REP_DELAY  420
-#define REP_FAST   110
-#define REP_FLOOR   45
+#define PH_REP_DELAY  420
+#define PH_REP_FAST   110
+#define PH_REP_FLOOR   45
+
+/* Left/Right, held: pages, then more pages at a time (see repeat_tick). */
+#define REPX_DELAY      450
+#define REPX_FAST       220
+#define REPX_FLOOR       80
+#define REPX_MAX_PAGES   40
 
 static int nav_from(uint32_t mask, int *dx, int *dy)
 {
@@ -961,28 +1225,29 @@ int phantom_joystick(unsigned char joy, uint32_t mask)
 	int dx, dy;
 	int held = nav_from(mask, &dx, &dy);
 
-	/* fresh direction press -> act now, arm the repeat */
+	/* A fresh direction press acts now and arms its repeat. Up/Down and Left/Right are separate: holding one
+	 * while tapping the other must not cancel it. */
 	int pdx, pdy;
-	if (nav_from(pressed, &pdx, &pdy))
+	nav_from(pressed, &pdx, &pdy);
+	if (pdy)
 	{
-		if (adjusting)
-		{
-			if (pdx) ph_ui_adjust_edge(&ui, pdx);
-			if (pdy) ph_ui_adjust_move(&ui, -pdy * 2);   /* up shrinks the box, down grows it */
-		}
-		else
-		{
-			if (pdy) ph_ui_move(&ui, pdy);
-			if (pdx) ph_ui_page(&ui, pdx);
-		}
-		rep_at[joy] = now_ms() + REP_DELAY;
-		rep_dir[joy] = pdy ? pdy : 0;
+		if (adjusting) ph_ui_adjust_move(&ui, -pdy * 2);   /* up shrinks the box, down grows it */
+		else           ph_ui_move(&ui, pdy);
+		rep_at[joy] = now_ms() + PH_REP_DELAY;
+		rep_dir[joy] = pdy;
 		rep_n[joy] = 0;
 	}
-	else if (!held)
+	if (pdx)
 	{
-		rep_dir[joy] = 0;
+		if (adjusting) ph_ui_adjust_edge(&ui, pdx);
+		else           ph_ui_page(&ui, pdx);
+		repx_at[joy] = now_ms() + REPX_DELAY;
+		repx_dir[joy] = adjusting ? 0 : pdx;               /* choosing an edge does not repeat */
+		repx_n[joy] = 0;
 	}
+	if (!dy) rep_dir[joy] = 0;
+	if (!dx) repx_dir[joy] = 0;
+	(void)held;
 
 	if (adjusting)
 	{
@@ -1019,7 +1284,6 @@ int phantom_joystick(unsigned char joy, uint32_t mask)
 	if (pressed & GJ_Y)
 	{
 		phantom_request_refresh();
-		if (live_host[0]) send_to(live_host, "GET_CATALOG");
 		return 1;
 	}
 
@@ -1052,15 +1316,30 @@ static void repeat_tick(void)
 	uint32_t t = now_ms();
 	for (int j = 0; j < 4; j++)
 	{
-		if (!rep_dir[j]) continue;
-		if ((int32_t)(t - rep_at[j]) < 0) continue;
+		if (rep_dir[j] && (int32_t)(t - rep_at[j]) >= 0)
+		{
+			if (ui.view == PH_VIEW_ADJUST) ph_ui_adjust_move(&ui, -rep_dir[j] * 2);
+			else                           ph_ui_move(&ui, rep_dir[j]);
+			rep_n[j]++;
+			uint32_t gap = PH_REP_FAST - (uint32_t)rep_n[j] * 6;
+			if ((int32_t)gap < PH_REP_FLOOR) gap = PH_REP_FLOOR;
+			rep_at[j] = t + gap;
+		}
 
-		if (ui.view == PH_VIEW_ADJUST) ph_ui_adjust_move(&ui, -rep_dir[j] * 2);
-		else                           ph_ui_move(&ui, rep_dir[j]);
-		rep_n[j]++;
-		uint32_t gap = REP_FAST - (uint32_t)rep_n[j] * 6;
-		if ((int32_t)gap < REP_FLOOR) gap = REP_FLOOR;
-		rep_at[j] = t + gap;
+		if (repx_dir[j] && ui.view == PH_VIEW_LIST && (int32_t)(t - repx_at[j]) >= 0)
+		{
+			/* Holding Left/Right pages, and the longer it is held the further each step goes: a page, then
+			 * several, up to REPX_MAX_PAGES. Across a library of hundreds of thousands a page at a time is a
+			 * long afternoon; this crosses a letter's worth in a couple of seconds and still lets go within a
+			 * page of where you meant. */
+			int pages = 1 + repx_n[j] / 2;
+			if (pages > REPX_MAX_PAGES) pages = REPX_MAX_PAGES;
+			ph_ui_seek(&ui, repx_dir[j] * pages * ph_ui_rows(&ui));
+			repx_n[j]++;
+			int gap = REPX_FAST - repx_n[j] * 10;
+			if (gap < REPX_FLOOR) gap = REPX_FLOOR;
+			repx_at[j] = t + (uint32_t)gap;
+		}
 	}
 }
 
@@ -1124,7 +1403,6 @@ int phantom_keyboard(uint16_t key, int press)
 
 	case KEY_F5:
 		phantom_request_refresh();
-		if (live_host[0]) send_to(live_host, "GET_CATALOG");
 		break;
 
 	default: break;
@@ -1200,4 +1478,4 @@ const char *phantom_state_text(void)
 	}
 }
 
-int phantom_title_count(void) { return ui.count; }
+int phantom_title_count(void) { return cat_paged ? cat.total : ui.count; }

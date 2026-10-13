@@ -25,9 +25,11 @@ extern "C" {
 #define PH_CANVAS_W 720
 #define PH_CANVAS_H 480
 
+/* The resident list: what the older catalog path fills, and what the tests and the preview tool
+ * use. A library bigger than this is not held here at all - see ph_source. */
 #define PH_MAX_GAMES 512
 #define PH_ID_LEN    64
-#define PH_TITLE_LEN 96
+#define PH_TITLE_LEN 128
 #define PH_SYS_LEN   32
 
 /* One entry of the host's library. Everything here comes from the host daemon's
@@ -47,6 +49,25 @@ typedef struct
 	uint32_t hsync_hz;            /* 15734, 0 = unknown */
 	uint32_t vsync_chz;           /* centi-Hz: 5994 = 59.94Hz, 0 = unknown */
 } ph_game;
+
+/* Where the list's rows come from, when they are not all held here.
+ *
+ * A library of hundreds of thousands of titles cannot live in an array: the host keeps it, sorted, and the
+ * cabinet fetches the page it is looking at (phantom_cat.c). The renderer only ever asks for the rows it is
+ * about to draw, by position in the current tab's list, so it does not care which kind of source it has.
+ *
+ * With none set, rows come from games[]/count below, filtered by tab - which is how it has always worked. */
+typedef struct ph_source
+{
+	/* Titles in the tab. Negative: nothing known yet. */
+	int            (*count)(void *ctx, int tab);
+	/* Row `index` of the tab, or NULL when it has not arrived yet (it is drawn as a placeholder). */
+	const ph_game *(*row)(void *ctx, int tab, int index);
+	/* Index of the first title filed under letter k of the tab (0 = anything not a letter, 1..26 = A..Z), k = 27
+	 * giving the count. Negative: not known yet. */
+	int            (*letter_start)(void *ctx, int tab, int k);
+	void           *ctx;
+} ph_source;
 
 /* Header link indicator. SEARCHING is the pre-discovery state and must not be shown
  * as an error: a cold boot legitimately sits there for a second or two. */
@@ -111,6 +132,9 @@ typedef struct
 	/* catalog */
 	ph_game games[PH_MAX_GAMES];
 	int     count;
+	ph_source src;        /* when src.count is set, rows come from here and games[]/count are not used */
+	int     lib_loading;  /* the host is online but has not sent its library's size yet */
+	int     lib_scanning; /* the host is still looking for games; what is listed may not be everything */
 
 	/* navigation. sel indexes the *filtered* list, not games[]. */
 	int tab;
@@ -159,9 +183,21 @@ int ph_ui_tab(ph_ui *u, int dx);
  * lands somewhere unrelated, where a single step wrapping is easy to follow. */
 int ph_ui_page(ph_ui *u, int dir);
 
+/* Move by `rows` titles (negative: back), clamped at both ends. This is how a held Left/Right crosses a
+ * library that is far too long to page through a screen at a time. */
+int ph_ui_seek(ph_ui *u, int rows);
+
 /* Jump to the first title of the next (dir > 0) or the current/previous (dir < 0) letter.
- * Titles that do not start with a letter are one group, ahead of "A". */
+ * Titles that do not start with a letter are one group, ahead of "A". Does nothing until the letter table
+ * is known. */
 int ph_ui_letter(ph_ui *u, int dir);
+
+/* Titles in tab `tab`, from whichever source the list has. */
+int ph_ui_tab_count(const ph_ui *u, int tab);
+
+/* Does a catalog entry of this system belong on this tab? (The tab strip is the launcher's; a host just
+ * names its systems.) */
+int ph_tab_matches(int tab, const char *sys);
 
 /* Rows the list shows at once with the current margins. */
 int ph_ui_rows(const ph_ui *u);

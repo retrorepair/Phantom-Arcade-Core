@@ -44,6 +44,8 @@
 #include <set>
 #include "emulator_status.h"
 #include "fbneo_sets.h"
+#include "game_index.h"
+#include "library_scan.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -202,7 +204,7 @@ HANDLE g_hHttpThread = NULL;
 // Forward declarations
 void LoadConfiguration();
 void SaveConfiguration();
-void ScanRomDirectories();
+void StartLibraryScan(bool full);
 void ToggleDaemon();
 bool LaunchGame(const std::string& gameId, const std::wstring& targetMisterIp = L"");
 
@@ -450,6 +452,9 @@ static std::wstring GetLearnedMisterIp() {
 
 // Called from the UDP thread for every datagram a MiSTer sends us.
 static void NoteMisterAddress(const std::wstring& ip) {
+    // Something on this PC talking to us (a test client, a second tool) is not a cabinet, and must not
+    // overwrite the address of the real one.
+    if (ip.rfind(L"127.", 0) == 0) return;
     {
         std::lock_guard<std::mutex> lk(g_ipMutex);
         if (g_learnedMisterIp == ip) return;
@@ -770,9 +775,11 @@ static std::string XmlTag(const std::string& block, const char* tag) {
     if (b == std::string::npos) return "";
     std::string v = block.substr(a + open.size(), b - a - open.size());
     // the few entities MAME emits in these fields
-    for (size_t p; (p = v.find("&amp;")) != std::string::npos; ) v.replace(p, 5, "&");
     for (size_t p; (p = v.find("&apos;")) != std::string::npos; ) v.replace(p, 6, "'");
     for (size_t p; (p = v.find("&quot;")) != std::string::npos; ) v.replace(p, 6, "\"");
+    for (size_t p; (p = v.find("&lt;")) != std::string::npos; ) v.replace(p, 4, "<");
+    for (size_t p; (p = v.find("&gt;")) != std::string::npos; ) v.replace(p, 4, ">");
+    for (size_t p; (p = v.find("&amp;")) != std::string::npos; ) v.replace(p, 5, "&");
     return v;
 }
 
@@ -786,72 +793,101 @@ static std::string XmlAttr(const std::string& block, const char* attr) {
     return block.substr(a, b - a);
 }
 
-static void FilterRunnableSets(const std::wstring& mameExe,
-                               const std::vector<std::string>& stems,
-                               std::set<std::string>& outRunnable,
-                               std::map<std::string, MameMeta>& outMeta) {
-    outRunnable.insert(stems.begin(), stems.end());   // default to keeping everything
-    if (mameExe.empty() || stems.empty()) return;
+static std::string AsciiFold(const std::string& in);   // defined below
+
+// One batch of set names, answered by the user's own MAME. `out` gets one verdict per name, in order, or
+// is left empty when MAME could not be asked at all (it would not start, or said nothing) - which the
+// caller reads as "keep these, and remember nothing", so a broken MAME cannot empty somebody's library.
+//
+// A scan hands these over in batches because the names go on a command line, which Windows ends at
+// about 32,000 characters; a few thousand sets in one call used to fail outright.
+static void MameVerifyBatch(const std::wstring& mameExe, const std::vector<std::string>& names,
+                            std::vector<phantom::MameVerdict>& out) {
+    out.clear();
+    if (mameExe.empty() || names.empty()) return;
 
     std::wstring dir;
     size_t slash = mameExe.find_last_of(L"\\/");
     if (slash != std::wstring::npos) dir = mameExe.substr(0, slash);
 
-    std::wstring names;
-    for (const auto& s : stems) names += L" " + StringToWstring(s);
+    std::wstring args;
+    for (const auto& s : names) args += L" " + StringToWstring(s);
 
     // 1. bad romsets
-    std::string verify = RunCapture(L"\"" + mameExe + L"\" -verifyroms" + names, dir);
-    std::stringstream vs(verify);
-    std::string line;
-    while (std::getline(vs, line)) {
-        // "romset <name> is bad"
-        if (line.rfind("romset ", 0) != 0) continue;
-        size_t sp = line.find(' ', 7);
-        if (sp == std::string::npos) continue;
-        std::string name = line.substr(7, sp - 7);
-        if (line.find(" is bad") != std::string::npos) outRunnable.erase(name);
+    std::set<std::string> bad;
+    std::string verify = RunCapture(L"\"" + mameExe + L"\" -verifyroms" + args, dir);
+    {
+        std::stringstream vs(verify);
+        std::string line;
+        while (std::getline(vs, line)) {
+            // "romset <name> is bad"
+            if (line.rfind("romset ", 0) != 0) continue;
+            size_t sp = line.find(' ', 7);
+            if (sp == std::string::npos) continue;
+            if (line.find(" is bad") != std::string::npos) bad.insert(line.substr(7, sp - 7));
+        }
     }
 
-    // 2. devices and other non-runnable machines, plus everything worth showing on the
-    //    cabinet. Each machine's block is bounded at </machine> before anything is read
-    //    out of it: a driver's block is followed by blocks for every device it
-    //    references, which carry <description> tags of their own.
-    std::string xml = RunCapture(L"\"" + mameExe + L"\" -listxml" + names, dir);
-    if (xml.size() > 64) {
-        size_t at = 0;
-        while ((at = xml.find("<machine name=\"", at)) != std::string::npos) {
-            size_t q = at + 15;
-            size_t e = xml.find('"', q);
-            if (e == std::string::npos) break;
-            std::string name = xml.substr(q, e - q);
+    // 2. devices and other non-runnable machines, plus everything worth showing on the cabinet. Each
+    //    machine's block is bounded at </machine> before anything is read out of it: a driver's block
+    //    is followed by blocks for every device it references, which carry <description> tags of their own.
+    std::string xml = RunCapture(L"\"" + mameExe + L"\" -listxml" + args, dir);
+    if (verify.empty() && xml.size() <= 64) return;   // MAME did not answer
 
-            size_t tagEnd = xml.find('>', e);
-            if (tagEnd == std::string::npos) break;
-            std::string openTag = xml.substr(e, tagEnd - e);
-            if (openTag.find("runnable=\"no\"") != std::string::npos) outRunnable.erase(name);
+    std::set<std::string> notRunnable;
+    std::map<std::string, MameMeta> meta;
+    size_t at = 0;
+    while ((at = xml.find("<machine name=\"", at)) != std::string::npos) {
+        size_t q = at + 15;
+        size_t e = xml.find('"', q);
+        if (e == std::string::npos) break;
+        std::string name = xml.substr(q, e - q);
 
-            size_t blockEnd = xml.find("</machine>", tagEnd);
-            if (blockEnd == std::string::npos) blockEnd = xml.size();
-            std::string block = xml.substr(tagEnd, blockEnd - tagEnd);
+        size_t tagEnd = xml.find('>', e);
+        if (tagEnd == std::string::npos) break;
+        std::string openTag = xml.substr(e, tagEnd - e);
+        if (openTag.find("runnable=\"no\"") != std::string::npos) notRunnable.insert(name);
 
-            MameMeta m;
-            m.year = XmlTag(block, "year");
-            m.manufacturer = XmlTag(block, "manufacturer");
+        size_t blockEnd = xml.find("</machine>", tagEnd);
+        if (blockEnd == std::string::npos) blockEnd = xml.size();
+        std::string block = xml.substr(tagEnd, blockEnd - tagEnd);
 
-            size_t disp = block.find("<display ");
-            if (disp != std::string::npos) {
-                size_t dEnd = block.find('>', disp);
-                std::string d = block.substr(disp, (dEnd == std::string::npos ? block.size() : dEnd) - disp);
-                try { m.width   = std::stoi(XmlAttr(d, "width")); }   catch (...) {}
-                try { m.height  = std::stoi(XmlAttr(d, "height")); }  catch (...) {}
-                try { m.rotate  = std::stoi(XmlAttr(d, "rotate")); }  catch (...) {}
-                try { m.refresh = std::stod(XmlAttr(d, "refresh")); } catch (...) {}
-            }
-            if (!m.year.empty() || !m.manufacturer.empty() || m.width) outMeta[name] = m;
+        MameMeta m;
+        m.year = XmlTag(block, "year");
+        m.manufacturer = XmlTag(block, "manufacturer");
 
-            at = blockEnd;
+        size_t disp = block.find("<display ");
+        if (disp != std::string::npos) {
+            size_t dEnd = block.find('>', disp);
+            std::string d = block.substr(disp, (dEnd == std::string::npos ? block.size() : dEnd) - disp);
+            try { m.width   = std::stoi(XmlAttr(d, "width")); }   catch (...) {}
+            try { m.height  = std::stoi(XmlAttr(d, "height")); }  catch (...) {}
+            try { m.rotate  = std::stoi(XmlAttr(d, "rotate")); }  catch (...) {}
+            try { m.refresh = std::stod(XmlAttr(d, "refresh")); } catch (...) {}
         }
+        if (!m.year.empty() || !m.manufacturer.empty() || m.width) meta[name] = m;
+
+        at = blockEnd;
+    }
+
+    for (const auto& n : names) {
+        phantom::MameVerdict v;
+        v.runnable = !bad.count(n) && !notRunnable.count(n);
+        auto mi = meta.find(n);
+        if (mi != meta.end()) {
+            v.year = AsciiFold(mi->second.year);
+            v.maker = AsciiFold(mi->second.manufacturer);
+            if (mi->second.width && mi->second.height) {
+                char buf[96];
+                const bool tate = (mi->second.rotate == 90 || mi->second.rotate == 270);
+                if (mi->second.refresh > 0.0)
+                    snprintf(buf, sizeof(buf), "%dx%d @ %.2fHz%s", mi->second.width, mi->second.height, mi->second.refresh, tate ? " TATE" : "");
+                else
+                    snprintf(buf, sizeof(buf), "%dx%d%s", mi->second.width, mi->second.height, tate ? " TATE" : "");
+                v.mode = buf;
+            }
+        }
+        out.push_back(std::move(v));
     }
 }
 
@@ -1118,49 +1154,6 @@ static std::string Ps3TitleFor(const fs::path& romFile) {
 // decorative symbols, and collapses whatever that leaves.
 static std::string JsonEscape(const std::string& in);   // defined below
 
-// What the cabinet reads of a game. The catalog on disk carries more (rom path and name, a
-// duplicate of the video mode) for the PC app and the launcher; the cabinet gets only this.
-struct CabinetRec {
-    std::string system, systemName, id, title, videoMode, year, maker;
-};
-
-// The cabinet receives the catalog in ONE datagram, which this side caps at 60,000 bytes, and
-// keeps at most 512 games (PH_MAX_GAMES). A large library - a folder of MAME sets for FBNeo runs
-// to over a thousand - was simply cut off after the first few hundred records, and since the
-// big arcade systems come first, every other emulator vanished from the cabinet. So the cabinet
-// gets its own file: compact records, the small systems first and the big arcade ones after, and
-// it stops at a whole record. Sending the rest needs the cabinet to ask for pages.
-static const size_t kCabinetBytes = 59000;
-static const size_t kCabinetMaxGames = 500;
-
-static void WriteCabinetCatalog(const std::vector<CabinetRec>& recs, const std::wstring& path) {
-    std::vector<const CabinetRec*> ordered;
-    for (int pass = 0; pass < 3; pass++) {
-        for (const auto& r : recs) {
-            const int rank = (r.system == "fbneo") ? 2 : (r.system == "groovymame") ? 1 : 0;
-            if (rank == pass) ordered.push_back(&r);
-        }
-    }
-
-    std::string out = "{\"games\":[";
-    size_t written = 0;
-    for (const CabinetRec* r : ordered) {
-        std::string rec = std::string("{\"id\":\"") + JsonEscape(r->id) + "\",\"title\":\"" + JsonEscape(r->title) +
-                          "\",\"system\":\"" + JsonEscape(r->system) + "\",\"systemName\":\"" + JsonEscape(r->systemName) +
-                          "\",\"videoMode\":\"" + JsonEscape(r->videoMode) + "\",\"year\":\"" + JsonEscape(r->year) +
-                          "\",\"manufacturer\":\"" + JsonEscape(r->maker) + "\"}";
-        const size_t add = rec.size() + (written ? 1 : 0);
-        if (written >= kCabinetMaxGames || out.size() + add + 3 > kCabinetBytes) break;
-        if (written) out += ",";
-        out += rec;
-        written++;
-    }
-    out += "]}";
-
-    std::ofstream f(path.c_str(), std::ios::binary);
-    f << out;
-}
-
 static std::string AsciiFold(const std::string& in) {
     static const struct { unsigned cp; const char* rep; } MAP[] = {
         { 0x00AE, "" }, { 0x2122, "" }, { 0x00A9, "" },           // (R) (TM) (C)
@@ -1219,339 +1212,242 @@ static std::string JsonEscape(const std::string& in) {
     return out;
 }
 
-// The catalog id behind each row of hListGames, in the same order.
+// ---- the library -----------------------------------------------------------------------------
 //
-// The list shows "[system] Title", which is for reading, not for launching: the title is
-// not the id, and for an 86Box VM it is not even unique. Launching used to recover an id
-// by stripping the "[system] " prefix off that display text, which produced a bare title
-// with no "<key>_" on the front - so the lookup in ExecuteLaunchProcess could never match
-// it and every launch from this window failed with "no emulator for id". Keep the real
-// ids instead.
-static std::vector<std::string> g_listGameIds;
+// What the cabinet browses, and what a launch resolves against: one immutable phantom::Index, replaced
+// whole when a scan publishes a new one. game_index.h says why it is shaped the way it is, and
+// library_scan.h how it is built; this is the part that ties them to the manager's settings and window.
+//
+// The scan runs on its own thread. The window used to freeze for the whole of it, and the cabinet could
+// not be answered until it ended; now the last scan is served from the moment the manager starts, a
+// rescan runs behind it, and what it finds is published as it goes.
+static std::mutex g_libMutex;
+static std::shared_ptr<const phantom::Index> g_index;
+static uint32_t g_lastVer = 0;
+static std::atomic<bool> g_scanning(false);
+static std::atomic<bool> g_scanQueued(false);
+static std::atomic<bool> g_scanQueuedFull(false);
+static std::atomic<bool> g_scanStop(false);
+#define WM_APP_LIBRARY (WM_APP + 1)
 
-// Auto-Scan ROM Directories and build games_catalog.json
-void ScanRomDirectories() {
-    SendMessage(hListGames, LB_RESETCONTENT, 0, 0);
-    g_listGameIds.clear();
+static std::shared_ptr<const phantom::Index> CurrentIndex() {
+    std::lock_guard<std::mutex> lk(g_libMutex);
+    return g_index;
+}
 
-    struct ScanTarget {
-        std::wstring path;
-        std::string system;
-        std::string systemName;
-        std::string videoMode;
-        std::wstring exts;
-    };
+static std::wstring IndexCachePath() { return GetAppDir() + L"\\phantom_index.bin"; }
 
-    std::vector<ScanTarget> targets;
+// Make `ix` what the cabinet sees. A scan that found nothing new changes nothing: publishing bumps the
+// version, and a cabinet in the middle of browsing would throw away every page it had fetched for a
+// library that had not changed.
+static bool PublishIndex(std::shared_ptr<phantom::Index> ix) {
+    const std::shared_ptr<const phantom::Index> cur = CurrentIndex();
+    if (cur && phantom::IndexEquivalent(*cur, *ix)) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_libMutex);
+        uint32_t v = (uint32_t)time(NULL);   // a restart must not reuse a version a cabinet is still holding
+        if (v <= g_lastVer) v = g_lastVer + 1;
+        g_lastVer = v;
+        ix->ver = v;
+        g_index = ix;
+    }
+    if (hMainWnd) PostMessage(hMainWnd, WM_APP_LIBRARY, 0, 0);
+    return true;
+}
+
+// The last scan, so there is a library to serve before the first new scan has finished. It is the answer
+// only for the folders it was made from: a cache from before a folder was changed is not used.
+static void LoadCachedLibrary() {
+    std::shared_ptr<phantom::Index> ix = phantom::LoadIndex(IndexCachePath(), 0);
+    if (!ix) return;
+    for (size_t s = 0; s < ix->sys.size(); s++) {
+        if (ix->lists[1 + s].empty()) continue;
+        EmulatorDef* e = EmuByKey(ix->sys[s].key);
+        if (!e || phantom::scan_detail::Utf8(GetText(e->romsEdit)) != ix->sys[s].root) return;
+    }
+    PublishIndex(ix);
+}
+
+// FBNeo is asked once which games it supports - a folder of MAME sets holds plenty it cannot start - and
+// the answer is kept until the executable changes: asking costs a second or more and the list is ten
+// megabytes of XML. Empty if it cannot be asked, which is read as "do not filter".
+static std::map<std::string, FbneoSet> LoadFbneoSets(const std::wstring& fbExe) {
+    std::map<std::string, FbneoSet> sets;
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (fbExe.empty() || !GetFileAttributesExW(fbExe.c_str(), GetFileExInfoStandard, &a)) return sets;
+
+    char sig[128];
+    snprintf(sig, sizeof(sig), "FBN1\t%lu\t%lu\t%lu", (unsigned long)a.nFileSizeLow,
+             (unsigned long)a.ftLastWriteTime.dwHighDateTime, (unsigned long)a.ftLastWriteTime.dwLowDateTime);
+    const std::wstring cache = GetAppDir() + L"\\fbneo_sets.cache";
+
+    {
+        std::ifstream in(cache.c_str(), std::ios::binary);
+        std::string line;
+        if (in && std::getline(in, line) && line == sig) {
+            while (std::getline(in, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                std::string f[5];
+                size_t at = 0;
+                int n = 0;
+                while (n < 5) {
+                    const size_t tab = line.find('\t', at);
+                    f[n++] = line.substr(at, tab == std::string::npos ? std::string::npos : tab - at);
+                    if (tab == std::string::npos) break;
+                    at = tab + 1;
+                }
+                if (n < 5 || f[0].empty()) continue;
+                FbneoSet s;
+                s.isBios = (f[1] == "1");
+                s.description = f[2];
+                s.year = f[3];
+                s.manufacturer = f[4];
+                sets[f[0]] = s;
+            }
+            if (sets.size() >= 1000) return sets;
+            sets.clear();
+        }
+    }
+
+    std::wstring fbDir;
+    size_t slash = fbExe.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) fbDir = fbExe.substr(0, slash);
+    sets = ParseFbneoDat(RunCapture(L"\"" + fbExe + L"\" -listinfo", fbDir));
+    if (sets.size() < 1000) { sets.clear(); return sets; }
+
+    std::ofstream out(cache.c_str(), std::ios::binary | std::ios::trunc);
+    if (out) {
+        auto clean = [](std::string s) { for (char& c : s) if (c == '\t' || c == '\n' || c == '\r') c = ' '; return s; };
+        out << sig << "\n";
+        for (const auto& kv : sets)
+            out << clean(kv.first) << '\t' << (kv.second.isBios ? "1" : "0") << '\t' << clean(kv.second.description) << '\t'
+                << clean(kv.second.year) << '\t' << clean(kv.second.manufacturer) << "\n";
+    }
+    return sets;
+}
+
+static std::string ExeSignature(const std::wstring& exe) {
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (exe.empty() || !GetFileAttributesExW(exe.c_str(), GetFileExInfoStandard, &a)) return "";
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%lu.%lu.%lu", (unsigned long)a.nFileSizeLow, (unsigned long)a.ftLastWriteTime.dwHighDateTime,
+             (unsigned long)a.ftLastWriteTime.dwLowDateTime);
+    return buf;
+}
+
+static std::vector<phantom::ScanTarget> BuildScanTargets() {
+    std::vector<phantom::ScanTarget> targets;
     for (int i = 0; i < g_emuCount; i++) {
         EmulatorDef& e = g_emus[i];
-        targets.push_back({ GetText(e.romsEdit), e.key, e.sysName, e.videoMode, e.exts });
+        phantom::ScanTarget t;
+        t.key = e.key;
+        t.name = e.sysName;
+        t.videoMode = e.videoMode;
+        t.exts = e.exts;
+        t.roots.push_back(GetText(e.romsEdit));
 
-        // RPCS3 keeps installed titles in its own dev_hdd0, not in a ROMs folder - a
-        // .pkg is an installer, so that is where a PS3 game ends up once it has been
-        // added. Scanned as well as the ROMs path so an installed game is found without
-        // anybody having to point a second setting at the emulator's own directory.
+        // RPCS3 keeps installed titles in its own dev_hdd0, not in a ROMs folder - a .pkg is an installer, so
+        // that is where a PS3 game ends up once it has been added. Scanned as well as the ROMs path so an
+        // installed game is found without anybody pointing a second setting at the emulator's own directory.
         if (!strcmp(e.key, "rpcs3")) {
             std::wstring exe = GetText(e.exeEdit);
             size_t slash = exe.find_last_of(L"\\/");
             if (slash != std::wstring::npos) {
                 std::wstring hdd = exe.substr(0, slash) + L"\\dev_hdd0\\game";
-                if (fs::exists(hdd)) {
-                    targets.push_back({ hdd, e.key, e.sysName, e.videoMode, e.exts });
-                }
+                if (fs::exists(hdd)) t.roots.push_back(hdd);
             }
         }
+        targets.push_back(std::move(t));
     }
+    return targets;
+}
 
-    // Ask MAME for its own names once, so arcade entries list "Battle Garegga (Korea)"
-    // rather than "bgaregga". Empty if MAME is not configured, in which case titles fall
-    // back to the ROM stem.
+static void RunLibraryScan(bool full) {
+    std::vector<phantom::ScanTarget> targets = BuildScanTargets();
+
+    // MAME's own names, so arcade entries list "Battle Garegga (Korea)" rather than "bgaregga". Empty if MAME
+    // is not configured, in which case titles fall back to the ROM stem.
     SetWindowText(hStaticStatus, L"Status: Reading MAME's game list...");
     EmulatorDef* mameDef = EmuByKey("groovymame");
-    std::wstring mameExeForScan = mameDef ? GetText(mameDef->exeEdit) : L"";
-    std::map<std::string, std::string> mameTitles = LoadMameTitles(mameExeForScan);
+    const std::wstring mameExe = mameDef ? GetText(mameDef->exeEdit) : L"";
+    const std::map<std::string, std::string> mameTitles = LoadMameTitles(mameExe);
 
-    // FBNeo is asked once which games it supports: a folder of MAME sets holds plenty it cannot
-    // start, and each of those would sit in the menu failing the moment somebody picked it. If it
-    // cannot be asked (no exe, or an answer that is not a game list) the list is left unfiltered.
-    std::map<std::string, FbneoSet> fbneoSets;
-    {
-        EmulatorDef* fbDef = EmuByKey("fbneo");
-        std::wstring fbExe = fbDef ? GetText(fbDef->exeEdit) : L"";
-        if (!fbExe.empty() && fs::exists(fbExe)) {
-            std::wstring fbDir;
-            size_t slash = fbExe.find_last_of(L"\\/");
-            if (slash != std::wstring::npos) fbDir = fbExe.substr(0, slash);
-            SetWindowText(hStaticStatus, L"Status: Asking FBNeo which games it supports...");
-            fbneoSets = ParseFbneoDat(RunCapture(L"\"" + fbExe + L"\" -listinfo", fbDir));
-            if (fbneoSets.size() < 1000) fbneoSets.clear();
-        }
-    }
-    int fbneoSkipped = 0;
+    EmulatorDef* fbDef = EmuByKey("fbneo");
+    const std::wstring fbExe = fbDef ? GetText(fbDef->exeEdit) : L"";
+    SetWindowText(hStaticStatus, L"Status: Asking FBNeo which games it supports...");
+    const std::map<std::string, FbneoSet> fbneoSets = LoadFbneoSets(fbExe);
 
-    // Ask MAME which of the arcade sets on disk will actually start, before listing any
-    // of them. See FilterRunnableSets.
-    std::set<std::string> runnable;
-    std::map<std::string, MameMeta> mameMeta;
-    {
-        std::vector<std::string> stems;
-        std::wstring mameRoms = mameDef ? GetText(mameDef->romsEdit) : L"";
-        if (!mameRoms.empty() && fs::exists(mameRoms)) {
-            try {
-                for (auto rit = fs::recursive_directory_iterator(
-                            mameRoms, fs::directory_options::skip_permission_denied);
-                     rit != fs::recursive_directory_iterator(); ++rit) {
-                    if (rit.depth() > 5) { rit.disable_recursion_pending(); continue; }
-                    const auto& e = *rit;
-                    if (!e.is_regular_file()) continue;
-                    auto ext = e.path().extension().string();
-                    for (auto& c : ext) c = (char)tolower((unsigned char)c);
-                    if (ext == ".zip" || ext == ".7z" || ext == ".chd") stems.push_back(e.path().stem().string());
-                }
-            } catch (...) {}
-        }
-        if (!stems.empty()) {
-            SetWindowText(hStaticStatus, L"Status: Checking which sets MAME can run...");
-            FilterRunnableSets(mameExeForScan, stems, runnable, mameMeta);
-        }
-    }
-    int skipped = 0;
-    int pkgsSeen = 0;   // PS3 installers found but not listed
-
-    std::wstring catPath = GetAppDir() + L"\\games_catalog.json";
-    std::ofstream catOut; catOut.open(catPath.c_str());
-    std::vector<CabinetRec> cabinetRecs;
-    catOut << "{\n  \"games\": [\n";
-
-    int totalFound = 0;
-
-    for (const auto& target : targets) {
-        if (target.path.empty() || !fs::exists(target.path)) continue;
-
-        try {
-            // Recursive, because games are routinely one-per-folder rather than loose
-            // files - a PS3 title is a directory, a Dreamcast game is a .gdi beside its
-            // tracks, and CHDs often sit in a folder named after the set. Depth is
-            // capped so a ROM drive full of extras does not take all day.
-            std::set<std::string> seenStems;   // one entry per game, not per file
-            for (auto it = fs::recursive_directory_iterator(
-                        target.path, fs::directory_options::skip_permission_denied);
-                 it != fs::recursive_directory_iterator(); ++it) {
-                if (it.depth() > 5) { it.disable_recursion_pending(); continue; }
-                const auto& entry = *it;
-                if (entry.is_regular_file()) {
-                    auto ext = entry.path().extension().string();
-                    for (auto& c : ext) c = tolower(c);
-                    std::string fname = entry.path().filename().string();
-                    std::string lower = fname;
-                    for (auto& c : lower) c = (char)tolower((unsigned char)c);
-
-                    // PS3 games are shipped as .pkg installers, which RPCS3 installs
-                    // rather than runs - and a single title arrives as a dozen of them
-                    // (base, patches, DLC, region fixes). Listing each as a game would
-                    // fill the cabinet with entries that cannot start. They are counted
-                    // and reported instead, and the launchable form is EBOOT.BIN.
-                    if (target.system == "rpcs3" && ext == ".pkg") { pkgsSeen++; continue; }
-
-                    // Each emulator declares the extensions it can open, so a PS2 iso
-                    // does not end up listed under xemu and vice versa. EBOOT.BIN is
-                    // matched by name because it has no distinguishing extension.
-                    std::string exts = WstringToString(target.exts);
-                    bool wanted = (!ext.empty() &&
-                                   (exts.find(ext + ",") != std::string::npos ||
-                                    (exts.size() >= ext.size() &&
-                                     exts.compare(exts.size() - ext.size(), ext.size(), ext) == 0)));
-                    if (target.system == "rpcs3" && lower == "eboot.bin") wanted = true;
-
-                    if (wanted) {
-                        std::string filename = fname;
-                        std::string stem = entry.path().stem().string();
-
-                        // MAME and FBNeo name a set, not a file. A set's CHDs live in a
-                        // folder called after the set - roms/sfiii3/cap-33s-1.chd - so a
-                        // nested file belongs to the folder, and taking its stem instead
-                        // invented "cap-33s-1" and "cap-33s-2" as if they were games.
-                        if (target.system == "groovymame" || target.system == "fbneo") {
-                            std::error_code rc;
-                            fs::path rel = fs::relative(entry.path(), target.path, rc);
-                            if (!rc && rel.has_parent_path() && rel.begin() != rel.end()) {
-                                std::string top = rel.begin()->string();
-                                if (!top.empty() && top != "." && top != "..") stem = top;
-                            }
-                        }
-
-                        // 86Box is a machine per folder, and the file every one of them
-                        // has is called 86box.cfg - so the stem names no VM, and all of
-                        // them would collide on the same catalog id. The folder is the
-                        // machine's name.
-                        if (target.system == "86box") {
-                            std::string n = entry.path().parent_path().filename().string();
-                            if (!n.empty()) stem = n;
-                        }
-
-                        // A compound extension leaves its first half behind:
-                        // "Game.nkit.iso" stems to "Game.nkit", and ".nkit" is a container
-                        // format, not part of the title.
-                        {
-                            const char *containers[] = { ".nkit", ".nkit.gcz", ".decrypted" };
-                            for (const char *c : containers) {
-                                const size_t cl = strlen(c);
-                                if (stem.size() > cl &&
-                                    !_stricmp(stem.c_str() + stem.size() - cl, c)) {
-                                    stem.erase(stem.size() - cl);
-                                    break;
-                                }
-                            }
-                        }
-
-                        // A generic filename says nothing, so name the game after the
-                        // folder holding it, stepping over the layout directories a PS3
-                        // disc carries.
-                        if (lower == "eboot.bin") {
-                            fs::path p = entry.path().parent_path();
-                            for (int up = 0; up < 3; up++) {
-                                std::string n = p.filename().string();
-                                std::string nl = n;
-                                for (auto& c : nl) c = (char)tolower((unsigned char)c);
-                                if (nl != "usrdir" && nl != "ps3_game" && !n.empty()) { stem = n; break; }
-                                p = p.parent_path();
-                            }
-                        }
-
-                        if (!seenStems.insert(stem).second) continue;
-                        // Leave out arcade sets MAME will not start - they would sit in
-                        // the menu failing the moment anybody picked one.
-                        if (target.system == "groovymame" && !runnable.empty() &&
-                            runnable.find(stem) == runnable.end()) {
-                            skipped++;
-                            continue;
-                        }
-                        // The same for FBNeo: a set that is not in its own list, or is only a
-                        // BIOS, which it refuses to start as a game.
-                        if (target.system == "fbneo" && !fbneoSets.empty()) {
-                            auto fi = fbneoSets.find(stem);
-                            if (fi == fbneoSets.end() || fi->second.isBios) {
-                                fbneoSkipped++;
-                                continue;
-                            }
-                        }
-
-                        std::string id = target.system + "_" + stem;
-                        std::string cleanRomPath = entry.path().generic_string();
-
-                        // Arcade sets get MAME's own description, which carries the region.
-                        // FBNeo names its sets the way MAME does ("ssf2t", "kof98"), so the same
-                        // list gives its zips real titles too; a set MAME has no entry for keeps
-                        // the zip's name. Everything else keeps the filename: Dolphin, PCSX2 and
-                        // Flycast have no equivalent list to ask, and inventing titles for them
-                        // would be guessing.
-                        std::string title = stem;
-                        XboxMeta xbox;
-                        if (target.system == "groovymame" || target.system == "fbneo") {
-                            auto it = mameTitles.find(stem);
-                            if (it != mameTitles.end()) {
-                                title = it->second;
-                            } else if (target.system == "fbneo") {
-                                auto fi = fbneoSets.find(stem);
-                                if (fi != fbneoSets.end() && !fi->second.description.empty())
-                                    title = fi->second.description;
-                            }
-                        } else if (target.system == "rpcs3") {
-                            // "NPUA80105" is a title id, not a name. PARAM.SFO has the name.
-                            std::string sfo = Ps3TitleFor(entry.path());
-                            if (!sfo.empty()) title = sfo;
-                        } else if (target.system == "xemu") {
-                            // "eps-h2u.iso" is a release group's filename, not a title. The
-                            // disc's own executable carries the real one, with its publisher
-                            // and build year; the other two are applied further down, where
-                            // year and maker exist.
-                            xbox = XboxMetaFor(entry.path());
-                            if (!xbox.title.empty()) title = xbox.title;
-                        }
-
-                        title = AsciiFold(title);   // the cabinet font is ASCII only
-                        std::wstring listEntry = L"[" + std::wstring(target.system.begin(), target.system.end()) + L"] " +
-                                                StringToWstring(title);
-                        const LRESULT row = SendMessage(hListGames, LB_ADDSTRING, 0, (LPARAM)listEntry.c_str());
-                        if (row >= 0) {
-                            if ((size_t) row >= g_listGameIds.size())
-                                g_listGameIds.resize((size_t) row + 1);
-                            g_listGameIds[(size_t) row] = id;
-                        }
-
-                        if (totalFound > 0) catOut << ",\n";
-                        catOut << "    {\n";
-                        catOut << "      \"id\": \"" << id << "\",\n";
-                        catOut << "      \"title\": \"" << JsonEscape(title) << "\",\n";
-                        catOut << "      \"system\": \"" << target.system << "\",\n";
-                        catOut << "      \"systemName\": \"" << target.systemName << "\",\n";
-                        catOut << "      \"romName\": \"" << filename << "\",\n";
-                        catOut << "      \"romPath\": \"" << cleanRomPath << "\",\n";
-                        // Real numbers for arcade sets, straight out of MAME's own -listxml:
-                        // the actual screen geometry, refresh and orientation, plus year and
-                        // manufacturer. The per-system strings below are only a fallback for
-                        // the emulators that have no equivalent to ask.
-                        std::string videoMode = target.videoMode;
-                        std::string year, maker;
-                        if (!xbox.year.empty()) year = xbox.year;
-                        if (!xbox.maker.empty()) maker = xbox.maker;
-                        if (target.system == "groovymame") {
-                            auto mi = mameMeta.find(stem);
-                            if (mi != mameMeta.end()) {
-                                year = mi->second.year;
-                                maker = mi->second.manufacturer;
-                                if (mi->second.width && mi->second.height) {
-                                    char buf[96];
-                                    if (mi->second.refresh > 0.0)
-                                        snprintf(buf, sizeof(buf), "%dx%d @ %.2fHz%s",
-                                                 mi->second.width, mi->second.height, mi->second.refresh,
-                                                 (mi->second.rotate == 90 || mi->second.rotate == 270) ? " TATE" : "");
-                                    else
-                                        snprintf(buf, sizeof(buf), "%dx%d%s",
-                                                 mi->second.width, mi->second.height,
-                                                 (mi->second.rotate == 90 || mi->second.rotate == 270) ? " TATE" : "");
-                                    videoMode = buf;
-                                }
-                            }
-                        }
-
-                        if (target.system == "fbneo") {
-                            auto fi = fbneoSets.find(stem);
-                            if (fi != fbneoSets.end()) {
-                                year  = AsciiFold(fi->second.year);
-                                maker = AsciiFold(fi->second.manufacturer);
-                            }
-                        }
-
-                        catOut << "      \"videoMode\": \"" << JsonEscape(videoMode) << "\",\n";
-                        catOut << "      \"year\": \"" << JsonEscape(year) << "\",\n";
-                        catOut << "      \"manufacturer\": \"" << JsonEscape(maker) << "\",\n";
-                        catOut << "      \"resolution\": \"" << JsonEscape(videoMode) << "\"\n";
-                        catOut << "    }";
-                        cabinetRecs.push_back({ target.system, target.systemName, id, title, videoMode, year, maker });
-                        totalFound++;
-                    }
-                }
-            }
-        } catch (...) {}
+    phantom::ScanServices svc;
+    svc.mameTitles = &mameTitles;
+    svc.fbneoSets = &fbneoSets;
+    svc.ps3Title = [](const std::wstring& p) { return Ps3TitleFor(fs::path(p)); };
+    svc.xboxMeta = [](const std::wstring& p) {
+        XboxMeta m = XboxMetaFor(fs::path(p));
+        phantom::Derived d;
+        d.title = m.title;
+        d.year = m.year;
+        d.maker = m.maker;
+        return d;
+    };
+    svc.fold = [](const std::string& s) { return AsciiFold(s); };
+    if (!mameExe.empty() && fs::exists(mameExe)) {
+        svc.mameVerify = [mameExe](const std::vector<std::string>& names, std::vector<phantom::MameVerdict>& out) {
+            MameVerifyBatch(mameExe, names, out);
+        };
+        svc.mameFingerprint = ExeSignature(mameExe);
     }
 
-    // No fallback catalog. This used to invent four arcade titles whenever a scan found
-    // nothing, so a cabinet with no ROM paths configured still showed a menu full of games
-    // it could not launch - every one of them failing at the moment somebody pressed the
-    // button. An empty catalog is the truth, and the core renders it as a clear "library is
-    // empty, run Auto-Scan" message rather than a dead list.
+    phantom::ScanOptions opt;
+    opt.full = full;
+    opt.threads = (int)std::min(8u, std::max(2u, std::thread::hardware_concurrency()));
+    opt.rejectsFile = GetAppDir() + L"\\mame_rejects.txt";
+    opt.stop = &g_scanStop;
 
-    catOut << "\n  ]\n}\n";
-    catOut.close();
-    WriteCabinetCatalog(cabinetRecs, GetAppDir() + L"\\games_catalog_cabinet.json");
+    DWORD lastStatus = 0;
+    auto progress = [&](const std::string& s) {
+        const DWORD now = GetTickCount();
+        if (now - lastStatus < 120) return;   // the window repaints for every message; a scan can send hundreds
+        lastStatus = now;
+        SetWindowText(hStaticStatus, (L"Status: " + StringToWstring(s)).c_str());
+    };
+    auto publish = [&](std::shared_ptr<phantom::Index> ix, bool final) {
+        const std::shared_ptr<phantom::Index> keep = ix;
+        const bool changed = PublishIndex(ix);
+        if (final && changed) phantom::SaveIndex(*keep, IndexCachePath());
+    };
 
-    std::wstring status = L"Status: Scanned " + std::to_wstring(totalFound) + L" game(s). Catalog saved.";
-    if (skipped > 0) status += L" (" + std::to_wstring(skipped) + L" set(s) left out: MAME cannot run them.)";
-    if (fbneoSkipped > 0) status += L" (" + std::to_wstring(fbneoSkipped) + L" file(s) left out: FBNeo does not support them.)";
-    if (pkgsSeen > 0) status += L" (" + std::to_wstring(pkgsSeen) +
-                               L" PS3 .pkg installer(s) ignored - install them in RPCS3 first.)";
+    const phantom::ScanStats st = phantom::RunScan(targets, svc, opt, CurrentIndex(), publish, progress);
+
+    char took[32];
+    snprintf(took, sizeof(took), "%.1f", st.totalMs / 1000.0);
+    std::wstring status = L"Status: " + std::to_wstring(st.listed) + L" game(s) listed in " + StringToWstring(took) + L" s.";
+    if (st.mameRejected + st.mameRemembered > 0)
+        status += L" (" + std::to_wstring(st.mameRejected + st.mameRemembered) + L" set(s) left out: MAME cannot run them.)";
+    if (st.fbneoSkipped > 0) status += L" (" + std::to_wstring(st.fbneoSkipped) + L" file(s) left out: FBNeo does not support them.)";
+    if (st.pkgs > 0) status += L" (" + std::to_wstring(st.pkgs) + L" PS3 .pkg installer(s) ignored - install them in RPCS3 first.)";
     SetWindowText(hStaticStatus, status.c_str());
+}
+
+static DWORD WINAPI LibraryScanThread(LPVOID param) {
+    try { RunLibraryScan(param != NULL); } catch (...) {
+        SetWindowText(hStaticStatus, L"Status: [FAILED] the library scan stopped with an error.");
+    }
+    g_scanning = false;
+    if (g_scanQueued.exchange(false)) StartLibraryScan(g_scanQueuedFull.exchange(false));
+    return 0;
+}
+
+// Scan the ROM folders in the background. `full` forgets everything learned before (what each file turned
+// out to be, what MAME rejected) and asks again; otherwise only files that are new or changed are looked at.
+// A request made while a scan is running is not lost: it runs when that one ends.
+void StartLibraryScan(bool full) {
+    if (g_scanning.exchange(true)) {
+        if (full) g_scanQueuedFull = true;
+        g_scanQueued = true;
+        return;
+    }
+    HANDLE h = CreateThread(NULL, 0, LibraryScanThread, (LPVOID)(uintptr_t)(full ? 1 : 0), 0, NULL);
+    if (h) CloseHandle(h); else g_scanning = false;
 }
 
 std::atomic<bool> g_launchInProgress(false);
@@ -1636,33 +1532,17 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
         return false;
     }
 
-    // Use the path the scan actually recorded. Rebuilding it from the ROMs folder and
-    // the stem only works for a file sitting directly in that folder, which stopped
-    // being true once the scan went recursive: an installed PS3 game lives under
-    // RPCS3's own dev_hdd0, so the reconstruction produced C:\Games\PS3\NPUA80105 and
-    // RPCS3 refused it as an invalid folder. The catalog already knows the real path.
+    // Use the path the scan actually recorded. Rebuilding it from the ROMs folder and the stem only works for
+    // a file sitting directly in that folder, which stopped being true once the scan went recursive: an
+    // installed PS3 game lives under RPCS3's own dev_hdd0, so the reconstruction produced C:\Games\PS3\NPUA80105
+    // and RPCS3 refused it as an invalid folder. The index knows the real path, and finds it by id in
+    // constant time - this used to read the whole catalog file and search it as text, on every launch.
     std::wstring wStem = StringToWstring(stem);
     std::wstring romPath;
-    {
-        std::ifstream cf(WstringToString(GetAppDir() + L"\\games_catalog.json").c_str());
-        if (cf.is_open()) {
-            std::stringstream ss; ss << cf.rdbuf();
-            std::string cat = ss.str();
-            std::string needle = "\"id\": \"" + gameId + "\"";
-            size_t at = cat.find(needle);
-            if (at != std::string::npos) {
-                size_t rp = cat.find("\"romPath\"", at);
-                size_t end = cat.find("}", at);
-                if (rp != std::string::npos && (end == std::string::npos || rp < end)) {
-                    size_t q1 = cat.find('"', cat.find(':', rp));
-                    size_t q2 = (q1 == std::string::npos) ? std::string::npos : cat.find('"', q1 + 1);
-                    if (q2 != std::string::npos) {
-                        std::string p = cat.substr(q1 + 1, q2 - q1 - 1);
-                        for (auto& c : p) if (c == '/') c = '\\';
-                        if (!p.empty()) romPath = StringToWstring(p);
-                    }
-                }
-            }
+    if (std::shared_ptr<const phantom::Index> ix = CurrentIndex()) {
+        if (const phantom::Rec* r = ix->Find(gameId.c_str())) {
+            romPath = StringToWstring(ix->Rom(*r));
+            for (auto& c : romPath) if (c == L'/') c = L'\\';
         }
     }
 
@@ -1830,20 +1710,44 @@ DWORD WINAPI HttpThreadProc(LPVOID lpParam) {
             buf[r] = 0;
             std::string req(buf);
             if (req.find("GET /catalog.json") != std::string::npos || req.find("GET / ") != std::string::npos) {
-                std::wstring catPath = GetAppDir() + L"\\games_catalog.json";
-                std::ifstream f; f.open(catPath.c_str());
-                std::string body = "";
-                if (f.is_open()) {
-                    std::stringstream ss;
-                    ss << f.rdbuf();
-                    body = ss.str();
-                } else {
-                    body = "{\"games\":[]}";
-                }
+                // Streamed in pieces and ended by closing the connection: a library of hundreds of thousands is
+                // far too big to build as one string first.
+                const std::string head = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+                                         "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+                send(clientSock, head.c_str(), (int)head.length(), 0);
 
-                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + 
-                                   std::to_string(body.length()) + "\r\nConnection: close\r\n\r\n" + body;
-                send(clientSock, resp.c_str(), (int)resp.length(), 0);
+                std::shared_ptr<const phantom::Index> ix = CurrentIndex();
+                std::string chunk = "{\"games\":[";
+                auto flush = [&]() {
+                    const char* p = chunk.data();
+                    size_t n = chunk.size();
+                    while (n) {
+                        int k = send(clientSock, p, (int)std::min<size_t>(n, 1u << 20), 0);
+                        if (k <= 0) { chunk.clear(); return false; }
+                        p += k;
+                        n -= (size_t)k;
+                    }
+                    chunk.clear();
+                    return true;
+                };
+                bool ok = true;
+                if (ix) {
+                    for (size_t i = 0; i < ix->Total() && ok; i++) {
+                        const phantom::Rec& r = ix->recs[ix->lists[0][i]];
+                        const char* rom = ix->Rom(r);
+                        const char* slash = strrchr(rom, '/');
+                        if (i) chunk += ",";
+                        chunk += "{\"id\":\"" + JsonEscape(ix->Id(r)) + "\",\"title\":\"" + JsonEscape(ix->Title(r)) +
+                                 "\",\"system\":\"" + JsonEscape(ix->sys[r.sys].key) + "\",\"systemName\":\"" +
+                                 JsonEscape(ix->sys[r.sys].name) + "\",\"romName\":\"" + JsonEscape(slash ? slash + 1 : rom) +
+                                 "\",\"romPath\":\"" + JsonEscape(rom) + "\",\"videoMode\":\"" + JsonEscape(ix->Str(r.mode)) +
+                                 "\",\"year\":\"" + JsonEscape(ix->Str(r.year)) + "\",\"manufacturer\":\"" +
+                                 JsonEscape(ix->Str(r.maker)) + "\",\"resolution\":\"" + JsonEscape(ix->Str(r.mode)) + "\"}";
+                        if (chunk.size() > (1u << 18)) ok = flush();
+                    }
+                }
+                chunk += "]}";
+                if (ok) flush();
             } else {
                 std::string notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
                 send(clientSock, notFound.c_str(), (int)notFound.length(), 0);
@@ -1941,21 +1845,59 @@ DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
                 std::string reply = "PHANTOM_HOST_ONLINE:" + std::to_string(port) + ":8088";
                 sendto(g_udpSocket, reply.c_str(), (int)reply.length(), 0, (sockaddr*)&clientAddr, clientLen);
             } else if (msg == "GET_CATALOG") {
-                // The cabinet's own, compact catalog (see WriteCabinetCatalog), else the full one.
-                std::wstring catPath = GetAppDir() + L"\\games_catalog_cabinet.json";
-                if (!fs::exists(catPath)) catPath = GetAppDir() + L"\\games_catalog.json";
-                std::ifstream f; f.open(catPath.c_str(), std::ios::binary);
-                std::string catData = "";
-                if (f.is_open()) {
-                    std::stringstream ss;
-                    ss << f.rdbuf();
-                    catData = ss.str();
+                // The older cabinets' way: the whole list in one datagram. They get a compact one, the small
+                // systems first, so a long arcade list cannot crowd every other emulator off it.
+                std::shared_ptr<const phantom::Index> ix = CurrentIndex();
+                std::string catData = ix ? phantom::CompactCatalogJson(*ix) : "{\"games\":[]}";
+                sendto(g_udpSocket, catData.c_str(), (int)std::min<size_t>(catData.length(), 60000), 0, (sockaddr*)&clientAddr, clientLen);
+            } else if (msg == "CATINFO" || msg.rfind("LETTERS:", 0) == 0 || msg.rfind("LIST:", 0) == 0) {
+                // The paged catalog. Each answer is one datagram of a few kilobytes at most, however big the library.
+                std::string reply;
+                if (phantom::AnswerCatalogRequest(CurrentIndex(), g_scanning.load(), msg, reply))
+                    sendto(g_udpSocket, reply.c_str(), (int)reply.length(), 0, (sockaddr*)&clientAddr, clientLen);
+            } else if (msg == "RESCAN") {
+                // Y on the cabinet: look for new and changed games now. Only what changed is examined.
+                StartLibraryScan(false);
+                const char* reply = "RESCAN:OK";
+                sendto(g_udpSocket, reply, (int)strlen(reply), 0, (sockaddr*)&clientAddr, clientLen);
+            } else if (msg.rfind("LAUNCH:@", 0) == 0) {
+                // A launch by position - LAUNCH:@<version>:<list>:<index>[:kbd=N] - which is how the paged cabinet
+                // asks: it holds a window of the list, not every id. The version is what makes this safe: if the
+                // library has been rescanned since the cabinet fetched the page, the position may now be a different
+                // game, and the answer is "stale", not a launch of whatever is there.
+                std::string spec = msg.substr(8);
+                while (!spec.empty() && (spec.back() == '\r' || spec.back() == '\n' || spec.back() == ' ')) spec.pop_back();
+                g_misterKeyboard.store(spec.find(":kbd=1") != std::string::npos);
+
+                std::string reply;
+                const std::shared_ptr<const phantom::Index> ix = CurrentIndex();
+                uint32_t ver = 0, at = 0;
+                std::vector<std::string> f;
+                {
+                    size_t pos = 0;
+                    for (int n = 0; n < 4; n++) {
+                        const size_t c = spec.find(':', pos);
+                        f.push_back(spec.substr(pos, c == std::string::npos ? std::string::npos : c - pos));
+                        if (c == std::string::npos) break;
+                        pos = c + 1;
+                    }
                 }
-                if (catData.empty()) {
-                    catData = "{\"games\":[]}";
+                const bool parsed = f.size() >= 3 && phantom::detail::ToU32(f[0], ver) && phantom::detail::ToU32(f[2], at);
+                if (!parsed) {
+                    reply = "ACK:LAUNCH:BAD";
+                } else if (!ix || ix->ver != ver) {
+                    reply = "ACK:LAUNCH:STALE:" + std::to_string(ix ? ix->ver : 0);
+                } else {
+                    const phantom::Rec* r = ix->RecAt(ix->ListFor(f[1]), at);
+                    if (!r) {
+                        reply = "ACK:LAUNCH:NOTFOUND";
+                    } else {
+                        const std::string id = ix->Id(*r);
+                        LaunchGame(id, misterClientIp);
+                        reply = "ACK:LAUNCH:OK:" + id;
+                    }
                 }
-                int sendLen = (int)std::min(catData.length(), (size_t)60000);
-                sendto(g_udpSocket, catData.c_str(), sendLen, 0, (sockaddr*)&clientAddr, clientLen);
+                sendto(g_udpSocket, reply.c_str(), (int)reply.length(), 0, (sockaddr*)&clientAddr, clientLen);
             } else if (msg.rfind("LAUNCH:", 0) == 0) {
                 // MiSTer requested emulator game launch!
                 std::string gameId = msg.substr(7);
@@ -2019,10 +1961,22 @@ DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
 void EnsureFirewallRules() {
     wchar_t exePath[MAX_PATH];
     GetModuleFileName(NULL, exePath, MAX_PATH);
+    const std::wstring path(exePath);
 
-    std::wstring cmd = L"advfirewall firewall add rule name=\"Phantom Arcade Manager\" dir=in action=allow program=\"" + 
-                       std::wstring(exePath) + L"\" enable=yes profile=any";
-    ShellExecute(NULL, L"runas", L"netsh", cmd.c_str(), NULL, SW_HIDE);
+    // Listing rules needs no elevation, so look first. This used to add a rule on every start, which put an
+    // elevation prompt in front of the user each time and left a duplicate rule behind each time - dozens of
+    // them. Done on its own thread: netsh takes a moment, and nothing waits on the answer.
+    std::thread([path]() {
+        std::string listing = RunCapture(L"netsh advfirewall firewall show rule name=\"Phantom Arcade Manager\" verbose", L"");
+        std::string want = WstringToString(path);
+        for (char& c : listing) c = (char)tolower((unsigned char)c);
+        for (char& c : want) c = (char)tolower((unsigned char)c);
+        if (!want.empty() && listing.find(want) != std::string::npos) return;   // this program is already allowed
+
+        std::wstring cmd = L"advfirewall firewall add rule name=\"Phantom Arcade Manager\" dir=in action=allow program=\"" +
+                           path + L"\" enable=yes profile=any";
+        ShellExecute(NULL, L"runas", L"netsh", cmd.c_str(), NULL, SW_HIDE);
+    }).detach();
 }
 
 void ToggleDaemon() {
@@ -2063,6 +2017,18 @@ void ToggleDaemon() {
         SetWindowText(hBtnToggleDaemon, L"Start Background Daemon");
         SetWindowText(hStaticStatus, L"Status: Daemon Stopped");
     }
+}
+
+// Launch whatever is highlighted in the manager's own list.
+static void LaunchSelectedGame() {
+    const int sel = (int)SendMessage(hListGames, LB_GETCURSEL, 0, 0);
+    std::shared_ptr<const phantom::Index> ix = CurrentIndex();
+    const phantom::Rec* r = (sel == LB_ERR || !ix) ? nullptr : ix->RecAt(0, (size_t)sel);
+    if (!r) {
+        SetWindowText(hStaticStatus, L"Status: pick a game from the list first.");
+        return;
+    }
+    LaunchGame(ix->Id(*r));
 }
 
 // Window Procedure
@@ -2108,7 +2074,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         y += 36;
         CreateWindow(L"STATIC", L"Games Catalog (Double-click or press Launch to test CRT stream):", WS_CHILD | WS_VISIBLE, 20, y, 500, 18, hWnd, NULL, hInst, NULL);
         y += 18;
-        hListGames = CreateWindow(L"LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY, 20, y, 620, 120, hWnd, (HMENU)IDC_LIST_GAMES, hInst, NULL);
+        // No-data and owner-drawn: the list box keeps a count and asks for the text of whatever row is on screen,
+        // so a library of hundreds of thousands costs it nothing. (A normal list box stores every string.)
+        hListGames = CreateWindow(L"LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NODATA | LBS_OWNERDRAWFIXED,
+                                  20, y, 620, 120, hWnd, (HMENU)IDC_LIST_GAMES, hInst, NULL);
 
         // Status Bar
         y += 128;
@@ -2124,9 +2093,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         if (wmId == IDC_LIST_GAMES && event == LBN_DBLCLK) {
             // Double-click to launch game directly
-            int sel = (int)SendMessage(hListGames, LB_GETCURSEL, 0, 0);
-            if (sel != LB_ERR && (size_t) sel < g_listGameIds.size())
-                LaunchGame(g_listGameIds[(size_t) sel]);
+            LaunchSelectedGame();
             break;
         }
 
@@ -2153,17 +2120,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SaveConfiguration();
             break;
         case IDC_BTN_SCAN_ROMS:
-            ScanRomDirectories();
+            // The button is the "look again from scratch" one; the cabinet's Y button is the quick one.
+            StartLibraryScan(true);
             break;
-        case IDC_BTN_LAUNCH_GAME: {
-            int sel = (int)SendMessage(hListGames, LB_GETCURSEL, 0, 0);
-            if (sel == LB_ERR || (size_t) sel >= g_listGameIds.size()) {
-                SetWindowText(hStaticStatus, L"Status: pick a game from the list first.");
-                break;
-            }
-            LaunchGame(g_listGameIds[(size_t) sel]);
+        case IDC_BTN_LAUNCH_GAME:
+            LaunchSelectedGame();
             break;
-        }
         case IDC_BTN_TOGGLE_DAEMON:
             ToggleDaemon();
             break;
@@ -2171,7 +2133,41 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
     }
 
+    case WM_APP_LIBRARY: {
+        std::shared_ptr<const phantom::Index> ix = CurrentIndex();
+        SendMessage(hListGames, LB_SETCOUNT, (WPARAM)(ix ? ix->Total() : 0), 0);
+        InvalidateRect(hListGames, NULL, TRUE);
+        break;
+    }
+
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* mi = (MEASUREITEMSTRUCT*)lParam;
+        if (mi->CtlID == IDC_LIST_GAMES) { mi->itemHeight = 16; return TRUE; }
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)lParam;
+        if (di->CtlID != IDC_LIST_GAMES) return DefWindowProc(hWnd, msg, wParam, lParam);
+        if ((int)di->itemID < 0) return TRUE;   // an empty list asks to draw its focus rectangle
+
+        const bool selected = (di->itemState & ODS_SELECTED) != 0;
+        FillRect(di->hDC, &di->rcItem, GetSysColorBrush(selected ? COLOR_HIGHLIGHT : COLOR_WINDOW));
+        SetBkMode(di->hDC, TRANSPARENT);
+        SetTextColor(di->hDC, GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT));
+
+        std::wstring text;
+        std::shared_ptr<const phantom::Index> ix = CurrentIndex();
+        if (const phantom::Rec* r = ix ? ix->RecAt(0, di->itemID) : nullptr)
+            text = L"[" + StringToWstring(ix->sys[r->sys].key) + L"] " + StringToWstring(ix->Title(*r));
+        RECT rc = di->rcItem;
+        rc.left += 3;
+        DrawTextW(di->hDC, text.c_str(), (int)text.size(), &rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        return TRUE;
+    }
+
     case WM_DESTROY:
+        g_scanStop = true;
         if (g_daemonRunning) {
             ToggleDaemon();
         }
@@ -2210,9 +2206,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
     UpdateWindow(hMainWnd);
 
     // Initial scan and start daemon immediately
-    EnsureFirewallRules();
-    ScanRomDirectories();
+    // --no-firewall: a second copy run for testing must not raise the elevation prompt again.
+    if (!wcsstr(lpCmdLine, L"--no-firewall")) EnsureFirewallRules();
+    LoadCachedLibrary();     // the cabinet can be answered from the first moment
     ToggleDaemon();
+    StartLibraryScan(false); // and anything new is found behind it, without freezing this window
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {

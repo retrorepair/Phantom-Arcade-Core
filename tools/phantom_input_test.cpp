@@ -34,11 +34,17 @@
 #include <unistd.h>
 
 #include "phantom.h"
+#include "phantom_ui.h"
 #include "user_io.h" /* JOY_* - the same bit values the core uses (found via -I hps_linux/src) */
+#include "../host/game_index.h" /* the daemon's own index and reply code: the fake host below answers with it */
 
 /* The Groovy core's ten pad positions in order - A, B, X, Y, L, R, Select, Start, L2, R2 - as bits
  * 4..13 of the mask. user_io.h's JOY_SELECT/JOY_START (0x40/0x80) are the older names for what are
  * X and Y here. */
+#define GJ_L      0x0100
+#define GJ_R      0x0200
+#define GJ_L2     0x1000
+#define GJ_R2     0x2000
 #define GJ_X      0x0040
 #define GJ_Y      0x0080
 #define GJ_SELECT 0x0400
@@ -93,6 +99,59 @@ static std::mutex               g_mx;
 static std::vector<std::string> g_rx;
 static std::atomic<bool>        g_stop{false};
 
+/* What the fake host's library is, and how it behaves. The paged catalog is answered by the daemon's own code
+ * (host/game_index.h), so each side of the wire is tested against the other's real implementation. */
+static std::mutex                            g_ix_mx;
+static std::shared_ptr<const phantom::Index> g_ix;
+static std::atomic<int> g_host_paged{1}; /* 1: speaks the paged catalog; 0: an older daemon that only knows GET_CATALOG */
+static std::atomic<int> g_drop_lists{0}; /* swallow this many LIST requests, to see them asked for again */
+static std::atomic<int> g_scanning{0};
+
+static std::shared_ptr<const phantom::Index> cur_ix()
+{
+    std::lock_guard<std::mutex> lk(g_ix_mx);
+    return g_ix;
+}
+static void set_ix(std::shared_ptr<const phantom::Index> ix)
+{
+    std::lock_guard<std::mutex> lk(g_ix_mx);
+    g_ix = ix;
+}
+
+static std::shared_ptr<phantom::Index> make_small(unsigned ver)
+{
+    phantom::IndexBuilder b;
+    int d = b.AddSystem("dolphin", "Nintendo GameCube / Wii", "/r/d");
+    int x = b.AddSystem("xemu", "Microsoft Xbox", "/r/x");
+    int m = b.AddSystem("groovymame", "GroovyMAME Arcade", "/r/m");
+    b.Add(d, "dolphin_Galaxy", "Super Mario Galaxy", "/r/d/g.iso", "", "", "", 1, 1);
+    b.Add(x, "xemu_Halo2", "Halo 2", "/r/x/h.iso", "", "", "", 1, 1);
+    b.Add(m, "groovymame_sf2", "Street Fighter II", "/r/m/sf2.zip", "", "", "", 1, 1);
+    return b.Finish(ver);
+}
+
+/* n games over three systems, titles spread across every letter plus some digits first. */
+static std::shared_ptr<phantom::Index> make_big(unsigned n, unsigned ver)
+{
+    phantom::IndexBuilder b;
+    int m = b.AddSystem("groovymame", "GroovyMAME Arcade", "/r/m");
+    int d = b.AddSystem("dolphin", "Nintendo GameCube / Wii", "/r/d");
+    int x = b.AddSystem("xemu", "Microsoft Xbox", "/r/x");
+    for (unsigned i = 0; i < n; i++) {
+        const int         s = (i % 10) < 6 ? m : (i % 10) < 9 ? d : x;
+        const char *const key = s == m ? "groovymame" : s == d ? "dolphin" : "xemu";
+        char title[64];
+        if (i % 40 == 0)
+            std::snprintf(title, sizeof(title), "%u Game", i);
+        else
+            std::snprintf(title, sizeof(title), "%c%c Title %u", 'A' + (int) ((i * 7) % 26), 'a' + (int) ((i * 11) % 26), i);
+        char id[64];
+        std::snprintf(id, sizeof(id), "%s_set%u", key, i);
+        b.Add(s, id, title, "/r/x.zip", "15kHz Native", "1990", "Capcom", i, i);
+    }
+    return b.Finish(ver);
+}
+
 static const char *CATALOG =
     "{\"games\":["
     "{\"id\":\"dolphin_Galaxy\",\"title\":\"Super Mario Galaxy\",\"system\":\"dolphin\"},"
@@ -119,7 +178,26 @@ static void host_thread(int fd)
             const char *r = "PHANTOM_HOST_ONLINE";
             sendto(fd, r, strlen(r), 0, (sockaddr *) &from, fl);
         } else if (m == "GET_CATALOG") {
-            sendto(fd, CATALOG, strlen(CATALOG), 0, (sockaddr *) &from, fl);
+            std::string body = g_host_paged ? phantom::CompactCatalogJson(*cur_ix()) : std::string(CATALOG);
+            sendto(fd, body.data(), body.size(), 0, (sockaddr *) &from, fl);
+        } else if (g_host_paged && (m == "CATINFO" || m.rfind("LETTERS:", 0) == 0 || m.rfind("LIST:", 0) == 0)) {
+            if (m.rfind("LIST:", 0) == 0 && g_drop_lists > 0) {
+                g_drop_lists--;
+                continue;
+            }
+            std::string r;
+            if (phantom::AnswerCatalogRequest(cur_ix(), g_scanning != 0, m, r))
+                sendto(fd, r.data(), r.size(), 0, (sockaddr *) &from, fl);
+        } else if (g_host_paged && m == "RESCAN") {
+            const char *r = "RESCAN:OK";
+            sendto(fd, r, strlen(r), 0, (sockaddr *) &from, fl);
+        } else if (g_host_paged && m.rfind("LAUNCH:@", 0) == 0) {
+            /* what the daemon does: refuse a position quoted against a library that is no longer current */
+            unsigned ver = 0;
+            std::string r = "ACK:LAUNCH:OK:x";
+            if (std::sscanf(m.c_str(), "LAUNCH:@%u:", &ver) != 1 || ver != cur_ix()->ver)
+                r = "ACK:LAUNCH:STALE:" + std::to_string(cur_ix()->ver);
+            sendto(fd, r.data(), r.size(), 0, (sockaddr *) &from, fl);
         } else if (m == "STATUS") {
             int         mode = g_status_mode;
             const char *r    = mode == 1 ? "STATUS:RUNNING" : mode == 2 ? "STATUS:IDLE" : nullptr;
@@ -195,6 +273,33 @@ static void check(bool ok, const char *fmt, ...)
 
 static void section(const char *s) { std::printf("\n%s\n", s); }
 
+/* Where a paged launch would go: press A, read the LAUNCH it sent, press B to leave the loading screen. */
+struct Pos {
+    bool        ok  = false;
+    unsigned    ver = 0;
+    std::string list;
+    int         index = -1;
+};
+static Pos launch_here()
+{
+    int n0 = count_rx("LAUNCH:@");
+    tap(JOY_BTN1, 40);
+    Pos p;
+    if (count_rx("LAUNCH:@") == n0)
+        return p;
+    char     list[64] = "";
+    unsigned ver      = 0;
+    int      idx      = -1;
+    if (std::sscanf(last_rx("LAUNCH:@").c_str(), "LAUNCH:@%u:%63[^:]:%d", &ver, list, &idx) == 3) {
+        p.ok    = true;
+        p.ver   = ver;
+        p.list  = list;
+        p.index = idx;
+    }
+    tap(JOY_BTN2, 40); /* B: back out of the loading screen */
+    return p;
+}
+
 /* Does the launcher's settings file contain this line? */
 static bool ini_has(const char *line)
 {
@@ -239,6 +344,7 @@ int main()
         timeval tv { 0, 50000 };
         setsockopt(hfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
+    set_ix(make_small(41));
     std::thread host(host_thread, hfd);
 
     phantom_init();
@@ -365,10 +471,11 @@ int main()
     phantom_idle_enter();
     pump(2200); /* past the takeover guard */
 
-    int catalog0 = count_rx("GET_CATALOG");
+    int rescan0 = count_rx("RESCAN"), info0 = count_rx("CATINFO");
     tap(GJ_Y);
-    check(count_rx("GET_CATALOG") > catalog0, "Y asked the host for the catalog again");
     pump(400);
+    check(count_rx("RESCAN") > rescan0, "Y asked the host to look for new and changed games");
+    check(count_rx("CATINFO") > info0, "...and for its library again");
 
     launches_before = count_rx("LAUNCH:");
     tap(GJ_SELECT); /* adjust page opens with the bottom edge selected */
@@ -511,6 +618,165 @@ int main()
 
     /* 7g: nothing to protect once the launcher is up. */
     check(phantom_session_ended(PHANTOM_END_CLOSE) == 0, "with the launcher already showing, the caller just closes");
+
+    /* ---------------------------------------------------------------------------- */
+    section("8. a library of 50,000 titles, fetched a page at a time");
+    phantom_idle_leave();   /* put a game on, and take the screen back, to start from a known place */
+    pump(100);
+    phantom_idle_enter();
+    pump(2200);             /* past the takeover guard */
+
+    ph_ui rows_probe;
+    ph_ui_init(&rows_probe, 0, PH_CANVAS_W, PH_CANVAS_H);
+    const int ROWS = ph_ui_rows(&rows_probe);
+    check(ROWS > 5, "the list shows %d rows", ROWS);
+
+    const unsigned BIGN = 50000;
+    auto big = make_big(BIGN, 777);
+    set_ix(big);
+    tap(GJ_Y);
+    pump(700);
+    check(phantom_title_count() == (int) BIGN, "the cabinet reports %d titles (expected %u)", phantom_title_count(), BIGN);
+
+    /* bring the cursor to the first title of the All tab */
+    Pos p = launch_here();
+    for (int i = 0; i < 12 && p.ok && p.list != "*"; i++) {
+        tap(GJ_R);
+        pump(60);
+        p = launch_here();
+    }
+    tap(GJ_R);
+    pump(60);
+    tap(GJ_L);
+    pump(150);
+    p = launch_here();
+    check(p.ok && p.ver == 777 && p.list == "*" && p.index == 0, "the first launch quotes version %u, list '%s', index %d", p.ver, p.list.c_str(), p.index);
+
+    for (int i = 0; i < 3; i++) tap(JOY_DOWN, 30);
+    p = launch_here();
+    check(p.ok && p.index == 3, "three Downs: index %d", p.index);
+
+    tap(JOY_RIGHT, 30);
+    pump(100);
+    p = launch_here();
+    check(p.ok && p.index == 3 + ROWS, "one page right: index %d (expected %d)", p.index, 3 + ROWS);
+
+    /* letters: R2 goes to the start of the next letter that has titles; the host's table says where */
+    {
+        const auto &starts = big->letters[0];
+        int next = -1;
+        for (int k = 0; k < 27; k++)
+            if (starts[k] < starts[k + 1] && (int) starts[k] > p.index) { next = (int) starts[k]; break; }
+        tap(GJ_R2, 30);
+        pump(100);
+        Pos q = launch_here();
+        check(q.ok && q.index == next, "R2: index %d (the host's table says the next letter starts at %d)", q.index, next);
+
+        tap(GJ_R2, 30);
+        pump(100);
+        Pos r = launch_here();
+        check(r.ok && r.index > q.index, "R2 again goes on: %d", r.index);
+        tap(GJ_L2, 30);
+        pump(100);
+        Pos s = launch_here();
+        check(s.ok && s.index == q.index, "L2 at the top of a letter goes to the top of the one before it (%d, expected %d)", s.index, q.index);
+    }
+
+    /* holding Right crosses the library at an increasing pace, and the rows are there when it stops */
+    {
+        Pos before = launch_here();
+        int lists0 = count_rx("LIST:");
+        pad(JOY_RIGHT);
+        pump(2500);
+        pad(0);
+        pump(150);
+        Pos after = launch_here();
+        int moved = after.index - before.index;
+        std::printf("  (holding Right for 2.5 s moved %d titles and asked for %d pages)\n", moved, count_rx("LIST:") - lists0);
+        check(after.ok, "the rows were already there when the cursor stopped");
+        check(moved > 40 * ROWS, "holding Right for 2.5 s moved only %d titles", moved);
+        check(count_rx("LIST:") - lists0 < 400, "that many titles cost %d page requests", count_rx("LIST:") - lists0);
+    }
+
+    /* a tab is a different list on the host */
+    tap(GJ_R, 30);
+    pump(100);
+    p = launch_here();
+    check(p.ok && p.list == "groovymame" && p.index == 0, "next tab: list '%s', index %d", p.list.c_str(), p.index);
+
+    /* a page that never arrives is asked for again */
+    {
+        g_drop_lists = 3;
+        tap(GJ_R2, 30);
+        pump(80);
+        int n0 = count_rx("LAUNCH:@");
+        tap(JOY_BTN1, 30);
+        check(count_rx("LAUNCH:@") == n0, "while its page is missing, A does not launch an unseen row");
+        pump(900);
+        Pos q = launch_here();
+        check(q.ok, "the page was asked for again and arrived");
+    }
+
+    /* the host rescans: the next thing the cabinet asks is refused, and it picks up the new library */
+    {
+        auto big2 = make_big(49000, 888);
+        set_ix(big2);
+        /* pages already held keep showing; the cabinet finds out when it next asks for one it does not have */
+        tap(GJ_R2, 30);
+        tap(GJ_R2, 30);
+        pump(600);
+        check(phantom_title_count() == 49000, "after the host's rescan the cabinet reports %d titles", phantom_title_count());
+        Pos q = launch_here();
+        check(q.ok && q.ver == 888, "...and launches quote the new version (%u)", q.ver);
+    }
+
+    /* ...and a launch against a library that changed under it is refused, not misdirected */
+    {
+        auto big3 = make_big(48000, 999);
+        set_ix(big3);
+        int n0 = count_rx("LAUNCH:@");
+        tap(JOY_BTN1, 30);
+        pump(300);
+        check(count_rx("LAUNCH:@") == n0 + 1, "the launch was sent (quoting the old version)");
+        check(phantom_title_count() == 48000, "the refusal made the cabinet fetch the new library (%d titles)", phantom_title_count());
+        Pos q = launch_here();
+        check(q.ok && q.ver == 999, "it is back at the list, ready to launch against version 999 (got %u)", q.ver);
+    }
+
+    /* a host that does not know the paged catalog is still served, the older way */
+    {
+        g_host_paged = 0;
+        int cat0 = count_rx("GET_CATALOG");
+        tap(GJ_Y);
+        pump(5500);
+        check(count_rx("GET_CATALOG") > cat0, "an older host was asked for its whole catalog");
+        check(phantom_title_count() == 3, "...and its %d titles are shown", phantom_title_count());
+        int l0 = count_rx("LAUNCH:");
+        tap(JOY_BTN1, 30);
+        check(count_rx("LAUNCH:") == l0 + 1 && last_rx("LAUNCH:").rfind("LAUNCH:@", 0) != 0,
+              "launching from it uses the id, not a position (%s)", last_rx("LAUNCH:").c_str());
+        tap(JOY_BTN2, 30); /* B: back out of the loading screen */
+        g_host_paged = 1;
+    }
+
+    /* The daemon is restarted as a newer build, with nobody pressing anything: the cabinet is still online the
+     * whole time, so nothing looks like "a host has appeared". It has to notice for itself. */
+    {
+        pump(4000); /* the probe interval is shortened for the test */
+        check(phantom_title_count() == 48000, "a host that learned to page was noticed without a refresh (%d titles)", phantom_title_count());
+        Pos q = launch_here();
+        check(q.ok && q.ver == 999, "and launches are by position again (version %u)", q.ver);
+    }
+
+    /* ...and the other way: a paged host replaced, silently, by an older one. */
+    {
+        g_host_paged = 0;
+        pump(9000);
+        check(phantom_title_count() == 3, "a host that stopped answering CATINFO was given up on (%d titles)", phantom_title_count());
+        g_host_paged = 1;
+        pump(4000);
+        check(phantom_title_count() == 48000, "and found again when it speaks the paged catalog (%d titles)", phantom_title_count());
+    }
 
     g_stop = true;
     host.join();

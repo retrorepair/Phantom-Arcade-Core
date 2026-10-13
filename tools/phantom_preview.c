@@ -9,6 +9,10 @@
  *   gcc -O2 -I../hps_linux/src/support/groovy -o phantom_preview phantom_preview.c \
  *       ../hps_linux/src/support/groovy/phantom_ui.c
  *   ./phantom_preview out.ppm [catalog.tsv] [--busy] [--empty] [--offline] [--tab N]
+ *       [--big N [--have LO,HI]] [--scanning] [--loading]
+ *
+ * --big N shows a library of N titles the way a host-backed list does (no array behind it); --have LO,HI
+ * says which rows have arrived, the rest drawing as placeholders.
  *
  * The catalog file is TSV: id, title, system, sysname, hsync_hz, vsync_centihz.
  * With no file a small fixture is used. That fixture is test data for looking at the
@@ -58,6 +62,38 @@ static void fixture(void)
 	add("fzerogx", "F-Zero GX", "dolphin", "GameCube", 15734, 6000);
 }
 
+static int  big_n = 0, have_lo = 0, have_hi = 1 << 30;
+static ph_game big_ring[16];
+static int  big_ring_i;
+
+static int big_count(void *ctx, int tab)
+{
+	(void)ctx;
+	return tab == PH_TAB_ALL ? big_n : 0;
+}
+
+static const ph_game *big_row(void *ctx, int tab, int i)
+{
+	(void)ctx;
+	if (tab != PH_TAB_ALL || i < 0 || i >= big_n || i < have_lo || i >= have_hi) return 0;
+	ph_game *g = &big_ring[big_ring_i++ & 15];
+	memset(g, 0, sizeof(*g));
+	snprintf(g->id, sizeof(g->id), "big_%d", i);
+	snprintf(g->title, sizeof(g->title), "%c%c Example Title Number %d", 'A' + (int)((long)i * 26 / big_n), 'a' + (i * 7) % 26, i);
+	snprintf(g->system, sizeof(g->system), "pcsx2");
+	snprintf(g->sysname, sizeof(g->sysname), "Sony PlayStation 2");
+	snprintf(g->year, sizeof(g->year), "%d", 1990 + i % 30);
+	snprintf(g->maker, sizeof(g->maker), "Some Maker Co.");
+	snprintf(g->mode, sizeof(g->mode), "320x240 @ 60.00Hz");
+	return g;
+}
+
+static int big_letter(void *ctx, int tab, int k)
+{
+	(void)ctx; (void)tab;
+	return k >= 27 ? big_n : k == 0 ? 0 : (int)(((long)(k - 1) * big_n + 25) / 26);
+}
+
 static void load_tsv(const char *path)
 {
 	FILE *f = fopen(path, "r");
@@ -95,7 +131,7 @@ int main(int argc, char **argv)
 	const char *out = argc > 1 ? argv[1] : "phantom_preview.ppm";
 	const char *tsv = 0;
 	int busy = 0, empty = 0, offline = 0, tab = 0, sel = 0;
-	int adjust = 0, edge = 1, sl = -1, st = -1, sr = -1, sb = -1;
+	int adjust = 0, edge = 1, sl = -1, st = -1, sr = -1, sb = -1, scanning = 0, loading = 0;
 	uint32_t t = 0;
 
 	for (int i = 2; i < argc; i++)
@@ -107,6 +143,10 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--sel") && i + 1 < argc) sel = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--time") && i + 1 < argc) t = (uint32_t)strtoul(argv[++i], 0, 10);
 		else if (!strcmp(argv[i], "--adjust")) adjust = 1;
+		else if (!strcmp(argv[i], "--big") && i + 1 < argc) big_n = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--have") && i + 1 < argc) sscanf(argv[++i], "%d,%d", &have_lo, &have_hi);
+		else if (!strcmp(argv[i], "--scanning")) scanning = 1;
+		else if (!strcmp(argv[i], "--loading")) loading = 1;
 		else if (!strcmp(argv[i], "--edge") && i + 1 < argc) edge = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--safe") && i + 1 < argc) sscanf(argv[++i], "%d,%d,%d,%d", &sl, &st, &sr, &sb);
 		else if (argv[i][0] != '-') tsv = argv[i];
@@ -117,10 +157,18 @@ int main(int argc, char **argv)
 	ui.host_port = 1999;
 	ui.host_state = offline ? PH_HOST_OFFLINE : PH_HOST_ONLINE;
 
-	if (!empty)
+	if (big_n > 0)
+	{
+		ui.src.count = big_count;
+		ui.src.row = big_row;
+		ui.src.letter_start = big_letter;
+	}
+	else if (!empty)
 	{
 		if (tsv) load_tsv(tsv); else fixture();
 	}
+	ui.lib_scanning = scanning;
+	ui.lib_loading = loading;
 
 	ui.tab = tab;
 	ui.sel = sel;

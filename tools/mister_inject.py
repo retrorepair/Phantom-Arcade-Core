@@ -8,7 +8,7 @@ with nothing plugged in - navigate, screenshot, confirm.
   python3 mister_inject.py down down down          # three presses
   python3 mister_inject.py right enter --settle 1.0
 
-Key names: up down left right enter space esc tab f5.
+Key names: up down left right enter space esc tab f5 f2 pgup pgdn comma dot q e.
 
 The device has to linger a moment after creation: MiSTer rescans /dev/input on hotplug
 and will miss keys sent before it has opened the new node.
@@ -38,8 +38,9 @@ SYN_REPORT = 0
 KEYS = {
     "esc": 1, "space": 57, "enter": 28, "tab": 15, "backspace": 14,
     "up": 103, "left": 105, "right": 106, "down": 108,
-    "f1": 59, "f5": 63,
-    "w": 17, "a": 30, "s": 31, "d": 32,
+    "f1": 59, "f2": 60, "f5": 63,
+    "w": 17, "a": 30, "s": 31, "d": 32, "q": 16, "e": 18,
+    "pgup": 104, "pgdn": 109, "comma": 51, "dot": 52,
 }
 
 # input_event on 32-bit ARM: struct timeval (two 32-bit longs) + type + code + value
@@ -53,10 +54,18 @@ def emit(fd, etype, code, value):
 
 
 def main():
-    names = [a for a in sys.argv[1:] if not a.startswith("--")]
+    args = sys.argv[1:]
+    names = []
+    skip = False
+    for a in args:
+        if skip:
+            skip = False          # the value of --settle / --hold, not a key
+        elif a in ("--settle", "--hold"):
+            skip = True
+        elif not a.startswith("--"):
+            names.append(a)
     settle = 0.35
     hold = 0.06
-    args = sys.argv[1:]
     for i, a in enumerate(args):
         if a == "--settle" and i + 1 < len(args):
             settle = float(args[i + 1])

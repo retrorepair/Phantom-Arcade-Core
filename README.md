@@ -67,8 +67,10 @@ Three things, and one line of configuration.
    be called anything you like; the section cannot. (`[Groovy*]` also works and matches a
    stock Groovy install too.)
 
-Then on the PC, run `build_output/PhantomArcadeManager.exe`, point it at your emulators and
-ROM folders, press **1. Scan ROMs**, and press **Start Background Daemon**.
+Then on the PC, run `build_output/PhantomArcadeManager.exe` and point it at your emulators and
+ROM folders. It scans in the background as it starts (the window stays usable, and the cabinet is served
+the last scan straight away); **1. Scan ROMs** forces a full rescan from scratch, and **Start Background
+Daemon** is already on.
 
 Nothing else — there is no address to configure at either end. The cabinet opens every
 conversation, so the daemon takes the MiSTer's address from the datagrams it receives and
@@ -82,11 +84,15 @@ because changing it on one side alone silently breaks discovery — a far likeli
 than a clash on 1999. If something else really does own that port, change it in both
 `phantom_config.json` (`udp_port`) and `phantom.ini` (`UDP_PORT`) together.
 
-Scan ROMs asks MAME which sets will actually start, and lists only those. Incomplete
+The scan asks MAME which sets will actually start, and lists only those. Incomplete
 romsets (`mame -verifyroms` calls them bad) and entries that are not games at all —
 devices and BIOS images like `hd44780` or `model1io`, which live in roms folders quite
 legitimately — are left out. They would otherwise sit in the menu and fail the instant
-anyone chose one, which from the cabinet looks exactly like a broken stream.
+anyone chose one, which from the cabinet looks exactly like a broken stream. FBNeo is asked
+the same way for the games it supports.
+
+It is built for libraries of hundreds of thousands of titles; see
+[Large libraries](#large-libraries).
 
 If your network drops broadcast, you can still name the host in
 `/media/fat/config/phantom.ini`:
@@ -143,12 +149,18 @@ only the default, not the only option.
 
 ## Using it
 
+The buttons are MiSTer's usual ones: A red, B yellow, X blue, Y green.
+
 | Control | Does |
 |---|---|
 | Up / Down | move through the list (hold to accelerate) |
-| Left / Right | change platform tab |
-| Button 1 | launch the highlighted game |
-| Start | search for the host again and refresh the catalog |
+| Left / Right | a page at a time; **held**, each step goes further, so a very long list can be crossed in seconds |
+| L / R | change platform tab |
+| L2 / R2 | jump to the previous / next letter |
+| A | launch the highlighted game |
+| B | back out of a launch that is not going anywhere |
+| Y | look for new games (the PC rescans what changed) and refresh the list |
+| Select | the screen-adjust page: set how much of each edge your TV hides, and save it |
 | Start + Select, held 1.2 s | stop the game and come back to the launcher |
 
 To get back to the menu there is also **OSD → System → Phantom Arcade → Return to
@@ -161,7 +173,12 @@ advertised the keepalive capability, and GroovyMAME advertises none, so an emula
 was killed outright never sends `CMD_CLOSE` and the CRT would hold its last frame
 indefinitely.
 
-Keyboard equivalents: arrows, Enter/Space, Esc, F5.
+Keyboard equivalents: arrows, PgUp/PgDn, Q/E or Tab for platform, `,` and `.` for letters,
+Enter/Space, Esc, F2 for screen adjust, F5.
+
+Many TVs hide the edges of the picture (overscan). **Select** opens the screen-adjust page: Left/Right
+picks an edge, Up/Down moves it, A saves. Backgrounds still fill the screen; everything you read stays
+inside the margins.
 
 The OSD gains a **Phantom Arcade** page (System → Phantom Arcade) showing the host address,
 link state and title count, with the idle-screen choice, the exit hotkey toggle, and
@@ -252,12 +269,26 @@ The launcher's drawing and navigation have no hardware or socket dependencies
 ```bash
 gcc -O2 -Wall -Wextra -Ihps_linux/src/support/groovy \
     -o /tmp/t tools/phantom_ui_test.c hps_linux/src/support/groovy/phantom_ui.c && /tmp/t
-# 332 checks, 0 failures
+# 418 checks, 0 failures
 
 gcc -O2 -Ihps_linux/src/support/groovy -o /tmp/p \
     tools/phantom_preview.c hps_linux/src/support/groovy/phantom_ui.c
 /tmp/p out.ppm --busy          # render any screen to a file and look at it
 ```
+
+The cabinet's paged library is tested against the PC's real reply code, under the address and
+undefined-behaviour sanitizers, and the whole launcher (`phantom.cpp`) runs against a fake PC on
+loopback, including a 50,000-title library:
+
+```bash
+wsl -- bash tools/run_phantom_cat_test.sh     # 82 checks
+wsl -- bash tools/run_phantom_input_test.sh   # the launcher end to end
+```
+
+The PC side builds with MSVC and tests itself the same way: `host/game_index_test.cpp` (300,000
+games: order, letters, pages, the cache file), `host/rom_enum_test.cpp` (the folder walk against
+`std::filesystem`) and `host/library_scan_test.cpp` (the real scanner with stand-ins for MAME, counting
+how often each is asked — an unchanged library asks zero times).
 
 On the MiSTer itself, the HPS and the FPGA share the board's DDR3, so what the core is
 actually displaying can be read straight out of memory — no capture card:
@@ -277,6 +308,43 @@ Every screenshot in this README was produced that way, on hardware.
 `tools/mister_serial.ps1` talks to the HPS console over the DE10-Nano's USB UART, which
 keeps working when the network and the screen do not.
 
+## Large libraries
+
+A library of hundreds of thousands of titles cannot be sent in one datagram or held in an array, so
+neither is done.
+
+**The PC** keeps the library as one immutable, versioned index (`host/game_index.h`): records in a
+string pool, one title-sorted list per system plus one for everything, and a letter table per list, so a
+jump to "S" is a lookup. 300,000 games is about 36 MB and builds, sorted, in about half a second. The last
+scan is saved (`phantom_index.bin`) and served the moment the manager starts.
+
+A scan (`host/library_scan.h`, on its own thread) walks each ROM folder with `FindFirstFileEx` in several
+threads (`host/rom_enum.h`, about four times faster than `std::filesystem` even before the per-file work it
+avoids) — 300,000 files in about a quarter of a second. Only files that are new or changed are looked at:
+a game whose size and modification time match the last scan keeps what was learned about it (the PARAM.SFO
+title, the Xbox disc's title, what MAME said), and MAME is asked only about new sets, in batches that fit a
+command line. Sets MAME rejected are remembered against a fingerprint of the MAME folder and executable;
+if nothing under it has changed, the verdict still holds, and the moment anything has, they are asked
+again, because a missing parent may have been added. What needs no vetting is published as soon as it is
+found and MAME sets join as each batch is answered.
+
+**The cabinet** holds a window onto that list, not a copy of it (`phantom_cat.c`). Over UDP:
+
+| Request | Answer |
+|---|---|
+| `CATINFO` | the library's version and size, and each system's name and count |
+| `LETTERS:<ver>:<list>` | where each letter begins |
+| `LIST:<ver>:<list>:<offset>:<count>` | a page of rows (32), a few kilobytes at most |
+| `LAUNCH:@<ver>:<list>:<index>` | start the game at that position |
+| `RESCAN` | look for new and changed games now |
+
+Every request quotes the library's version. If the PC has rescanned since the cabinet fetched a page,
+it answers `STALE`, the cabinet fetches the new library, and a launch is refused rather than starting
+whatever has moved into that position. Pages are cached least-recently-used, with a few read ahead in the
+direction of travel; a row that has not arrived is drawn as a placeholder (a few milliseconds on a LAN).
+A PC that predates all of this is still served, the older way: after a moment without an answer to
+`CATINFO` the cabinet asks for the whole catalog in one datagram.
+
 ## Known limits
 
 - **AF_XDP build.** `tools/build_phantom_hps.sh xdp` reports that it cannot build it. The
@@ -284,10 +352,11 @@ keeps working when the network and the screen do not.
   repository — true of upstream too, and nothing to do with the launcher. The UDP binary is
   what the install instructions use; XDP additionally needs a patched kernel, a BPF object
   and `libelf` on the MiSTer.
-- **Catalog size.** The host serves the catalog in one UDP datagram, capped at 60000 bytes
-  on its side, so a very large library will arrive truncated. The core's parser stops
-  cleanly at the last complete record rather than showing a corrupt one, but the fix
-  belongs on the host and is not done yet.
+- **MAME's own speed.** Asking MAME about a very large number of new sets for the first time is as
+  slow as MAME's `-verifyroms` is; the scan publishes what it has as it goes, and an unchanged library
+  is never asked again.
+- **Titles are ASCII on the cabinet.** The font has no accents or kana, so the PC folds a title down
+  (`WipEout(R) HD` becomes `WipEout HD`); the library itself keeps the original file names.
 - **Timings in the detail bar** come from the host's `videoMode` string. The host does not
   send real modeline numbers, so the core shows what it was given and nothing more — it
   does not fill in a plausible 15.734 kHz that might be wrong for that title.

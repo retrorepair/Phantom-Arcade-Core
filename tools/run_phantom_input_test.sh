@@ -18,10 +18,12 @@ out="${TMPDIR:-/tmp}/phantom_input_test"
 mkdir -p "$out"
 
 gcc -std=c11 -O1 -c "$grv/phantom_ui.c" -I "$grv" -o "$out/phantom_ui.o"
+gcc -std=c11 -O1 -c "$grv/phantom_cat.c" -I "$grv" -o "$out/phantom_cat.o"
 g++ -std=c++17 -O1 -Wall -c "$phantom_cpp" -I "$src" -I "$grv" -I "$upstream" \
-    -DPH_INI="\"$out/phantom.ini\"" -DPH_CACHE="\"$out/cache.tsv\"" -DT_CLOSE_GRACE=600 -DT_CLOSE_HOLD_CAP=3000 -DT_CLOSE_POLL=100 -o "$out/phantom.o"
+    -DPH_INI="\"$out/phantom.ini\"" -DPH_CACHE="\"$out/cache.tsv\"" -DT_CLOSE_GRACE=600 -DT_CLOSE_HOLD_CAP=3000 -DT_CLOSE_POLL=100 \
+    -DT_INFO_POLL=1500 -DT_INFO_SCAN_POLL=500 -DT_INFO_PROBE=1500 -DT_INFO_SILENT=1200 -o "$out/phantom.o"
 g++ -std=c++17 -O1 -Wall -pthread "$here/tools/phantom_input_test.cpp" \
-    "$out/phantom.o" "$out/phantom_ui.o" -I "$src" -I "$grv" -I "$upstream" -DTEST_DIR="\"$out\"" -DT_CLOSE_GRACE=600 -DT_CLOSE_HOLD_CAP=3000 -DT_CLOSE_POLL=100 \
+    "$out/phantom.o" "$out/phantom_ui.o" "$out/phantom_cat.o" -I "$src" -I "$grv" -I "$upstream" -DTEST_DIR="\"$out\"" -DT_CLOSE_GRACE=600 -DT_CLOSE_HOLD_CAP=3000 -DT_CLOSE_POLL=100 \
     -o "$out/phantom_input_test"
 
 exec "$out/phantom_input_test"

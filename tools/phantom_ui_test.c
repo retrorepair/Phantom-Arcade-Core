@@ -449,6 +449,209 @@ static void test_letter(void)
 	CHECK(ph_ui_letter(&ui, 1) == 0 && ph_ui_page(&ui, 1) == 0, "an empty list has nowhere to jump");
 }
 
+/* ---- a source that is not the resident array --------------------------------------- */
+
+/* A library far too big to hold: titles are made up on demand, in order, A..Z over the length of the list, and
+ * the letter table is arithmetic. Rows outside [g_have_lo, g_have_hi) are "still on their way" (NULL). */
+static int g_big_n = 100000;
+static int g_have_lo = 0, g_have_hi = 1 << 30;
+static int g_letters_known = 1;
+static ph_game g_ring[16];
+static int g_ring_i;
+
+static int big_count(void *ctx, int tab)
+{
+	(void)ctx;
+	if (tab == PH_TAB_ALL) return g_big_n;
+	if (tab == PH_TAB_MAME) return 1000;
+	return 0;
+}
+
+static int big_n_of(int tab)
+{
+	return tab == PH_TAB_ALL ? g_big_n : tab == PH_TAB_MAME ? 1000 : 0;
+}
+
+static const ph_game *big_row(void *ctx, int tab, int i)
+{
+	(void)ctx;
+	int n = big_n_of(tab);
+	if (i < 0 || i >= n || i < g_have_lo || i >= g_have_hi) return 0;
+	ph_game *g = &g_ring[g_ring_i++ & 15];
+	memset(g, 0, sizeof(*g));
+	snprintf(g->id, sizeof(g->id), "big_%d_%d", tab, i);
+	snprintf(g->title, sizeof(g->title), "%c title %06d", 'A' + (int)((long)i * 26 / n), i);
+	snprintf(g->system, sizeof(g->system), "groovymame");
+	snprintf(g->sysname, sizeof(g->sysname), "GroovyMAME Arcade");
+	return g;
+}
+
+static int big_letter(void *ctx, int tab, int k)
+{
+	(void)ctx;
+	int n = big_n_of(tab);
+	if (!g_letters_known) return -1;
+	if (k >= 27) return n;
+	if (k == 0) return 0;                                   /* nothing here starts with a non-letter */
+	return (int)(((long)(k - 1) * n + 25) / 26);            /* the first index whose letter is 'A' + k - 1 */
+}
+
+static void big_reset(void)
+{
+	reset();
+	g_big_n = 100000;
+	g_have_lo = 0;
+	g_have_hi = 1 << 30;
+	g_letters_known = 1;
+	ui.src.count = big_count;
+	ui.src.row = big_row;
+	ui.src.letter_start = big_letter;
+	ui.src.ctx = 0;
+	ui.host_state = PH_HOST_ONLINE;
+}
+
+static void test_source_basics(void)
+{
+	big_reset();
+	CHECK(ph_ui_tab_count(&ui, PH_TAB_ALL) == 100000 && ph_ui_tab_count(&ui, PH_TAB_MAME) == 1000 && ph_ui_tab_count(&ui, PH_TAB_PS3) == 0,
+	      "tab counts come from the source");
+	const ph_game *g = ph_ui_selected(&ui);
+	CHECK(g && !strcmp(g->id, "big_0_0"), "the selection is row 0 of the source");
+
+	ph_ui_move(&ui, -1);
+	CHECK(ui.sel == 99999, "up from the top wraps to the last of 100000, got %d", ui.sel);
+	g = ph_ui_selected(&ui);
+	CHECK(g && !strcmp(g->id, "big_0_99999"), "...and that is the source's last row");
+	ph_ui_move(&ui, 1);
+	CHECK(ui.sel == 0, "and down from the last wraps to the first");
+
+	CHECK(ph_ui_seek(&ui, 1000000000) == 1 && ui.sel == 99999, "seeking past the end stops at the end, got %d", ui.sel);
+	CHECK(ph_ui_seek(&ui, 5) == 0 && ui.sel == 99999, "and a further seek reports no change");
+	CHECK(ph_ui_seek(&ui, -1000000000) == 1 && ui.sel == 0, "seeking past the start stops at the start");
+	CHECK(ph_ui_seek(&ui, 0) == 0, "a seek of nothing changes nothing");
+	CHECK(ph_ui_seek(&ui, 12345) == 1 && ui.sel == 12345, "a seek of 12345 lands on 12345, got %d", ui.sel);
+	CHECK(ui.scroll <= ui.sel && ui.sel < ui.scroll + ph_ui_rows(&ui), "the window follows (scroll %d for sel %d)", ui.scroll, ui.sel);
+
+	ph_ui_page(&ui, 1);
+	CHECK(ui.sel == 12345 + ph_ui_rows(&ui), "a page is still a screenful, got %d", ui.sel);
+
+	CHECK(ph_ui_tab(&ui, 1) == 1 && ui.tab == PH_TAB_MAME && ui.sel == 0, "the next tab starts at its top");
+	ph_ui_move(&ui, -1);
+	CHECK(ui.sel == 999, "and wraps within its own 1000 titles, got %d", ui.sel);
+	g = ph_ui_selected(&ui);
+	CHECK(g && !strcmp(g->id, "big_1_999"), "the row comes from the tab's own list");
+}
+
+static void test_source_letters(void)
+{
+	big_reset();
+	int n = 100000;
+	CHECK(ui.sel == 0, "starts at the top ('A')");
+	int expect = (int)(((long)1 * n + 25) / 26);
+	ph_ui_letter(&ui, 1);
+	CHECK(ui.sel == expect, "R2 from A goes to the start of B: %d (table says %d)", ui.sel, expect);
+	for (int k = 3; k <= 26; k++) ph_ui_letter(&ui, 1);
+	expect = (int)(((long)25 * n + 25) / 26);
+	CHECK(ui.sel == expect, "twenty-five letters on is the start of Z: %d (table says %d)", ui.sel, expect);
+	ph_ui_letter(&ui, 1);
+	CHECK(ui.sel == 0, "past Z wraps to the first letter that has titles, got %d", ui.sel);
+	ph_ui_letter(&ui, -1);
+	CHECK(ui.sel == expect, "before the first letter wraps to the last, got %d", ui.sel);
+
+	ph_ui_seek(&ui, 50);
+	ph_ui_letter(&ui, -1);
+	CHECK(ui.sel == expect, "L2 in the middle of Z goes to the top of Z, got %d", ui.sel);
+
+	/* the table not having arrived yet: the press is ignored, not guessed at */
+	g_letters_known = 0;
+	int before = ui.sel;
+	CHECK(ph_ui_letter(&ui, 1) == 0 && ui.sel == before, "with no letter table a letter jump does nothing");
+	g_letters_known = 1;
+}
+
+static void test_source_missing_rows(void)
+{
+	big_reset();
+	ph_ui_seek(&ui, 50000);
+	g_have_lo = 0;
+	g_have_hi = 10;     /* the page around row 50000 has not arrived */
+	CHECK(ph_ui_selected(&ui) == 0, "a selected row that has not arrived is NULL");
+	CHECK(ph_ui_animate(&ui, 1000) == 0, "and nothing animates for it");
+
+	ph_ui_render(&ui);
+	uint8_t waiting[sizeof(fb)];
+	memcpy(waiting, fb, sizeof(fb));
+
+	g_have_lo = 0;
+	g_have_hi = 1 << 30;
+	ui.dirty = 1;
+	ph_ui_render(&ui);
+	CHECK(memcmp(waiting, fb, sizeof(fb)) != 0, "placeholders look different from titles");
+
+	/* the placeholder is drawn, not left blank: the title column has ink in it */
+	g_have_hi = 10;
+	ph_ui_render(&ui);
+	int ink = 0;
+	for (int y = 130; y < 340; y++)
+		for (int x = 60; x < 300; x++)
+		{
+			const uint8_t *p = &fb[(y * PH_CANVAS_W + x) * 3];
+			if (p[0] > 0x30 || p[1] > 0x30 || p[2] > 0x30) { ink = 1; break; }
+		}
+	CHECK(ink, "the rows being waited on are not blank");
+
+	/* none of the rows present at all (the very first moments) renders without incident */
+	g_have_hi = 0;
+	ph_ui_render(&ui);
+	CHECK(ui.dirty == 0, "a list with no rows yet renders");
+}
+
+static void test_source_states(void)
+{
+	big_reset();
+	g_big_n = 0;                 /* the host has said it has nothing yet */
+	ui.lib_scanning = 1;
+	ph_ui_render(&ui);
+	uint8_t scanning[sizeof(fb)];
+	memcpy(scanning, fb, sizeof(fb));
+
+	ui.lib_scanning = 0;
+	ui.lib_loading = 1;
+	ph_ui_render(&ui);
+	uint8_t loading[sizeof(fb)];
+	memcpy(loading, fb, sizeof(fb));
+
+	ui.lib_loading = 0;
+	ui.dirty = 1;
+	ph_ui_render(&ui);
+	CHECK(memcmp(scanning, fb, sizeof(fb)) != 0 && memcmp(loading, fb, sizeof(fb)) != 0 && memcmp(scanning, loading, sizeof(fb)) != 0,
+	      "scanning, loading and an empty library each say something different");
+
+	/* the header says so while the host is still working, even with games on show */
+	g_big_n = 1000;
+	ui.lib_scanning = 0;
+	ui.dirty = 1;
+	ph_ui_render(&ui);
+	memcpy(loading, fb, sizeof(fb));
+	ui.lib_scanning = 1;
+	ui.dirty = 1;
+	ph_ui_render(&ui);
+	CHECK(memcmp(loading, fb, sizeof(fb)) != 0, "a host that is still scanning is shown as such");
+}
+
+static void test_source_shrinks(void)
+{
+	big_reset();
+	ph_ui_seek(&ui, 99000);
+	g_big_n = 500;              /* the host rescanned and the library is smaller */
+	ph_ui_reclamp(&ui, 0);
+	CHECK(ui.sel == 499, "the cursor is clamped to the new length, got %d", ui.sel);
+	CHECK(ui.scroll + ph_ui_rows(&ui) <= 500 && ui.scroll >= 0, "and the window with it (scroll %d)", ui.scroll);
+	g_big_n = 0;
+	ph_ui_reclamp(&ui, 0);
+	CHECK(ui.sel == 0 && ui.scroll == 0 && ph_ui_selected(&ui) == 0, "an emptied library leaves nothing selected");
+}
+
 int main(void)
 {
 	test_safe_defaults_and_rows();
@@ -458,6 +661,12 @@ int main(void)
 	test_adjust_flow();
 	test_page();
 	test_letter();
+
+	test_source_basics();
+	test_source_letters();
+	test_source_missing_rows();
+	test_source_states();
+	test_source_shrinks();
 
 	test_empty();
 	test_wrap();

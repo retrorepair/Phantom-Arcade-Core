@@ -357,6 +357,11 @@ static int tab_match(int tab, const char *sys)
 	}
 }
 
+int ph_tab_matches(int tab, const char *sys)
+{
+	return tab_match(tab, sys);
+}
+
 int ph_ui_filtered(const ph_ui *u, int *out, int max)
 {
 	int n = 0;
@@ -367,12 +372,73 @@ int ph_ui_filtered(const ph_ui *u, int *out, int max)
 	return n;
 }
 
+/* The letter a title files under: A-Z whatever its case, everything else as one group (0). */
+static int letter_key(const char *t)
+{
+	char c = t ? t[0] : 0;
+	if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 1);
+	else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 1);
+	else c = 0;
+	return c;
+}
+
+/* The resident list, as a source. These scan games[] for each question, which is fine for the few hundred rows
+ * it is limited to and keeps the tests and the preview tool exactly as they were. */
+static int res_count(const ph_ui *u, int tab)
+{
+	int n = 0;
+	for (int i = 0; i < u->count; i++)
+		if (tab_match(tab, u->games[i].system)) n++;
+	return n;
+}
+
+static const ph_game *res_row(const ph_ui *u, int tab, int index)
+{
+	if (index < 0) return 0;
+	for (int i = 0; i < u->count; i++)
+		if (tab_match(tab, u->games[i].system) && index-- == 0) return &u->games[i];
+	return 0;
+}
+
+/* First index of letter k in a list that is in title order: how many titles file under an earlier letter. */
+static int res_letter(const ph_ui *u, int tab, int k)
+{
+	int n = 0, before = 0;
+	for (int i = 0; i < u->count; i++)
+	{
+		if (!tab_match(tab, u->games[i].system)) continue;
+		n++;
+		if (letter_key(u->games[i].title) < k) before++;
+	}
+	return k >= 27 ? n : before;
+}
+
+static int src_count(const ph_ui *u, int tab)
+{
+	int n = u->src.count ? u->src.count(u->src.ctx, tab) : res_count(u, tab);
+	return n < 0 ? 0 : n;
+}
+
+static const ph_game *src_row(const ph_ui *u, int tab, int index)
+{
+	return u->src.row ? u->src.row(u->src.ctx, tab, index) : res_row(u, tab, index);
+}
+
+static int src_letter(const ph_ui *u, int tab, int k)
+{
+	return u->src.letter_start ? u->src.letter_start(u->src.ctx, tab, k) : res_letter(u, tab, k);
+}
+
+int ph_ui_tab_count(const ph_ui *u, int tab)
+{
+	return src_count(u, tab);
+}
+
 const ph_game *ph_ui_selected(const ph_ui *u)
 {
-	int idx[PH_MAX_GAMES];
-	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
+	int n = src_count(u, u->tab);
 	if (n <= 0 || u->sel < 0 || u->sel >= n) return 0;
-	return &u->games[idx[u->sel]];
+	return src_row(u, u->tab, u->sel);
 }
 
 static int visible_rows(const ph_ui *u)
@@ -439,8 +505,7 @@ void ph_ui_init(ph_ui *u, uint8_t *fb, int w, int h)
 
 int ph_ui_move(ph_ui *u, int dy)
 {
-	int idx[PH_MAX_GAMES];
-	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
+	int n = src_count(u, u->tab);
 	if (n <= 0) return 0;
 
 	int before = u->sel;
@@ -479,14 +544,16 @@ int ph_ui_tab(ph_ui *u, int dx)
 
 void ph_ui_reclamp(ph_ui *u, const char *keep_id)
 {
-	int idx[PH_MAX_GAMES];
-	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
+	int n = src_count(u, u->tab);
 
-	if (keep_id && *keep_id)
+	/* Staying on the same game by id is only possible when every row is at hand. A source that fetches
+	 * pages keeps the position instead, clamped to whatever the list now holds. */
+	if (keep_id && *keep_id && !u->src.row)
 	{
 		for (int i = 0; i < n; i++)
 		{
-			if (strcmp(u->games[idx[i]].id, keep_id) == 0)
+			const ph_game *g = res_row(u, u->tab, i);
+			if (g && strcmp(g->id, keep_id) == 0)
 			{
 				u->sel = i;
 				fix_scroll(u, n);
@@ -504,16 +571,16 @@ int ph_ui_rows(const ph_ui *u)
 	return visible_rows(u);
 }
 
-int ph_ui_page(ph_ui *u, int dir)
+int ph_ui_seek(ph_ui *u, int rows)
 {
-	int idx[PH_MAX_GAMES];
-	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
-	if (n <= 0 || dir == 0) return 0;
+	int n = src_count(u, u->tab);
+	if (n <= 0 || rows == 0) return 0;
 
 	int before = u->sel;
-	u->sel += dir * visible_rows(u);
-	if (u->sel < 0) u->sel = 0;
-	if (u->sel >= n) u->sel = n - 1;
+	long to = (long)u->sel + rows;
+	if (to < 0) to = 0;
+	if (to > n - 1) to = n - 1;
+	u->sel = (int)to;
 	fix_scroll(u, n);
 
 	if (u->sel == before) return 0;
@@ -523,50 +590,67 @@ int ph_ui_page(ph_ui *u, int dir)
 	return 1;
 }
 
-/* The letter a title files under: A-Z whatever its case, everything else as one group. */
-static int letter_key(const char *t)
+int ph_ui_page(ph_ui *u, int dir)
 {
-	char c = t ? t[0] : 0;
-	if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-	return (c >= 'A' && c <= 'Z') ? c : 0;
+	if (dir == 0) return 0;
+	return ph_ui_seek(u, dir * visible_rows(u));
 }
 
 int ph_ui_letter(ph_ui *u, int dir)
 {
-	int idx[PH_MAX_GAMES];
-	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
+	int n = src_count(u, u->tab);
 	if (n <= 0 || dir == 0) return 0;
 
-	int cur = letter_key(u->games[idx[u->sel]].title);
-	int to = u->sel;
+	/* Where each letter's titles begin. Not known yet (a host-backed list fetches the table the first time a
+	 * tab is shown) means the press has nothing to act on. */
+	int s[28];
+	for (int k = 0; k < 28; k++)
+	{
+		s[k] = (k == 27) ? n : src_letter(u, u->tab, k);
+		if (s[k] < 0) return 0;
+	}
 
+	/* The letter the selection is in: the last one that has titles and begins at or before it. */
+	int cur = 0;
+	for (int k = 0; k < 27; k++)
+		if (s[k] < s[k + 1] && s[k] <= u->sel) cur = k;
+
+	int to = u->sel;
 	if (dir > 0)
 	{
-		int i = u->sel;
-		while (i < n && letter_key(u->games[idx[i]].title) == cur) i++;
-		to = (i >= n) ? 0 : i;              /* past the last letter wraps to the first */
-	}
-	else
-	{
-		int start = u->sel;
-		while (start > 0 && letter_key(u->games[idx[start - 1]].title) == cur) start--;
-		if (start < u->sel)
+		int k = cur + 1;
+		while (k < 27 && s[k] >= s[k + 1]) k++;           /* skip letters with no titles */
+		if (k < 27)
 		{
-			to = start;                     /* first press goes to the top of this letter */
-		}
-		else if (start > 0)
-		{
-			int k = letter_key(u->games[idx[start - 1]].title);
-			int i = start - 1;
-			while (i > 0 && letter_key(u->games[idx[i - 1]].title) == k) i--;
-			to = i;                         /* then to the top of the one before */
+			to = s[k];
 		}
 		else
 		{
-			int k = letter_key(u->games[idx[n - 1]].title);
-			int i = n - 1;
-			while (i > 0 && letter_key(u->games[idx[i - 1]].title) == k) i--;
-			to = i;                         /* before the first letter wraps to the last */
+			k = 0;                                         /* past the last letter wraps to the first */
+			while (k < 27 && s[k] >= s[k + 1]) k++;
+			to = (k < 27) ? s[k] : 0;
+		}
+	}
+	else
+	{
+		if (u->sel > s[cur])
+		{
+			to = s[cur];                                   /* first press goes to the top of this letter */
+		}
+		else
+		{
+			int k = cur - 1;
+			while (k >= 0 && s[k] >= s[k + 1]) k--;
+			if (k >= 0)
+			{
+				to = s[k];                                 /* then to the top of the one before */
+			}
+			else
+			{
+				k = 26;                                    /* before the first letter wraps to the last */
+				while (k >= 0 && s[k] >= s[k + 1]) k--;
+				to = (k >= 0) ? s[k] : 0;
+			}
 		}
 	}
 
@@ -594,9 +678,7 @@ void ph_ui_set_safe(ph_ui *u, int l, int t, int r, int b)
 	u->safe.b = clamp_even(b, PH_SAFE_MAX_Y);
 
 	/* The list shows more or fewer rows now, so the scroll position may no longer be valid. */
-	int idx[PH_MAX_GAMES];
-	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
-	fix_scroll(u, n);
+	fix_scroll(u, src_count(u, u->tab));
 	u->dirty = 1;
 }
 
@@ -661,8 +743,7 @@ int ph_ui_animate(ph_ui *u, uint32_t tick_ms)
 	const ph_game *g = ph_ui_selected(u);
 	if (!g) return 0;
 
-	int idx[PH_MAX_GAMES];
-	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
+	int n = src_count(u, u->tab);
 	int winw = title_window(u, g, n, 0, 0);
 	int full = (int)strlen(g->title) * PH_NARROW_W;
 	if (full <= winw)
@@ -718,7 +799,10 @@ static void draw_header(ph_ui *u)
 	uint32_t led;
 	switch (u->host_state)
 	{
-	case PH_HOST_ONLINE:  label = "HOST ONLINE";   led = C_GREEN;  break;
+	case PH_HOST_ONLINE:
+		label = u->lib_scanning ? "HOST SCANNING" : "HOST ONLINE";
+		led = u->lib_scanning ? C_YELLOW : C_GREEN;
+		break;
 	case PH_HOST_OFFLINE: label = "NO HOST";       led = C_RED;    break;
 	default:              label = "SEARCHING...";  led = C_YELLOW; break;
 	}
@@ -760,8 +844,7 @@ static void draw_tabs(ph_ui *u)
 
 	/* Position within the filtered list, parked at the right end of the strip. Measured
 	 * first because the tabs get whatever width it does not want. */
-	int idx[PH_MAX_GAMES];
-	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
+	int n = src_count(u, u->tab);
 	char cnt[32];
 	snprintf(cnt, sizeof(cnt), "%d/%d", n ? u->sel + 1 : 0, n);
 
@@ -840,6 +923,18 @@ static void draw_empty(ph_ui *u, int x, int y, int w, int any_games)
 		return;
 	}
 
+	if (u->host_state == PH_HOST_ONLINE && u->lib_scanning)
+	{
+		text_n(u, cx, cy, "The host is scanning your ROM folders...", C_AMBER);
+		text_n(u, cx, cy + 26, "Games appear here as they are found.", C_TEXT_DIM);
+		return;
+	}
+	if (u->host_state == PH_HOST_ONLINE && u->lib_loading)
+	{
+		text_n(u, cx, cy, "Loading the library...", C_AMBER);
+		return;
+	}
+
 	switch (u->host_state)
 	{
 	case PH_HOST_SEARCHING:
@@ -879,12 +974,11 @@ static void draw_list(ph_ui *u)
 	text_n_right(u, x + w - 12, L.list_y + 5, "SYSTEM", C_TEXT_MUTE);
 	rect(u, x + 2, L.list_y + LIST_HDR_H, w - 4, 2, C_BORDER);
 
-	int idx[PH_MAX_GAMES];
-	int n = ph_ui_filtered(u, idx, PH_MAX_GAMES);
+	int n = src_count(u, u->tab);
 
 	if (n == 0)
 	{
-		draw_empty(u, x, L.list_y + LIST_HDR_H, w, u->count > 0);
+		draw_empty(u, x, L.list_y + LIST_HDR_H, w, src_count(u, PH_TAB_ALL) > 0);
 		return;
 	}
 
@@ -897,18 +991,11 @@ static void draw_list(ph_ui *u)
 		int vi = r + u->scroll;
 		if (vi >= n) break;
 
-		const ph_game *g = &u->games[idx[vi]];
+		/* NULL: the page holding this row is still on its way from the host. */
+		const ph_game *g = src_row(u, u->tab, vi);
 		int ry = inner_y + r * ROW_H;
 		int sel = (vi == u->sel);
-
-		/* The system column is right-aligned and variable width, so the title's
-		 * budget has to be measured against this row's actual system string. A
-		 * fixed split ran "Capcom CPS-3" straight through the end of "Street
-		 * Fighter III: 3rd Strike". */
-		const char *sys = g->sysname[0] ? g->sysname : g->system;
-		int sys_x, sys_w;
 		int tx = x + 30;
-		int title_w = title_window(u, g, n, &sys_x, &sys_w);
 
 		if (sel)
 		{
@@ -920,6 +1007,22 @@ static void draw_list(ph_ui *u)
 		{
 			rect(u, x + 2, ry, w - 4, ROW_H, (vi & 1) ? C_ROW_B : C_ROW_A);
 		}
+
+		if (!g)
+		{
+			/* A bar where the title will be, a different length each row so it reads as text on its way and not
+			 * as a ruled line. Drawn rather than left blank because blank looks like an empty entry. */
+			rect(u, tx, ry + 6, 96 + (vi * 53) % 168, 8, sel ? C_AMBER_DK : C_BORDER);
+			continue;
+		}
+
+		/* The system column is right-aligned and variable width, so the title's
+		 * budget has to be measured against this row's actual system string. A
+		 * fixed split ran "Capcom CPS-3" straight through the end of "Street
+		 * Fighter III: 3rd Strike". */
+		const char *sys = g->sysname[0] ? g->sysname : g->system;
+		int sys_x, sys_w;
+		int title_w = title_window(u, g, n, &sys_x, &sys_w);
 
 		uint32_t tc = sel ? C_AMBER_HI : C_TEXT;
 
@@ -974,7 +1077,8 @@ static void draw_detail(ph_ui *u)
 	const ph_game *g = ph_ui_selected(u);
 	if (!g)
 	{
-		text_n(u, x + 12, L.detail_y + 4, "--", C_TEXT_MUTE);
+		const int waiting = u->host_state == PH_HOST_ONLINE && src_count(u, u->tab) > 0;
+		text_n(u, x + 12, L.detail_y + 4, waiting ? "Loading..." : "--", C_TEXT_MUTE);
 		return;
 	}
 
