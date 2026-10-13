@@ -80,6 +80,21 @@ int      groovy_ps2_inputs_enabled(void);
 /* After the launcher takes the screen from a running stream, how long the launch button
  * must stay untouched before it will launch anything. See try_launch(). */
 #define T_TAKEOVER_GUARD 1500
+
+/* How long a session that has ended is waited on before the launcher takes the screen.
+ * GRACE is always waited: a client that reconnects sends CMD_CLOSE and then CMD_INIT, and
+ * has to be given time to do the second half. While the host says an emulator is still
+ * running the wait continues, up to HOLD_CAP, asking every POLL. Overridable so the test
+ * can run in seconds rather than half a minute. */
+#ifndef T_CLOSE_GRACE
+#define T_CLOSE_GRACE     2500
+#endif
+#ifndef T_CLOSE_HOLD_CAP
+#define T_CLOSE_HOLD_CAP 20000
+#endif
+#ifndef T_CLOSE_POLL
+#define T_CLOSE_POLL       400
+#endif
 #define T_STATUS_SHOW    6000   /* how long a transient message sits in the detail bar */
 
 /* One 480i field is ~16.7ms; there is no point building frames faster than the CRT
@@ -110,6 +125,13 @@ static int       rep_n[4];
 static int       stream_was_live = 0;
 static int       guard_on        = 0;
 static uint32_t  guard_until     = 0;
+
+/* A session that has ended and is being waited on (see phantom_session_ended). end_host is
+ * what the host last said since the wait began: -1 nothing, 0 no game running, 1 running. */
+static int       end_reason  = 0;
+static uint32_t  end_since   = 0;
+static uint32_t  end_poll_at = 0;
+static int       end_host    = -1;
 
 static int       sock = -1;
 static int       cfg_port = PH_DEF_PORT;
@@ -455,6 +477,12 @@ static void drain(void)
 				send_to(live_host, "GET_CATALOG");
 			}
 		}
+		else if (!strncmp(buf, "STATUS:", 7))
+		{
+			/* The answer to our STATUS poll. Only meaningful while a session end is being
+			 * waited on; an old host never sends it, which reads as "no answer". */
+			end_host = strstr(buf, "RUNNING") ? 1 : 0;
+		}
 		else if (!strncmp(buf, "ACK:LAUNCH", 10))
 		{
 			LOGP("host acked launch\n");
@@ -604,6 +632,7 @@ void phantom_stop(void)
 	if (shadow) { free(shadow); shadow = 0; }
 	ui.fb = 0;
 	owns_screen = 0;
+	end_reason = 0;
 	inited = 0;
 }
 
@@ -637,6 +666,7 @@ int phantom_idle_enter(void)
 	 * hotkey - and a press that lands first would launch whatever row is highlighted,
 	 * which the host answers by killing the game they were in. */
 	memset(rep_dir, 0, sizeof(rep_dir));
+	end_reason = 0;   /* whatever was being waited on has been decided, one way or another */
 	if (stream_was_live)
 	{
 		stream_was_live = 0;
@@ -682,6 +712,72 @@ int phantom_owns_screen(void)
 	return owns_screen;
 }
 
+/* ---- ending a session without taking the screen ------------------------------------- */
+
+int phantom_session_ended(int reason)
+{
+	/* Nothing to protect: the launcher is not the idle screen, or is already showing. */
+	if (!inited || idle_mode != PHANTOM_IDLE_LAUNCHER || owns_screen) return 0;
+	if (end_reason) return 2;
+
+	end_reason  = reason;
+	end_since   = now_ms();
+	end_host    = -1;
+	end_poll_at = end_since + T_CLOSE_POLL;
+	send_to(live_host, "STATUS");
+
+	LOGP("session ended (%s); holding the screen for at least %dms\n",
+		 reason == PHANTOM_END_TIMEOUT ? "client went quiet" : "client closed", T_CLOSE_GRACE);
+	return 1;
+}
+
+void phantom_session_alive(int how)
+{
+	if (!end_reason) return;
+	if (how == PHANTOM_ALIVE_ACTIVITY && end_reason != PHANTOM_END_TIMEOUT) return;
+
+	LOGP("client is back after %ums; the launcher never took the screen\n", (unsigned)(now_ms() - end_since));
+	end_reason = 0;
+}
+
+/* Called from the idle poll, which runs whether or not the launcher is on screen. */
+static void end_tick(void)
+{
+	if (!end_reason) return;
+
+	uint32_t t    = now_ms();
+	uint32_t held = t - end_since;
+	const char *why = 0;
+
+	if (held >= T_CLOSE_GRACE)
+	{
+		if (end_host == 1)
+		{
+			/* A game is alive but not streaming. Keep the last frame up rather than the
+			 * menu - up to a point, so a hung emulator cannot hold the screen for ever. */
+			if (held >= T_CLOSE_HOLD_CAP) why = "no stream for too long, although the host still reports a game";
+		}
+		else
+		{
+			why = (end_host == 0) ? "the host reports no game running" : "no answer from the host";
+		}
+	}
+
+	if (why)
+	{
+		LOGP("taking the screen after %ums: %s\n", (unsigned)held, why);
+		end_reason = 0;
+		groovy_force_close();   /* setClose(): which raises the idle screen, so we arrive in idle_enter */
+		return;
+	}
+
+	if ((int32_t)(t - end_poll_at) >= 0)
+	{
+		send_to(live_host, "STATUS");
+		end_poll_at = t + T_CLOSE_POLL;
+	}
+}
+
 void phantom_idle_poll(void)
 {
 	if (!inited) return;
@@ -691,6 +787,7 @@ void phantom_idle_poll(void)
 	/* The network half runs even when the launcher is not on screen, so that the
 	 * catalog and the host's state are already current the moment a stream ends. */
 	drain();
+	end_tick();
 
 	int searching = (ui.host_state != PH_HOST_ONLINE);
 	uint32_t interval = T_DISCOVER_FAST;

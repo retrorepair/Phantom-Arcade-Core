@@ -36,6 +36,18 @@
 #include "phantom.h"
 #include "user_io.h" /* JOY_* - the same bit values the core uses (found via -I hps_linux/src) */
 
+/* Must match what phantom.cpp is built with (tools/run_phantom_input_test.sh passes the same
+ * values to both), shortened so the session-end scenarios run in seconds. */
+#ifndef T_CLOSE_GRACE
+#define T_CLOSE_GRACE 2500
+#endif
+#ifndef T_CLOSE_HOLD_CAP
+#define T_CLOSE_HOLD_CAP 30000
+#endif
+#ifndef T_CLOSE_POLL
+#define T_CLOSE_POLL 400
+#endif
+
 #ifndef TEST_PORT
 #define TEST_PORT 19999
 #endif
@@ -46,6 +58,9 @@
 /* ---- the six hooks phantom.cpp expects groovy.cpp to provide ------------------------- */
 
 static int g_forwarded = 0; /* pad events the launcher did NOT consume = events the emulator got */
+static std::atomic<int> g_closes{0};      /* times the core was told to really close the session */
+static std::atomic<int> g_status_mode{0}; /* what the fake host says to STATUS: 0 nothing (an old
+                                           * host), 1 RUNNING, 2 IDLE */
 
 extern "C" {
 uint32_t groovy_idle_canvas_bytes(void) { return 720u * 480u * 3u; }
@@ -57,7 +72,11 @@ int      groovy_ps2_inputs_enabled(void) { return 0; }
 /* In the core this is setClose(), which re-raises the idle screen - and with the launcher
  * as the idle screen, that is phantom_idle_enter(). Mirrored here because it is exactly the
  * path the exit hotkey takes. */
-void groovy_force_close(void) { phantom_idle_enter(); }
+void groovy_force_close(void)
+{
+    g_closes++;
+    phantom_idle_enter();
+}
 }
 
 /* ---- a fake PC daemon ------------------------------------------------------------- */
@@ -93,6 +112,11 @@ static void host_thread(int fd)
             sendto(fd, r, strlen(r), 0, (sockaddr *) &from, fl);
         } else if (m == "GET_CATALOG") {
             sendto(fd, CATALOG, strlen(CATALOG), 0, (sockaddr *) &from, fl);
+        } else if (m == "STATUS") {
+            int         mode = g_status_mode;
+            const char *r    = mode == 1 ? "STATUS:RUNNING" : mode == 2 ? "STATUS:IDLE" : nullptr;
+            if (r)
+                sendto(fd, r, strlen(r), 0, (sockaddr *) &from, fl);
         }
     }
 }
@@ -320,6 +344,93 @@ int main()
     pump(50);
     check(count_rx("LAUNCH:") == launches_before + 1, "Enter after a pause still launches (%d)",
           count_rx("LAUNCH:") - launches_before);
+
+    /* ---------------------------------------------------------------------------- */
+    section("7. a session that ends is waited on - the launcher must not take the screen from a live game");
+    const int GRACE = T_CLOSE_GRACE, CAP = T_CLOSE_HOLD_CAP, POLL = T_CLOSE_POLL;
+    std::printf("  (grace %dms, cap %dms, poll %dms)\n", GRACE, CAP, POLL);
+    phantom_idle_leave(); /* a game is streaming */
+    pump(100);
+
+    /* 7a: the case that matters. A client reconnects: CMD_CLOSE, then CMD_INIT a moment later. */
+    g_status_mode = 1;
+    int closes0   = g_closes;
+    int asks0     = count_rx("STATUS");
+    check(phantom_session_ended(PHANTOM_END_CLOSE) == 1, "a close while streaming is taken over by the launcher");
+    check(phantom_session_ended(PHANTOM_END_CLOSE) == 2, "a repeat just reports it is already waiting");
+    pump(GRACE / 2);
+    check(phantom_owns_screen() == 0 && g_closes == closes0, "nothing taken at half the grace");
+    phantom_session_alive(PHANTOM_ALIVE_INIT); /* the client's CMD_INIT */
+    pump(GRACE * 2);
+    check(phantom_owns_screen() == 0 && g_closes == closes0,
+          "a client that re-inits is never interrupted, however long we then wait (screen=%d closes=%d)",
+          phantom_owns_screen(), (int) g_closes - closes0);
+    check(count_rx("STATUS") > asks0, "the host was asked whether a game is running (%d asks)",
+          count_rx("STATUS") - asks0);
+
+    /* 7b: no reconnect, but the host says the game is alive. Hold - up to the cap. */
+    g_status_mode = 1;
+    closes0       = g_closes;
+    phantom_session_ended(PHANTOM_END_CLOSE);
+    pump(GRACE + 600);
+    check(phantom_owns_screen() == 0 && g_closes == closes0,
+          "game reported running: still holding the last frame %dms in, past the grace", GRACE + 600);
+    pump(CAP - (GRACE + 600) + 600);
+    check(phantom_owns_screen() == 1 && g_closes == closes0 + 1,
+          "...but not for ever: a hung emulator cannot hold the screen past the cap");
+    phantom_idle_leave();
+    pump(100);
+
+    /* 7c: the host says nothing is running (a normal quit). Only the grace is waited. */
+    g_status_mode = 2;
+    closes0       = g_closes;
+    phantom_session_ended(PHANTOM_END_CLOSE);
+    pump(GRACE - 150);
+    check(phantom_owns_screen() == 0 && g_closes == closes0, "host idle: still waiting just inside the grace");
+    pump(400);
+    check(phantom_owns_screen() == 1 && g_closes == closes0 + 1, "host idle: the launcher takes the screen after the grace");
+    phantom_idle_leave();
+    pump(100);
+
+    /* 7d: an old host never answers STATUS at all. Same as idle: the grace, then close. */
+    g_status_mode = 0;
+    closes0       = g_closes;
+    phantom_session_ended(PHANTOM_END_CLOSE);
+    pump(GRACE - 150);
+    check(phantom_owns_screen() == 0, "no answer from the host: still waiting just inside the grace");
+    pump(400);
+    check(phantom_owns_screen() == 1 && g_closes == closes0 + 1, "no answer from the host: closes after the grace");
+    phantom_idle_leave();
+    pump(100);
+
+    /* 7e: the game ends while we are holding for it. */
+    g_status_mode = 1;
+    closes0       = g_closes;
+    phantom_session_ended(PHANTOM_END_CLOSE);
+    pump(GRACE + 400);
+    check(phantom_owns_screen() == 0, "held while the host reports a game");
+    g_status_mode = 2; /* it quits */
+    pump(POLL * 2 + 100);
+    check(phantom_owns_screen() == 1 && g_closes == closes0 + 1,
+          "the launcher appears within a poll or two of the game actually ending");
+    phantom_idle_leave();
+    pump(100);
+
+    /* 7f: the two reasons are cancelled differently. */
+    g_status_mode = 2;
+    closes0       = g_closes;
+    phantom_session_ended(PHANTOM_END_TIMEOUT); /* a stall... */
+    phantom_session_alive(PHANTOM_ALIVE_ACTIVITY); /* ...that ended on its own */
+    pump(GRACE + 400);
+    check(phantom_owns_screen() == 0 && g_closes == closes0, "a stalled client that resumes cancels the wait");
+    phantom_session_ended(PHANTOM_END_CLOSE);
+    phantom_session_alive(PHANTOM_ALIVE_ACTIVITY); /* a stray datagram after CMD_CLOSE */
+    pump(GRACE + 400);
+    check(phantom_owns_screen() == 1 && g_closes == closes0 + 1,
+          "...but a stray datagram after CMD_CLOSE does not cancel the close");
+
+    /* 7g: nothing to protect once the launcher is up. */
+    check(phantom_session_ended(PHANTOM_END_CLOSE) == 0, "with the launcher already showing, the caller just closes");
 
     g_stop = true;
     host.join();

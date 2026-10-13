@@ -19,9 +19,9 @@ mkdir -p "$out"
 
 gcc -std=c11 -O1 -c "$grv/phantom_ui.c" -I "$grv" -o "$out/phantom_ui.o"
 g++ -std=c++17 -O1 -Wall -c "$phantom_cpp" -I "$src" -I "$grv" -I "$upstream" \
-    -DPH_INI="\"$out/phantom.ini\"" -DPH_CACHE="\"$out/cache.tsv\"" -o "$out/phantom.o"
+    -DPH_INI="\"$out/phantom.ini\"" -DPH_CACHE="\"$out/cache.tsv\"" -DT_CLOSE_GRACE=600 -DT_CLOSE_HOLD_CAP=3000 -DT_CLOSE_POLL=100 -o "$out/phantom.o"
 g++ -std=c++17 -O1 -Wall -pthread "$here/tools/phantom_input_test.cpp" \
-    "$out/phantom.o" "$out/phantom_ui.o" -I "$src" -I "$grv" -I "$upstream" -DTEST_DIR="\"$out\"" \
+    "$out/phantom.o" "$out/phantom_ui.o" -I "$src" -I "$grv" -I "$upstream" -DTEST_DIR="\"$out\"" -DT_CLOSE_GRACE=600 -DT_CLOSE_HOLD_CAP=3000 -DT_CLOSE_POLL=100 \
     -o "$out/phantom_input_test"
 
 exec "$out/phantom_input_test"

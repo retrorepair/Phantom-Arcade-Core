@@ -54,6 +54,33 @@ int phantom_keyboard(uint16_t key, int press);
  * host to kill the emulator. Returns 1 once, on the frame the combo completes. */
 int phantom_exit_hotkey(unsigned char joy, uint32_t bitmask);
 
+/* A session ending is not the same as the stream being over, and the launcher must never
+ * take the screen from a game that is still being played - least of all mid-match. Taking
+ * it reprograms the whole video mode and then the client's own modeline reprograms it
+ * back, so even a reconnect that lasts a fraction of a second would be a hard break on
+ * the CRT, with the pad belonging to the menu in between.
+ *
+ * groovy.cpp therefore asks before closing, instead of closing and then raising the idle
+ * screen. phantom_session_ended() returns 0 when the caller should close now (launcher not
+ * the idle screen, or already on screen), and non-zero when it has taken responsibility for
+ * the close and will call groovy_force_close() itself if the session does not come back:
+ * 1 the first time, 2 on every later call while it is still waiting.
+ *
+ * It always waits a grace period, which covers a client reconnecting. It waits longer for
+ * as long as the host says an emulator is still running, up to a cap, because a game that
+ * is alive but not streaming is a stall, and the launcher is no help to anyone in one. */
+#define PHANTOM_END_CLOSE    1   /* the client sent CMD_CLOSE */
+#define PHANTOM_END_TIMEOUT  2   /* a keepalive client went quiet past the idle timeout */
+int  phantom_session_ended(int reason);
+
+/* The client is demonstrably back. INIT: it sent CMD_INIT, which cancels either kind of
+ * wait. ACTIVITY: it sent anything at all, which only cancels a TIMEOUT wait - a client
+ * that sent CMD_CLOSE may well send a stray datagram after it, and that must not cancel
+ * the close. */
+#define PHANTOM_ALIVE_INIT      1
+#define PHANTOM_ALIVE_ACTIVITY  2
+void phantom_session_alive(int how);
+
 /* OSD page (menu.cpp). */
 int         phantom_get_idle_mode(void);
 void        phantom_set_idle_mode(int mode);

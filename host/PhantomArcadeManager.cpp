@@ -42,6 +42,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include "emulator_status.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -187,6 +188,7 @@ static const char* LegacyKeyFor(const char* key) {
 
 std::atomic<bool> g_daemonRunning(false);
 std::atomic<DWORD> g_activePid(0);
+std::atomic<ULONGLONG> g_activeStart(0);   // that process's creation time, so a recycled pid is not mistaken for it
 std::atomic<int> g_configuredPort(1999);
 SOCKET g_udpSocket = INVALID_SOCKET;
 SOCKET g_httpSocket = INVALID_SOCKET;
@@ -1620,6 +1622,11 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
     }
 
     g_activePid = pi.dwProcessId;
+    {
+        FILETIME c, e, k, u;
+        g_activeStart = GetProcessTimes(pi.hProcess, &c, &e, &k, &u)
+                            ? (((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime) : 0;
+    }
     CloseHandle(pi.hThread);
 
     // Spawning successfully is not the same as running. Emulators exit within a second
@@ -1754,6 +1761,36 @@ DWORD WINAPI HttpThreadProc(LPVOID lpParam) {
 
 
 
+// ---- is an emulator running? ----------------------------------------------------------
+//
+// Answers the cabinet's STATUS request; the checks themselves live in emulator_status.h so
+// they can be tested against a real process (emulator_status_test.cpp).
+//
+// The emulator we started. g_activePid is only cleared on a KILL or a relaunch, never when
+// the emulator simply exits, so it says nothing on its own: the process has to be looked at.
+static bool LaunchedEmulatorAlive() {
+    return ProcessAliveSince(g_activePid.load(), g_activeStart.load());
+}
+
+// Any emulator at all, by the executables named in the settings. A Fightcade match is started
+// by the Fightcade client, not by us, and that is precisely the case that must not be
+// interrupted.
+static bool AnyConfiguredEmulatorRunning() {
+    std::set<std::wstring> names;
+    for (int i = 0; i < g_emuCount; i++) {
+        std::wstring exe = GetText(g_emus[i].exeEdit);
+        size_t sl = exe.find_last_of(L"\\/");
+        if (sl != std::wstring::npos) exe = exe.substr(sl + 1);
+        for (auto& c : exe) c = (wchar_t)towlower(c);
+        if (!exe.empty()) names.insert(exe);
+    }
+    return AnyProcessNamed(names);
+}
+
+static bool EmulatorRunning() {
+    return LaunchedEmulatorAlive() || AnyConfiguredEmulatorRunning();
+}
+
 DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
     int port = g_configuredPort.load();
 
@@ -1851,6 +1888,10 @@ DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
                 sendto(g_udpSocket, reply, (int)strlen(reply), 0, (sockaddr*)&clientAddr, clientLen);
             } else if (msg == "PING") {
                 const char* reply = "PONG";
+                sendto(g_udpSocket, reply, (int)strlen(reply), 0, (sockaddr*)&clientAddr, clientLen);
+            } else if (msg == "STATUS") {
+                // Asked by the cabinet whenever a stream ends: see EmulatorRunning().
+                const char* reply = EmulatorRunning() ? "STATUS:RUNNING" : "STATUS:IDLE";
                 sendto(g_udpSocket, reply, (int)strlen(reply), 0, (sockaddr*)&clientAddr, clientLen);
             }
         }

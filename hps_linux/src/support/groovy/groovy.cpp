@@ -2747,7 +2747,10 @@ static inline void process_packet(char *recvbufPtr, int len)
 					if (len == 1 && isConnected)   // ignore duplicate/stale closes: re-running teardown
 					{                              // on an already-closed core double-freed poc (now NULLed too)
 						LOG(1, "[CMD_CLOSE][%d]\n", recvbufPtr[0]);
-						setClose();
+						// A client closing is also what a reconnecting client does, a moment before
+						// it sends CMD_INIT. Ask the launcher first: it may hold the screen rather
+						// than switch the whole video mode to the menu and back.
+						if (!phantom_session_ended(PHANTOM_END_CLOSE)) setClose();
 					}
 				}; break;
 
@@ -2766,6 +2769,7 @@ static inline void process_packet(char *recvbufPtr, int len)
 						if (clientCaps) LOG(1, "[CMD_INIT][caps=0x%02x]\n", clientCaps);
 						LOG(1, "[CMD_INIT][%d][LZ4=%d][Audio rate=%d chan=%d][%s][ver=%d]\n", recvbufPtr[0], compression, audio_rate, audio_channels, (rgb_mode == 1) ? "RGBA888" : (rgb_mode == 2) ? "RGB565" : "RGB888", GROOVY_VERSION);
 						LOG(1, "[RECV_MODE][%d]\n", recvMode);
+						phantom_session_alive(PHANTOM_ALIVE_INIT);   // a reconnect: cancel any wait on the close
 						setInit(compression, audio_rate, audio_channels, rgb_mode);
 						sendACK(0, 0);						
 					}
@@ -3503,12 +3507,19 @@ void groovy_poll()
 		{
 			idleDeadline = GetTimer(idleTimeoutMs);
 			sawActivity = 0;
+			phantom_session_alive(PHANTOM_ALIVE_ACTIVITY);   // it was only a long stall: cancel a wait on it
 		}
 		else if ((clientCaps & CAP_KEEPALIVE) && CheckTimer(idleDeadline))
 		{
-			LOG(0, "[TIMEOUT][no client activity %ums][isBlitting=%d isCorePriority=%d][housekeeping]\n", idleTimeoutMs, isBlitting, isCorePriority);
-			if (fp) fflush(fp);
-			setClose();
+			// 0: close now. 1: the launcher is holding the screen and has taken the close over.
+			// 2: it is still holding it from an earlier poll; say nothing, this runs every poll.
+			int held = phantom_session_ended(PHANTOM_END_TIMEOUT);
+			if (held != 2)
+			{
+				LOG(0, "[TIMEOUT][no client activity %ums][isBlitting=%d isCorePriority=%d][%s]\n", idleTimeoutMs, isBlitting, isCorePriority, held ? "holding the screen" : "housekeeping");
+				if (fp) fflush(fp);
+			}
+			if (!held) setClose();
 		}
 	}
 
