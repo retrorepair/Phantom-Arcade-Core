@@ -115,7 +115,10 @@ static EmulatorDef g_emus[] = {
     { "fbneo", L"FBNeo (Fightcade)", "FBNeo Arcade",
       L"C:\\Emulators\\fbneo\\fcadefbneo.exe", L"C:\\Emulators\\fbneo\\ROMs",
       L".zip,.7z",
-      L"\"{rom}\"",
+      // FBNeo takes a game's short name, not a path: its command line is compared with each
+      // driver's name for an exact match, so a ROM path matches nothing and it stops with a
+      // "not supported" error. It finds the zip itself, in its ROM folder.
+      L"{rom_stem}",
       "15kHz Native", NULL, NULL },
 
     { "flycast", L"Flycast (Dojo)", "Sega Dreamcast / NAOMI",
