@@ -17,6 +17,7 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 
 #ifdef _WIN32
  #include <winsock2.h>
@@ -45,6 +46,11 @@ public:
     void publish(const uint8_t* pixels, int width, int height, int mode) {
         if (!pixels || width <= 0 || height <= 0) return;
         if (!enabled()) return;
+        // The browser is a preview, not part of the CRT timing path. Cap copies to
+        // 20 fps so enabling it cannot add a full-frame memcpy on every 60 Hz blit.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastPublish < std::chrono::milliseconds(50)) return;
+        lastPublish = now;
         const int bpp = mode == 1 ? 4 : mode == 2 ? 2 : 3;
         const size_t bytes = (size_t)width * (size_t)height * (size_t)bpp;
         if (bytes > 720u * 576u * 4u) return;
@@ -60,7 +66,7 @@ public:
     }
 
 private:
-    GMBrowserMonitor() : started(false), frameWidth(0), frameHeight(0), frameMode(0), frameSequence(0) {}
+    GMBrowserMonitor() : started(false), frameWidth(0), frameHeight(0), frameMode(0), frameSequence(0), lastPublish(std::chrono::steady_clock::now() - std::chrono::seconds(1)) {}
     GMBrowserMonitor(const GMBrowserMonitor&) = delete;
     GMBrowserMonitor& operator=(const GMBrowserMonitor&) = delete;
 
@@ -221,6 +227,7 @@ private:
     std::vector<uint8_t> raw;
     int frameWidth, frameHeight, frameMode;
     uint64_t frameSequence;
+    std::chrono::steady_clock::time_point lastPublish;
 };
 
 inline void gm_browser_monitor_publish(const char* pixels, int width, int height, int mode) {
