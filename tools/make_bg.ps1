@@ -11,7 +11,7 @@
   Copy the result to the card (Samba, FTP or scp) as /media/fat/config/phantom_bg.ppm. It is picked up the next time
   the menu comes back to the screen; delete the file to go back to the plain menu. Optional settings, in
   /media/fat/config/phantom.ini under [LAUNCHER]:  BG_DIM=50 (brightness the picture is dimmed to, percent),
-  BG_PANELS=200 and BG_LIST=128 (how solid the panels and the game list are, out of 255).
+  BG_PANELS=200 and BG_LIST=102 (how solid the panels and the game list are, out of 255; 102 is 60% see-through).
 
 .EXAMPLE
   .\make_bg.ps1 -In "C:\pics\ssf2t-title.png" -Out phantom_bg.ppm

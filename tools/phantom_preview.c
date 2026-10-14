@@ -13,7 +13,7 @@
  *       [--bg picture.ppm [--dim PERCENT] [--panels ALPHA] [--list ALPHA]]
  *
  * --bg puts a 720x480 P6 picture behind the whole launcher, dimmed to --dim percent (default 50), with the
- * panels drawn over it at --panels opacity (0..255, default 200) and the game list at --list (default 128: half see-through).
+ * panels drawn over it at --panels opacity (0..255, default 200) and the game list at --list (default 102: 60% see-through).
  *
  * --big N shows a library of N titles the way a host-backed list does (no array behind it); --have LO,HI
  * says which rows have arrived, the rest drawing as placeholders.

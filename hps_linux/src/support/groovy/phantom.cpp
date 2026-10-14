@@ -819,6 +819,17 @@ static void drain(void)
 			cat.want_info = 1;
 			ui.dirty = 1;
 		}
+		else if (!strncmp(buf, "LAUNCHFAIL:", 11))
+		{
+			/* The emulator would not start, stopped straight away, or is sitting behind an error dialog on the PC.
+			 * Until the host said so, this screen waited three minutes on "starting the emulator". */
+			LOGP("launch failed on the host: %s\n", buf + 11);
+			awaiting_video = 0;
+			ui.view = PH_VIEW_LIST;
+			snprintf(ui.status, sizeof(ui.status), "%s", buf + 11);
+			t_status_set = now_ms() + 5000;   /* an error is worth reading: about eleven seconds, not six */
+			ui.dirty = 1;
+		}
 		else if (!strncmp(buf, "ACK:LAUNCH", 10))
 		{
 			LOGP("host acked launch\n");

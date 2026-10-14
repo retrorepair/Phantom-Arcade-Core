@@ -183,13 +183,13 @@ inside the margins.
 ### A picture behind the menu
 
 Put a 720x480 picture at `/media/fat/config/phantom_bg.ppm` and the launcher shows it dimmed to half brightness
-behind everything, with the panels drawn over it translucently: the game list half see-through, the header, tab strip
+behind everything, with the panels drawn over it translucently: the game list 60% see-through, the header, tab strip
 and legend more solid, and all the text and the button colours fully solid. Take the file away and the menu is as it
 was. It is read every time the menu comes back to the screen, so a new picture needs no restart.
 
 `tools/make_bg.ps1 -In picture.png -Out phantom_bg.ppm` makes the file from any PNG/JPG (centre-cropped to the
 screen's 4:3 so nothing is stretched; `-Fit Stretch` squeezes the whole picture instead). Settings, under `[LAUNCHER]`
-in `phantom.ini`: `BG_DIM=50` (percent of brightness kept), `BG_PANELS=200` and `BG_LIST=128` (how solid the panels
+in `phantom.ini`: `BG_DIM=50` (percent of brightness kept), `BG_PANELS=200` and `BG_LIST=102` (how solid the panels
 and the game list are, out of 255). The screen-adjust page never shows the picture. A frame costs about 11 ms on the
 HPS over a picture (7 ms without), against a 16.7 ms field.
 
@@ -288,7 +288,7 @@ gcc -O2 -Ihps_linux/src/support/groovy -o /tmp/p \
     tools/phantom_preview.c hps_linux/src/support/groovy/phantom_ui.c
 /tmp/p out.ppm --busy          # render any screen to a file and look at it
 /tmp/p out.ppm --big 298765 --sel 123456 --have 0,123460   # a huge library, some rows still on their way
-/tmp/p out.ppm --bg picture.ppm   # the menu over a dimmed picture (720x480 P6), the game list half see-through
+/tmp/p out.ppm --bg picture.ppm   # the menu over a dimmed picture (720x480 P6), the game list 60% see-through
 tools/phantom_render_bench.c       # what a frame costs, flat and over a picture (build it for the ARM to measure the HPS)
 ```
 

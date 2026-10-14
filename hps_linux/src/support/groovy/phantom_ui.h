@@ -127,7 +127,7 @@ typedef struct
 /* How solid the panels are over a background picture, out of 255. The list is half see-through; the header,
  * tab strip, detail line and legend are more solid because they carry small text and the button colours. */
 #define PH_BG_PANEL_ALPHA 200
-#define PH_BG_LIST_ALPHA  128
+#define PH_BG_LIST_ALPHA  102
 
 typedef struct
 {

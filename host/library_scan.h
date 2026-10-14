@@ -303,6 +303,18 @@ inline ScanStats RunScan(const std::vector<ScanTarget>& targets, const ScanServi
             for (char ch : s) if (ch >= 'A' && ch <= 'Z') return false;
             return true;
         };
+        //
+        // For everything else, when one game has several files - Crazy Taxi as a .7z beside a folder holding its .cue and
+        // .bin - the one the emulator can open directly is the one to launch. An archive loses to a loose disc image or
+        // descriptor: Flycast, for one, stops without a word on a .7z of a disc, and the old scan only ever got this right
+        // by the accident of the order the folder was read in.
+        auto archiveRank = [](const std::string& rom) {
+            const size_t dot = rom.rfind('.');
+            if (dot == std::string::npos) return 0;
+            std::string e = rom.substr(dot);
+            for (char& ch : e) if (ch >= 'A' && ch <= 'Z') ch = (char)(ch + 32);
+            return (e == ".zip" || e == ".7z" || e == ".rar") ? 1 : 0;
+        };
         std::unordered_map<std::string, size_t> best;
         std::vector<Cand>& all = kept[ti];
         for (Local& L : locals) {
@@ -314,7 +326,10 @@ inline ScanStats RunScan(const std::vector<ScanTarget>& targets, const ScanServi
                 auto it = best.find(key);
                 if (it == best.end()) { best.emplace(key, all.size()); all.push_back(std::move(c)); continue; }
                 Cand& cur = all[it->second];
-                const bool better = arcade && isLower(c.stem) != isLower(cur.stem) ? isLower(c.stem) : c.rom < cur.rom;
+                bool better;
+                if (arcade && isLower(c.stem) != isLower(cur.stem)) better = isLower(c.stem);
+                else if (!arcade && archiveRank(c.rom) != archiveRank(cur.rom)) better = archiveRank(c.rom) < archiveRank(cur.rom);
+                else better = c.rom < cur.rom;
                 if (better) cur = std::move(c);
             }
         }

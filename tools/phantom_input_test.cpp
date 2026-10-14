@@ -112,6 +112,7 @@ static std::shared_ptr<const phantom::Index> g_ix;
 static std::atomic<int> g_host_paged{1}; /* 1: speaks the paged catalog; 0: an older daemon that only knows GET_CATALOG */
 static std::atomic<int> g_drop_lists{0}; /* swallow this many LIST requests, to see them asked for again */
 static std::atomic<int> g_scanning{0};
+static std::atomic<int> g_fail_launch{0}; /* answer the next LAUNCH with a LAUNCHFAIL, as the PC does when an emulator will not start */
 
 static std::shared_ptr<const phantom::Index> cur_ix()
 {
@@ -197,6 +198,13 @@ static void host_thread(int fd)
         } else if (g_host_paged && m == "RESCAN") {
             const char *r = "RESCAN:OK";
             sendto(fd, r, strlen(r), 0, (sockaddr *) &from, fl);
+        } else if (g_fail_launch > 0 && m.rfind("LAUNCH:", 0) == 0) {
+            g_fail_launch--;
+            const char *r = "ACK:LAUNCH:OK:x";
+            sendto(fd, r, strlen(r), 0, (sockaddr *) &from, fl);
+            usleep(120000); /* the PC takes a moment to find out */
+            const char *bad = "LAUNCHFAIL:RPCS3 is showing an error window on the PC: RPCS3: Fatal Error";
+            sendto(fd, bad, strlen(bad), 0, (sockaddr *) &from, fl);
         } else if (g_host_paged && m.rfind("LAUNCH:@", 0) == 0) {
             /* what the daemon does: refuse a position quoted against a library that is no longer current */
             unsigned ver = 0;
@@ -854,6 +862,25 @@ int main()
         check(count_rx("LAUNCH:") == l0 + 1, "launching works with a picture behind the menu");
         tap(JOY_BTN2, 30);
         unlink(bgpath);
+    }
+
+    /* ---------------------------------------------------------------------------- */
+    section("10. a launch the PC could not carry out is reported, not waited on");
+    {
+        phantom_idle_leave();
+        pump(50);
+        phantom_idle_enter();
+        pump(2200); /* past the takeover guard */
+        int n0 = count_rx("LAUNCH:");
+        g_fail_launch = 1;
+        tap(JOY_BTN1, 30); /* A: launch; the host says OK, then that it could not */
+        check(count_rx("LAUNCH:") == n0 + 1, "the launch was sent");
+        pump(500);
+        /* back at the list: pressing A launches again (on the loading screen it would only cancel) */
+        int n1 = count_rx("LAUNCH:");
+        tap(JOY_BTN1, 30);
+        check(count_rx("LAUNCH:") == n1 + 1, "after the failure report the launcher is back at the list, not still waiting");
+        tap(JOY_BTN2, 30);
     }
 
     g_stop = true;

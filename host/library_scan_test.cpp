@@ -160,6 +160,12 @@ int main(int argc, char** argv) {
     touch(root / "pc" / "Win98 Voodoo" / "86box.cfg");
     touch(root / "pc" / "DOS Box" / "86box.cfg");
     touch(root / "dc" / "crazytaxi.gdi");
+    touch(root / "dc" / "Disc Game (USA).7z");                    // an archive, and beside it a folder holding the real disc:
+    touch(root / "dc" / "Disc Game (USA)" / "Disc Game (USA).cue");   // the cue is what launches
+    touch(root / "dc" / "Disc Game (USA)" / "Disc Game (USA) (Track 1).bin");
+    touch(root / "dc" / "Archive Only.zip");
+    touch(root / "dc" / "Zip And Gdi.zip");
+    touch(root / "dc" / "Zip And Gdi" / "Zip And Gdi.gdi");
 
     auto target = [&](const char* key, const char* name, const char* sub, const wchar_t* exts) {
         ScanTarget t;
@@ -171,7 +177,7 @@ int main(int argc, char** argv) {
     std::vector<ScanTarget> targets = {
         target("groovymame", "GroovyMAME Arcade", "mame", L".zip,.7z,.chd"),
         target("fbneo", "FBNeo Arcade", "fbneo", L".zip,.7z"),
-        target("flycast", "Dreamcast", "dc", L".zip,.gdi,.cdi"),
+        target("flycast", "Dreamcast", "dc", L".zip,.7z,.chd,.gdi,.cdi,.cue,.lst"),
         target("rpcs3", "PS3", "ps3", L".iso,.pkg,.self,.elf,.bin"),
         target("xemu", "Xbox", "xbox", L".iso,.xiso"),
         target("dolphin", "GC/Wii", "gc", L".iso,.rvz"),
@@ -232,6 +238,15 @@ int main(int argc, char** argv) {
     CHECK(find(ix, "dolphin_Plain Game") != nullptr, "plain game");
     CHECK(find(ix, "86box_Win98 Voodoo") != nullptr && find(ix, "86box_DOS Box") != nullptr && !find(ix, "86box_86box"), "86Box machines are named for their folder");
     CHECK(find(ix, "flycast_crazytaxi") != nullptr, "dreamcast game");
+    auto romEndsWith = [&](const char* id, const char* suffix) {
+        const Rec* r = find(ix, id);
+        if (!r) return false;
+        const std::string p = ix.Rom(*r);
+        return p.size() >= strlen(suffix) && p.compare(p.size() - strlen(suffix), strlen(suffix), suffix) == 0;
+    };
+    CHECK(romEndsWith("flycast_Disc Game (USA)", ".cue"), "a disc beside its own archive launches the .cue, not the .7z");
+    CHECK(romEndsWith("flycast_Archive Only", ".zip"), "an archive with nothing else is still launched");
+    CHECK(find(ix, "flycast_Zip And Gdi") != nullptr && !romEndsWith("flycast_Zip And Gdi", ".zip"), "a .gdi beats a .zip of the same name");
     CHECK(c1.ps3 == 1 && c1.xbox == 1, "metadata reads: ps3 %d, xbox %d", c1.ps3.load(), c1.xbox.load());
 
     // every game is under its own system and the lists add up

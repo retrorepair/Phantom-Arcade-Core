@@ -1479,6 +1479,159 @@ static std::wstring ExpandArgs(const std::wstring& tmpl, const std::wstring& rom
     return out;
 }
 
+// ---- telling the cabinet when a launch did not work ----------------------------------------------
+//
+// A launch that failed on the PC - the emulator would not start, stopped straight away, or sat there showing an error
+// dialog - used to say so only in this window, while the cabinet, which had been told ACK:LAUNCH:OK, waited on "Host is
+// starting the emulator..." for three minutes. The address the LAUNCH came from is remembered, and a failure goes back to
+// it as LAUNCHFAIL:<one line the cabinet can show>.
+static std::mutex g_launchClientMutex;
+static sockaddr_in g_launchClient;
+static bool g_launchClientValid = false;
+
+static void NoteLaunchClient(const sockaddr_in& from) {
+    std::lock_guard<std::mutex> lk(g_launchClientMutex);
+    g_launchClient = from;
+    g_launchClientValid = true;
+}
+
+static void ReportLaunchFailure(const std::string& reason) {
+    sockaddr_in to;
+    {
+        std::lock_guard<std::mutex> lk(g_launchClientMutex);
+        if (!g_launchClientValid) return;
+        to = g_launchClient;
+    }
+    std::string msg = "LAUNCHFAIL:" + reason.substr(0, 88);
+    for (char& c : msg) if ((unsigned char)c < 32 || (unsigned char)c > 126) c = ' ';   // the cabinet's font is ASCII
+    SOCKET s = g_udpSocket;
+    if (s != INVALID_SOCKET) sendto(s, msg.c_str(), (int)msg.size(), 0, (const sockaddr*)&to, sizeof(to));
+}
+
+static std::string AsciiLabel(const wchar_t* label) {
+    return AsciiFold(phantom::scan_detail::Utf8(label ? std::wstring(label) : std::wstring()));
+}
+
+// RPCS3 will not run twice - the second one stops with "Another instance of RPCS3 is running" - and one left open at its
+// game list, which is where it sits when somebody has been browsing it, blocks every launch from the cabinet. So the
+// others are closed first: politely, then by force if one will not go.
+static void CloseRunningInstances(const std::wstring& exePath) {
+    const size_t sl = exePath.find_last_of(L"\\/");
+    std::wstring name = sl == std::wstring::npos ? exePath : exePath.substr(sl + 1);
+    for (auto& c : name) c = (wchar_t)towlower(c);
+    std::vector<DWORD> pids = PidsOfProcessesNamed({ name }, /*needUdp=*/false);
+    if (pids.empty()) return;
+
+    struct Ctx { std::set<DWORD> pids; } ctx;
+    ctx.pids.insert(pids.begin(), pids.end());
+    EnumWindows([](HWND h, LPARAM l) -> BOOL {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (((Ctx*)l)->pids.count(pid)) PostMessage(h, WM_CLOSE, 0, 0);
+        return TRUE;
+    }, (LPARAM)&ctx);
+
+    for (int i = 0; i < 40; i++) {
+        bool any = false;
+        for (DWORD pid : pids) {
+            HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+            if (h) { if (WaitForSingleObject(h, 0) == WAIT_TIMEOUT) any = true; CloseHandle(h); }
+        }
+        if (!any) return;
+        Sleep(100);
+    }
+    for (DWORD pid : pids) {
+        HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+        if (h) { TerminateProcess(h, 0); CloseHandle(h); }
+    }
+    Sleep(300);
+}
+
+// FBNeo only looks for a game's zip in its own ROM paths (szAppRomPaths in its ini), and out of the box those are the
+// ROMs folder next to it. A library kept anywhere else - a shared MAME set on another drive, say - lists in the cabinet
+// and then fails with "<game> was not found" the moment it is chosen. So the folder this app was pointed at is put in
+// FBNeo's list: in the first empty slot, and only if it is not there already.
+static void EnsureFbneoRomPath(const std::wstring& exeDir, const std::wstring& romsFolder) {
+    if (exeDir.empty() || romsFolder.empty()) return;
+    const fs::path ini = fs::path(exeDir) / L"config" / L"fcadefbneo.ini";
+    std::error_code ec;
+    if (!fs::exists(ini, ec)) return;   // FBNeo writes its own on first run; there is nothing to edit yet
+
+    std::wstring want = romsFolder;
+    for (auto& c : want) if (c == L'/') c = L'\\';
+    if (want.back() != L'\\') want += L'\\';
+    std::string wantA;
+    for (wchar_t c : want) wantA.push_back(c < 128 ? (char)c : '?');
+    if (wantA.find('?') != std::string::npos) return;   // not representable in its ANSI ini: leave it alone
+
+    std::ifstream in(ini, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+
+    auto lower = [](std::string s) { for (char& c : s) c = (char)tolower((unsigned char)c); return s; };
+    const std::string wantLower = lower(wantA);
+    size_t emptyLine = std::string::npos;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t eol = text.find('\n', pos);
+        if (eol == std::string::npos) eol = text.size();
+        std::string line = text.substr(pos, eol - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("szAppRomPaths[", 0) == 0) {
+            const size_t close = line.find(']');
+            const int slot = (close == std::string::npos) ? -1 : atoi(line.c_str() + 14);
+            std::string value = close == std::string::npos ? "" : line.substr(close + 1);
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.erase(value.begin());
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.pop_back();
+            if (slot >= 0 && slot <= 5) {
+                if (lower(value) == wantLower) return;                       // already there
+                if (value.empty() && emptyLine == std::string::npos) emptyLine = pos;
+            }
+        }
+        pos = eol + 1;
+    }
+    if (emptyLine == std::string::npos) return;   // all six are somebody's choice; do not overwrite one
+
+    const size_t eol = text.find('\n', emptyLine);
+    const size_t lineEnd = eol == std::string::npos ? text.size() : eol;
+    std::string old = text.substr(emptyLine, lineEnd - emptyLine);
+    const bool crlf = !old.empty() && old.back() == '\r';
+    const size_t close = old.find(']');
+    std::string repl = old.substr(0, close + 1) + " " + wantA + (crlf ? "\r" : "");
+    text.replace(emptyLine, lineEnd - emptyLine, repl);
+
+    const fs::path tmp = ini.wstring() + L".phantom.tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out << text;
+        if (!out) return;
+    }
+    fs::rename(tmp, ini, ec);
+}
+
+// A dialog box that is on screen and belongs to `pid`. FBNeo's "<game> was not found" is a standard dialog; RPCS3's
+// "Another instance is running" is a Qt window that calls itself "Fatal Error". (Matching the word "Fatal" alone would
+// catch "Fatal Fury", so it is "Fatal Error".)
+static bool FindErrorWindow(DWORD pid, std::wstring& title) {
+    struct Ctx { DWORD pid; std::wstring title; bool found; } c = { pid, L"", false };
+    EnumWindows([](HWND h, LPARAM l) -> BOOL {
+        Ctx* c = (Ctx*)l;
+        DWORD p = 0;
+        GetWindowThreadProcessId(h, &p);
+        if (p != c->pid || !IsWindowVisible(h)) return TRUE;
+        wchar_t cls[64] = {0}, ttl[256] = {0};
+        GetClassNameW(h, cls, 64);
+        GetWindowTextW(h, ttl, 256);
+        const std::wstring t(ttl);
+        const bool errorTitle = t.find(L"Fatal Error") != std::wstring::npos ||
+                                (t.size() >= 5 && t.compare(t.size() - 5, 5, L"Error") == 0);
+        if (!wcscmp(cls, L"#32770") || errorTitle) { c->found = true; c->title = t; return FALSE; }
+        return TRUE;
+    }, (LPARAM)&c);
+    title = c.title;
+    return c.found;
+}
+
 // Start the emulator a catalog id belongs to.
 //
 // The id is "<emulator key>_<rom stem>", which is how the cabinet's choice maps back to
@@ -1513,14 +1666,23 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
     if (!emu) {
         SetWindowText(hStaticStatus,
                       (L"Status: [FAILED] no emulator for id " + StringToWstring(gameId)).c_str());
+        ReportLaunchFailure("No emulator is set up for that game.");
         return false;
     }
+    const std::string label = AsciiLabel(emu->label);
 
     std::wstring exe  = GetText(emu->exeEdit);
     std::wstring roms = GetText(emu->romsEdit);
     if (exe.empty()) {
         SetWindowText(hStaticStatus,
                       (std::wstring(L"Status: [FAILED] no executable set for ") + emu->label).c_str());
+        ReportLaunchFailure("No program is set for " + label + " in the PC app.");
+        return false;
+    }
+    if (!fs::exists(exe)) {
+        SetWindowText(hStaticStatus,
+                      (std::wstring(L"Status: [FAILED] ") + emu->label + L" was not found at " + exe).c_str());
+        ReportLaunchFailure(label + " was not found where the PC app expects it.");
         return false;
     }
 
@@ -1529,6 +1691,7 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
     if (misterIp.empty() && std::string(emu->key) == "groovymame") {
         SetWindowText(hStaticStatus,
                       L"Status: [FAILED] no MiSTer has been seen yet, so there is no address to stream to.");
+        ReportLaunchFailure("The PC has not heard from a MiSTer yet.");
         return false;
     }
 
@@ -1580,6 +1743,10 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
     size_t slashPos = exe.find_last_of(L"\\/");
     if (slashPos != std::wstring::npos) exeDir = exe.substr(0, slashPos);
 
+    // What a particular emulator needs before it will start a game from here.
+    if (std::string(emu->key) == "fbneo") EnsureFbneoRomPath(exeDir, roms);
+    if (std::string(emu->key) == "rpcs3") CloseRunningInstances(exe);
+
     STARTUPINFO si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
     std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
@@ -1594,6 +1761,7 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
         std::wstring stat = std::wstring(L"Status: Could not start ") + emu->label +
                             L" (Error " + std::to_wstring(err) + L"). Check the executable path.";
         SetWindowText(hStaticStatus, stat.c_str());
+        ReportLaunchFailure("Could not start " + label + " (Windows error " + std::to_string(err) + ").");
         return false;
     }
 
@@ -1605,21 +1773,36 @@ bool ExecuteLaunchProcess(const std::string& gameId, const std::wstring& targetM
     }
     CloseHandle(pi.hThread);
 
-    // Spawning successfully is not the same as running. Emulators exit within a second
-    // or two when they cannot open what they were given - a missing or incomplete set,
-    // or a file they do not support. That used to look exactly like a core or network
-    // fault from the cabinet: the launcher sat on "starting stream" and eventually gave
-    // up with nothing to say. We are on the launch worker thread, so waiting is free.
-    DWORD waited = WaitForSingleObject(pi.hProcess, 6000);
-    if (waited == WAIT_OBJECT_0) {
-        DWORD code = 0;
-        GetExitCodeProcess(pi.hProcess, &code);
-        CloseHandle(pi.hProcess);
-        g_activePid = 0;
-        std::wstring stat = std::wstring(L"Status: [FAILED] ") + wStem + L" exited immediately (code " +
-                            std::to_wstring(code) + L"). Missing ROM, or not a playable set?";
-        SetWindowText(hStaticStatus, stat.c_str());
-        return false;
+    // Spawning successfully is not the same as running. An emulator that cannot open what it was given either exits
+    // within a second or two - a missing set, a file it does not support - or stays up behind a dialog box that
+    // nobody is there to click. Both used to look, from the cabinet, like a stream that was merely slow. So the new
+    // process is watched until it is plainly streaming (it owns a UDP socket, which is what a stream is), or has
+    // stopped, or is showing an error; and if it is none of those after a while it is assumed to be a slow start
+    // (RPCS3 compiling shaders on a first boot can take minutes). We are on the launch worker thread, so waiting
+    // is free.
+    const ULONGLONG t0 = GetTickCount64();
+    while (GetTickCount64() - t0 < 14000) {
+        if (WaitForSingleObject(pi.hProcess, 250) == WAIT_OBJECT_0) {
+            DWORD code = 0;
+            GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hProcess);
+            g_activePid = 0;
+            std::wstring stat = std::wstring(L"Status: [FAILED] ") + wStem + L" exited immediately (code " +
+                                std::to_wstring(code) + L"). Missing ROM, or not a playable set?";
+            SetWindowText(hStaticStatus, stat.c_str());
+            ReportLaunchFailure(label + " stopped straight away (code " + std::to_string(code) + "). Is the game file usable?");
+            return false;
+        }
+        std::wstring dlg;
+        if (FindErrorWindow(pi.dwProcessId, dlg)) {
+            CloseHandle(pi.hProcess);
+            g_activePid = 0;   // it is not streaming and the cabinet should not be told a game is running
+            SetWindowText(hStaticStatus, (std::wstring(L"Status: [FAILED] ") + emu->label + L" is showing \"" + dlg +
+                                          L"\" - read it on the PC.").c_str());
+            ReportLaunchFailure(label + " is showing an error window on the PC: " + AsciiFold(phantom::scan_detail::Utf8(dlg)));
+            return false;
+        }
+        if (PidsOwningUdpEndpoint().count(pi.dwProcessId)) break;   // streaming
     }
     CloseHandle(pi.hProcess);
 
@@ -1865,6 +2048,7 @@ DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
                 // asks: it holds a window of the list, not every id. The version is what makes this safe: if the
                 // library has been rescanned since the cabinet fetched the page, the position may now be a different
                 // game, and the answer is "stale", not a launch of whatever is there.
+                NoteLaunchClient(clientAddr);
                 std::string spec = msg.substr(8);
                 while (!spec.empty() && (spec.back() == '\r' || spec.back() == '\n' || spec.back() == ' ')) spec.pop_back();
                 g_misterKeyboard.store(spec.find(":kbd=1") != std::string::npos);
@@ -1900,6 +2084,7 @@ DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
                 sendto(g_udpSocket, reply.c_str(), (int)reply.length(), 0, (sockaddr*)&clientAddr, clientLen);
             } else if (msg.rfind("LAUNCH:", 0) == 0) {
                 // MiSTer requested emulator game launch!
+                NoteLaunchClient(clientAddr);
                 std::string gameId = msg.substr(7);
                 while (!gameId.empty() && (gameId.back() == '\r' || gameId.back() == '\n' || gameId.back() == ' ')) {
                     gameId.pop_back();

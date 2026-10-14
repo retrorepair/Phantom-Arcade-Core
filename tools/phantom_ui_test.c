@@ -676,6 +676,7 @@ static void test_background(void)
 	reset();
 	ui.bg = dim;
 	ui.bg_alpha = 128;
+	ui.bg_list_alpha = 128;   /* pinned: this test is about the blend, not about the default */
 	ph_ui_render(&ui);
 	const uint8_t *m = &fb[(300 * PH_CANVAS_W + 4) * 3];
 	CHECK(m[0] == 0x60 && m[1] == 0x60 && m[2] == 0x60, "outside every panel the picture shows as it is (%02X %02X %02X)", m[0], m[1], m[2]);
@@ -688,6 +689,17 @@ static void test_background(void)
 	/* C_CARD is 0x1B1D2A: B 0x2A G 0x1D R 0x1B, at half opacity over 0x60 */
 	CHECK(p[0] >= 0x44 && p[0] <= 0x46 && p[1] >= 0x3D && p[1] <= 0x3F && p[2] >= 0x3C && p[2] <= 0x3E,
 	      "a panel at half opacity is half picture, half its own colour (%02X %02X %02X)", p[0], p[1], p[2]);
+
+	/* the list's own default is 60% see-through: 40% panel colour over the picture (0x60): B 0x2A, G 0x1D, R 0x1B */
+	ui.bg_list_alpha = 0;
+	ui.dirty = 1;
+	ph_ui_render(&ui);
+	const uint8_t *d = &fb[(y * PH_CANVAS_W + x) * 3];
+	CHECK(d[0] >= 0x49 && d[0] <= 0x4B && d[1] >= 0x44 && d[1] <= 0x46 && d[2] >= 0x43 && d[2] <= 0x45,
+	      "by default the list is 60%% see-through (%02X %02X %02X)", d[0], d[1], d[2]);
+	ui.bg_list_alpha = 128;
+	ui.dirty = 1;
+	ph_ui_render(&ui);
 
 	/* the amber rule under the header is solid however translucent the panels are: it is a thing to find, not to see through */
 	const uint8_t *r = &fb[((ui.safe.t + 44 - 4 + 1) * PH_CANVAS_W + 4) * 3];

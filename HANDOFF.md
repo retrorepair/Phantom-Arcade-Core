@@ -6,7 +6,7 @@ exit exposed it, FBNeo was built from the fork for the first time, every build t
 deployed and put on GitHub as a release - and then the launcher was reworked for TVs that
 overscan (screen-adjust page, MiSTer-standard button colours and controls) and for libraries of
 hundreds of thousands of games (paged catalog, fast incremental scan). Everything below is
-committed and pushed; the last release is `v2026.10.14`.
+committed and pushed; the last release is `v2026.10.14.1`.
 
 ## State of the repos and releases
 
@@ -15,7 +15,7 @@ All verified against `retrorepair`, not `origin` — in the emulator forks `orig
 
 | Repo | Branch | Head | Release `v2026.10.13` asset |
 |---|---|---|---|
-| Phantom-Arcade-Core | `main` | see `git log` | **`v2026.10.14`**: `MiSTer_phantom`, `PhantomArcadeManager.exe`, `Phantom_Arcade.rbf`, `SHA256SUMS.txt` (every earlier `v2026.10.13*` is marked superseded) |
+| Phantom-Arcade-Core | `main` | see `git log` | **`v2026.10.14.1`**: `MiSTer_phantom`, `PhantomArcadeManager.exe`, `Phantom_Arcade.rbf`, `SHA256SUMS.txt` (every earlier `v2026.10.13*` is marked superseded) |
 | retrorepair/dolphin | `groovy-nlc` | `b9d320863` | `Dolphin-GroovyNLC-…-win64.zip` |
 | retrorepair/86Box | `groovy-nlc` | `5593d3c24` | `86Box-GroovyNLC-…-win64.zip` |
 | retrorepair/pcsx2 | `groovy-upstream-sync` | `a445baeb2` | `PCSX2-GroovyNLC-…-win64.zip` |
@@ -37,8 +37,8 @@ from the client's `emulator\fbneo` folder, not the repo. See `memory/fightcade-c
 
 ## Deploy state (verified by md5 against the repo)
 
-- **MiSTer card:** one `/media/fat/MiSTer_phantom` (md5 `90cf8e4de76a`, = `build_output\` = the
-  `v2026.10.14` release asset), one `_Utility/Phantom_Arcade.rbf` (the unmodified upstream bitstream); the
+- **MiSTer card:** one `/media/fat/MiSTer_phantom` (md5 `e0fb484c8dda`, = `build_output\` = the
+  `v2026.10.14.1` release asset), one `_Utility/Phantom_Arcade.rbf` (the unmodified upstream bitstream); the
   only other thing is `MiSTer.ini.prephantom`, a backup of the user's own ini. `phantom.ini` holds
   the user's saved screen margins (`SAFE_L/T/R/B`) - leave it alone. `config/phantom_bg.ppm` is their
   chosen background picture (see above).
@@ -51,7 +51,7 @@ from the client's `emulator\fbneo` folder, not the repo. See `memory/fightcade-c
   cleared by that reboot. Standing rule from the user: leave the card clean and startable from the menu, not
   dependent on my scripts, and release every build — `memory/deploy-standard-user-reachable.md`.
 - **PC:** `C:\PhantomArcade\PhantomArcadeManager.exe` (md5 `38f28e1107f3`) = `build_output\` = the
-  `v2026.10.14` release asset. The daemon is running with the user's own `phantom_config.json` (checked
+  `v2026.10.14.1` release asset. The daemon is running with the user's own `phantom_config.json` (checked
   byte-for-byte after a test that swapped it for a synthetic-library config and back). New files it
   keeps beside the exe: `phantom_index.bin` (the last scan), `fbneo_sets.cache` (FBNeo's supported
   list, keyed by its exe), `mame_rejects.txt` (sets MAME rejected, keyed by a fingerprint of its
@@ -132,6 +132,31 @@ build also logs `win32_dxgi_present: FBO incomplete (status=0x8CDD)` and falls b
 `SDL_GL_SwapWindow`. I made no power or GPU setting changes. If a reboot does not help, the
 NVIDIA Control Panel's "Prefer maximum performance" for `xemu.exe` is the user's to set.
 
+## 2026-10-14: why FBNeo, Dreamcast and PS3 "never loaded", and what was done
+
+The user reported that FBNeo, Dreamcast and PS3 games left the cabinet on "Host is starting the emulator..." for ever. Three
+separate causes, found by launching each through the daemon's own protocol and watching the process and its windows:
+- **Dreamcast (a regression from the new scanner):** a game with a `.7z` beside a folder holding its `.cue` got the `.7z`
+  (tie-break was the lexicographically smallest path, `.` sorts before `/`), and Flycast quits silently, exit code 0, on that
+  archive. The old scan got it right only by directory order. Now a loose disc file or descriptor beats an archive
+  (`archiveRank` in `library_scan.h`, tested, and shown to fail with the rule disabled).
+- **FBNeo:** it only looks in its own `szAppRomPaths`, which on this machine were empty, so only `C:\Emulatorsbneo\ROMs`
+  (holding just `ssf2t.zip`) was searched; the library comes from `Y:\MiSTer\mame`. The dialog said "<game> was not found.
+  ... No data was found". The daemon now adds the configured ROMs folder to the first empty slot of FBNeo's ini before
+  launching (`EnsureFbneoRomPath`; never overwrites a path the user set).
+- **PS3:** RPCS3 refuses to run twice ("Another instance of RPCS3 is running"), and the user's RPCS3 had been open at its game
+  list since Oct 11. The daemon now closes other RPCS3 instances (WM_CLOSE, then terminate) before launching one
+  (`CloseRunningInstances`). Note this closes an RPCS3 window the user may have been using.
+And the reason they hung rather than failed: the PC knew (it said so in its own window) but never told the cabinet. Now the
+daemon remembers who sent the LAUNCH and sends `LAUNCHFAIL:<line>` when the emulator does not start, stops within 14 s, or shows
+an error window (a `#32770` dialog, or a title ending "Error" / containing "Fatal Error" - not just "Fatal", which is a game);
+the cabinet leaves the loading screen and shows the line for ~11 s. A process that owns a UDP socket is streaming and ends the
+watch early. Verified on the real setup: Crazy Taxi and `zzyzzyxx` launch and stream, WipEout HD launches with RPCS3 open, and
+`assault` (a set whose ROMs are incomplete) is reported within 0.3 s as "FBNeo (Fightcade) is showing an error window".
+Open: a FBNeo ROM **audit** (my prototype `fb_audit.py` reads each zip's CRCs against the `-listinfo` DAT and the `romof`
+chain: 1,177 of the user's 1,217 listed sets would load, 40 would not) so unloadable sets are not listed at all - not built.
+Also found while testing: Windows showed a Firewall prompt for my own test program `bm_test.exe`; the user should Cancel it.
+
 ## What landed later in the session: overscan, controls, and large libraries
 
 ### The launcher fits TVs that overscan, and uses MiSTer's own button colours
@@ -196,8 +221,8 @@ dimmed game snapshot behind a translucent menu and downloading title/snap images
 changed (modification time to the nanosecond, so replacing it needs no restart); `ph_ui.bg` is the picture dimmed with
 `ph_ui_dim`, the canvas starts as it, and every panel is a translucent layer over what is already drawn (`rect()` blends when
 `ph_ui.alpha` is set; text, the amber rules, the cursor and the button badges are solid; the screen-adjust page ignores the
-picture). Header/tab strip/detail line/legend are 200/255 opaque (`PH_BG_PANEL_ALPHA`), the game list 128/255 = **50%
-see-through, which is what the user asked for** (`PH_BG_LIST_ALPHA`; they first said 60%, then 50%). `phantom.ini [LAUNCHER]`
+picture). Header/tab strip/detail line/legend are 200/255 opaque (`PH_BG_PANEL_ALPHA`), the game list 102/255 = **60%
+see-through, which is what the user settled on** (`PH_BG_LIST_ALPHA`; they went 60%, then 50%, then back to 60%). `phantom.ini [LAUNCHER]`
 takes `BG_DIM` (default 50), `BG_PANELS`, `BG_LIST`, and `phantom_save_config()` writes them back so a save does not drop them.
 **What is on the user's card now:** their own Super Street Fighter II Turbo ranking screen, captured from the running emulator
 window on this PC (GetClientRect + CopyFromScreen, 720x480), at `/media/fat/config/phantom_bg.ppm` - persistent across
