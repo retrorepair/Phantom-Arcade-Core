@@ -74,7 +74,7 @@ struct Stats {
     int fetch_mask = 0;
     int have[kKinds] = { 0, 0 };
     int queued = 0, active = 0;
-    bool online = false;
+    int online = 2;   // 1 the picture server answered last time, 0 it did not, 2 not asked yet (everything came from disk)
     bool bulk_running = false;
     size_t bulk_done = 0, bulk_total = 0;
 };
@@ -347,7 +347,7 @@ private:
 
     void SetOnline(bool v) {
         std::lock_guard<std::mutex> lk(m_);
-        online_ = v;
+        online_ = v ? 1 : 0;
     }
 
     bool Compose(const std::filesystem::path& p, std::vector<uint8_t>* canvas) {
@@ -483,7 +483,7 @@ private:
     std::unordered_map<std::string, Failure> fails_;
     std::map<std::string, std::shared_ptr<Listing>> listings_;
     int have_[kKinds] = { 0, 0 };
-    bool online_ = false;
+    int online_ = 2;
     bool quit_ = false;
     bool bulk_stop_ = false, bulk_running_ = false;
     size_t bulk_done_ = 0, bulk_total_ = 0;

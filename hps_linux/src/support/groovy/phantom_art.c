@@ -27,8 +27,10 @@ enum { S_IDLE = 0, S_WAIT, S_RETRY, S_CONNECTING, S_SENDING, S_HEAD, S_BODY };
 /* Asks while the host says "fetching" (202): every 1.5 s for a minute. */
 #define PA_PENDING_RETRY_MS  1500
 #define PA_PENDING_TRIES     40
-/* Tries after a network failure, each a second later than the last. */
+/* Quick tries after a network failure, each a second later than the last; after that the host is off or restarting, and the
+ * row is asked for again every PA_SLOW_RETRY_MS for as long as the cursor stays on it, so it is there when the host is back. */
 #define PA_FAIL_TRIES        4
+#define PA_SLOW_RETRY_MS     15000
 /* The most read in one call, so a megabyte does not hold up the rest of the poll loop. */
 #define PA_READ_BURST        (256 * 1024)
 
@@ -121,14 +123,9 @@ void pa_want(pa_art *a, const char *key, const char *query, uint32_t now)
 static int fail(pa_art *a, uint32_t now)
 {
 	reset_transfer(a);
-	if (++a->fails >= PA_FAIL_TRIES)
-	{
-		/* Give up on this row until the cursor moves; the host may simply be off. */
-		a->state = S_IDLE;
-		return 0;
-	}
+	a->fails++;
 	a->state = S_RETRY;
-	a->retry_at = now + 1000u * (uint32_t)a->fails;
+	a->retry_at = now + (a->fails >= PA_FAIL_TRIES ? (uint32_t)PA_SLOW_RETRY_MS : 1000u * (uint32_t)a->fails);
 	return 0;
 }
 
@@ -276,6 +273,7 @@ int pa_tick(pa_art *a, uint32_t now)
 			a->head_len = 0;
 			if (status == 202)
 			{
+				a->fails = 0;   /* a real answer about this row: the network is fine */
 				if (a->status != PA_PENDING) changed = 1;
 				a->status = PA_PENDING;
 				if (++a->tries > PA_PENDING_TRIES)
@@ -289,6 +287,7 @@ int pa_tick(pa_art *a, uint32_t now)
 			}
 			if (status == 404)
 			{
+				a->fails = 0;
 				if (a->status != PA_NONE) changed = 1;
 				a->status = PA_NONE;
 				a->state = S_IDLE;

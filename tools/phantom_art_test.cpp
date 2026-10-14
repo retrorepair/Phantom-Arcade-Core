@@ -343,10 +343,23 @@ static void test_failures()
     {
         want(&a, c, row);
         c.step(&a, 20000);
-        CHECK(h.seen(row) == 4, "row %d: a bad answer is tried %d times and then dropped (4 expected)", row, h.seen(row));
+        CHECK(h.seen(row) == 4, "row %d: a bad answer is tried %d times, a second apart, and then slows down (4 expected)", row, h.seen(row));
         CHECK(pa_get_status(&a) != PA_READY, "row %d: and is not taken for a picture", row);
         CHECK(!pa_picture(&a), "row %d: no picture appeared", row);
     }
+
+    // ...and goes on asking, slowly: a host that was only restarting is found again without the cursor having to move
+    want(&a, c, 20);
+    c.step(&a, 40000);
+    CHECK(h.seen(20) >= 9 && h.seen(20) <= 11, "a failing row is asked for again every 15 s once the quick tries are spent (%d asks: 4 before, 4 quick + 2 slow now)", h.seen(20));
+    h.modes[20] = M_OK;
+    c.until(&a, 20000, [&] { return pa_get_status(&a) == PA_READY; });
+    CHECK(pa_get_status(&a) == PA_READY && all_bytes(pa_picture(&a), PA_BYTES, 20), "and when the host comes right the picture arrives, with no cursor movement");
+
+    // the rest of this test wants a client that has never had a picture
+    pa_free(&a);
+    pa_init(&a);
+    pa_set_host(&a, "127.0.0.1", h.port);
 
     // a host that accepts and says nothing: the stall is noticed, by the clock the client is given
     want(&a, c, 24);

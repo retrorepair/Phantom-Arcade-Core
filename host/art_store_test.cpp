@@ -124,7 +124,7 @@ static void test_fetch_and_keep() {
         CHECK(srv.Count(PictureUrl("FBNeo - Arcade Games", kTitle, "Street Fighter Alpha 3 (World 980904)")) == 1, "the picture once");
         Stats s = st.GetStats();
         CHECK(s.have[kTitle] == 1 && s.have[kSnap] == 0, "counted: %d titles, %d snaps", s.have[kTitle], s.have[kSnap]);
-        CHECK(s.online, "the server answered, so it is online");
+        CHECK(s.online == 1, "the server answered, so it is online");
     }
 
     // a later run needs no network at all
@@ -266,7 +266,7 @@ static void test_outage() {
     srv.down = true;
     CHECK(st.Get(kTitle, g, &c) == Got::Pending, "pending while it tries");
     st.WaitIdle(5000);
-    CHECK(!st.GetStats().online, "the outage is noticed");
+    CHECK(st.GetStats().online == 0, "the outage is noticed");
     CHECK(st.Get(kTitle, g, &c) == Got::Pending, "a failed try is not 'no picture'");
     // no marker on disk for an outage
     CHECK(!fs::exists(root / "pic" / "title" / "fbneo" / "fbneo_a.none"), "an outage leaves no .none file");
@@ -281,7 +281,7 @@ static void test_outage() {
         if (!ready) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     CHECK(ready || st.Get(kTitle, g, &c) == Got::Ready, "and it recovers when the server returns");
-    CHECK(st.GetStats().online, "back online");
+    CHECK(st.GetStats().online == 1, "back online");
 }
 
 static void test_priority() {

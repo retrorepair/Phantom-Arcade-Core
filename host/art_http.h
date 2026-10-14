@@ -23,8 +23,8 @@
  *     ART:SET:<mask>            set what may be downloaded (bit 0 titles, bit 1 snaps), then answer as INFO
  *     ART:ALL:<1|0>             start / stop downloading pictures for the whole library, then answer as INFO
  *
- *     mask 0-3; titles/snaps are how many are on the PC; busy is queued + running fetches; online is whether the last
- *     request to the picture server worked; bulk is 1 while a whole-library download is running, with its progress.
+ *     mask 0-3; titles/snaps are how many are on the PC; busy is queued + running fetches; online is 1 if the last
+ *     request to the picture server worked, 0 if it did not, 2 if there has been none (all from disk); bulk is 1 while a whole-library download is running, with its progress.
  *
  * Portable, so art_http_test.cpp drives both against a real index and a fake picture server.
  */
@@ -169,7 +169,7 @@ inline std::string ReplyHead(const ArtReply& r) {
 inline std::string InfoLine(Store& store) {
     const Stats s = store.GetStats();
     return "ART:INFO:" + std::to_string(s.fetch_mask) + ":" + std::to_string(s.have[kTitle]) + ":" + std::to_string(s.have[kSnap]) + ":" +
-           std::to_string(s.queued + s.active) + ":" + (s.online ? "1" : "0") + ":" + (s.bulk_running ? "1" : "0") + ":" +
+           std::to_string(s.queued + s.active) + ":" + std::to_string(s.online) + ":" + (s.bulk_running ? "1" : "0") + ":" +
            std::to_string(s.bulk_done) + ":" + std::to_string(s.bulk_total);
 }
 

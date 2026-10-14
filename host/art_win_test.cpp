@@ -131,7 +131,7 @@ static void test_live(const fs::path& out) {
     const Stats s = st.GetStats();
     printf("  %d ready; kept %d titles, %d snaps; online=%d\n", ready, s.have[kTitle], s.have[kSnap], (int)s.online);
     CHECK(ready >= 8, "most of the samples have pictures (%d of %zu)", ready, asked.size());
-    CHECK(s.online, "the server was reached");
+    CHECK(s.online == 1, "the server was reached");
 }
 
 int main(int argc, char** argv) {

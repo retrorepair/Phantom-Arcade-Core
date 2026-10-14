@@ -180,7 +180,7 @@ static void test_commands() {
     CHECK(HandleArtCommand(st, ix, "PING", persist).empty(), "not an ART message");
     CHECK(HandleArtCommand(st, ix, "ART:NOPE", persist).empty(), "an unknown ART message is ignored");
     std::string r = HandleArtCommand(st, ix, "ART:INFO", persist);
-    CHECK(r == "ART:INFO:3:0:0:0:0:0:0:0", "INFO at the start: %s", r.c_str());
+    CHECK(r == "ART:INFO:3:0:0:0:2:0:0:0", "INFO at the start (server not asked yet): %s", r.c_str());
 
     r = HandleArtCommand(st, ix, "ART:SET:1", persist);
     CHECK(persisted == 1 && r.rfind("ART:INFO:1:", 0) == 0 && st.FetchMask() == 1, "SET:1 -> titles only, saved: %s", r.c_str());
