@@ -44,6 +44,7 @@
 #include "phantom.h"
 #include "phantom_ui.h"
 #include "phantom_cat.h"
+#include "phantom_art.h"
 #include "../../user_io.h"
 
 /* Hardware side, implemented in groovy.cpp. The launcher never touches SPI or the DDR
@@ -217,6 +218,22 @@ static int safe_cfg[4] = { PH_SAFE_DEF_L, PH_SAFE_DEF_T, PH_SAFE_DEF_R, PH_SAFE_
  * (the list, which is the part to see through, and everything else). See phantom_ui.h. */
 static int bg_dim = 50, bg_panels = PH_BG_PANEL_ALPHA, bg_list = PH_BG_LIST_ALPHA;
 
+/* The picture of the game under the cursor, fetched from the host (phantom_art.c). art_show is the user's choice of what
+ * to see - 0 nothing, 1 the title screen, 2 a screenshot - and is the cabinet's own. What the host may download is the
+ * host's setting, kept here only as the host last reported it (art_fetch, -1 until it has). */
+#define ART_OFF   0
+#define ART_TITLE 1
+#define ART_SNAP  2
+static pa_art    art;
+static int       art_show  = ART_TITLE;
+static int       art_fetch = -1;
+static int       art_have[2];                 /* pictures on the host: titles, screenshots */
+static int       art_bulk, art_bulk_done, art_bulk_total, art_online;
+static int       art_host_answers = 0;        /* the host has answered ART:INFO since it was found */
+static int       http_port = 8088;
+static uint32_t  art_pics_seen = 0;
+static uint32_t  t_art_pass = 0, t_art_info = 0;
+
 static int clamp_int(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 static void load_config(void)
@@ -264,6 +281,12 @@ static void load_config(void)
 		else if (!strcmp(key, "BG_DIM"))    bg_dim    = clamp_int(atoi(val), 0, 100);
 		else if (!strcmp(key, "BG_PANELS")) bg_panels = clamp_int(atoi(val), 1, 255);
 		else if (!strcmp(key, "BG_LIST"))   bg_list   = clamp_int(atoi(val), 1, 255);
+		else if (!strcmp(key, "ART_SHOW"))
+		{
+			if (!strcasecmp(val, "off") || !strcmp(val, "0"))                art_show = ART_OFF;
+			else if (!strcasecmp(val, "snap") || !strcasecmp(val, "screen")) art_show = ART_SNAP;
+			else                                                              art_show = ART_TITLE;
+		}
 	}
 	fclose(f);
 
@@ -289,15 +312,43 @@ void phantom_save_config(void)
 	fprintf(f, "EXIT_HOTKEY=%s\n", exit_hotkey ? "on" : "off");
 	fprintf(f, "SAFE_L=%d\nSAFE_T=%d\nSAFE_R=%d\nSAFE_B=%d\n", ui.safe.l, ui.safe.t, ui.safe.r, ui.safe.b);
 	fprintf(f, "BG_DIM=%d\nBG_PANELS=%d\nBG_LIST=%d\n", bg_dim, bg_panels, bg_list);
+	fprintf(f, "ART_SHOW=%s\n", art_show == ART_OFF ? "off" : art_show == ART_SNAP ? "snap" : "title");
 	fclose(f);
 }
 
 /* ---- the picture behind the menu ----------------------------------------------- */
 
-static uint8_t *bg_buf   = 0;
+/* Two sources, and the second wins when it has something: the fixed picture on the card (phantom_bg.ppm), and the
+ * game's own, fetched from the host as the cursor rests on it. Each is kept as it came (_raw) and as the menu draws it
+ * (dimmed), so the brightness can be changed from the settings menu without loading anything again. */
+static uint8_t *bg_raw   = 0;   /* the file's picture, as read */
+static uint8_t *bg_buf   = 0;   /* ...dimmed */
+static uint8_t *art_bg   = 0;   /* the fetched picture, dimmed (the undimmed one is held by art) */
+static int      art_shown = 0;  /* the menu is showing the fetched picture rather than the file's */
 static time_t   bg_mtime = 0;
 static long     bg_mtime_ns = 0;
 static off_t    bg_size  = 0;
+
+/* Point the menu at whichever picture it should be drawing now. */
+static void bg_apply(void)
+{
+	const uint8_t *b = (art_shown && art_bg) ? art_bg : bg_buf;
+	ui.bg = b;
+	if (b)
+	{
+		ui.bg_alpha = bg_panels;
+		ui.bg_list_alpha = bg_list;
+	}
+	ui.dirty = 1;
+}
+
+/* The brightness changed: dim both pictures again from what they were. */
+static void bg_redim(void)
+{
+	if (bg_raw && bg_buf) ph_ui_dim(bg_buf, bg_raw, (size_t)PH_CANVAS_W * PH_CANVAS_H * 3, bg_dim);
+	if (art_bg && pa_picture(&art)) ph_ui_dim(art_bg, pa_picture(&art), PA_BYTES, bg_dim);
+	bg_apply();
+}
 
 /* Pick up phantom_bg.ppm: loaded when it appears or changes, dropped when it goes. Called as the launcher comes up,
  * which is cheap (one stat) and means a new picture is seen the next time the menu returns, with nothing to restart. */
@@ -309,19 +360,18 @@ static void bg_load(void)
 		if (bg_buf)
 		{
 			free(bg_buf);
+			free(bg_raw);
 			bg_buf = 0;
+			bg_raw = 0;
 			LOGP("background picture removed\n");
 		}
-		ui.bg = 0;
-		ui.dirty = 1;
+		bg_apply();
 		return;
 	}
 
 	if (bg_buf && st.st_mtime == bg_mtime && st.st_mtim.tv_nsec == bg_mtime_ns && st.st_size == bg_size)
 	{
-		ui.bg = bg_buf;                  /* still the picture we hold; ph_ui_init may have cleared the pointer */
-		ui.bg_alpha = bg_panels;
-		ui.bg_list_alpha = bg_list;
+		bg_apply();                      /* still the picture we hold; ph_ui_init may have cleared the pointer */
 		return;
 	}
 
@@ -339,10 +389,12 @@ static void bg_load(void)
 
 	const size_t n = (size_t)PH_CANVAS_W * PH_CANVAS_H * 3;
 	uint8_t *p = (uint8_t *)malloc(n);
-	if (!p || fread(p, 1, n, f) != n)
+	uint8_t *d = (uint8_t *)malloc(n);
+	if (!p || !d || fread(p, 1, n, f) != n)
 	{
 		LOGP("could not read the picture in %s\n", PH_BG);
 		free(p);
+		free(d);
 		fclose(f);
 		return;
 	}
@@ -350,17 +402,16 @@ static void bg_load(void)
 
 	/* a PPM is R,G,B and the canvas is B,G,R */
 	for (size_t i = 0; i < n; i += 3) { uint8_t r = p[i]; p[i] = p[i + 2]; p[i + 2] = r; }
-	ph_ui_dim(p, p, n, bg_dim);
+	ph_ui_dim(d, p, n, bg_dim);
 
+	free(bg_raw);
 	free(bg_buf);
-	bg_buf = p;
+	bg_raw = p;
+	bg_buf = d;
 	bg_mtime = st.st_mtime;
 	bg_mtime_ns = st.st_mtim.tv_nsec;
 	bg_size = st.st_size;
-	ui.bg = bg_buf;
-	ui.bg_alpha = bg_panels;
-	ui.bg_list_alpha = bg_list;
-	ui.dirty = 1;
+	bg_apply();
 	LOGP("background picture loaded from %s (dimmed to %d%%)\n", PH_BG, bg_dim);
 }
 
@@ -716,6 +767,231 @@ static void library_tick(uint32_t t)
 	pump_pages(t);
 }
 
+/* ---- artwork and the settings menu ---------------------------------------------------------- */
+
+static void settings_refresh(void);
+
+/* What the host said about its pictures (ART:INFO:<mask>:<titles>:<snaps>:<busy>:<online>:<bulk>:<done>:<total>). */
+static void art_parse_info(const char *buf)
+{
+	int mask, ti, sn, busy, online, bulk, done, total;
+	if (sscanf(buf, "ART:INFO:%d:%d:%d:%d:%d:%d:%d:%d", &mask, &ti, &sn, &busy, &online, &bulk, &done, &total) != 8) return;
+	art_host_answers = 1;
+	art_fetch = clamp_int(mask, 0, 3);
+	art_have[0] = ti;
+	art_have[1] = sn;
+	art_online = online;
+	art_bulk = bulk;
+	art_bulk_done = done;
+	art_bulk_total = total;
+	if (ui.view == PH_VIEW_SETTINGS) settings_refresh();
+}
+
+/* Which picture the cursor is on, asked for once it has rested, and what to do when it arrives. */
+static void art_tick(uint32_t t)
+{
+	if ((int32_t)(t - t_art_pass) < 10) return;
+	t_art_pass = t;
+
+	const int on_screen = owns_screen && (ui.view == PH_VIEW_LIST || ui.view == PH_VIEW_SETTINGS);
+	if (on_screen && cat_paged && ui.host_state == PH_HOST_ONLINE && art_show != ART_OFF && ph_ui_selected(&ui))
+	{
+		char query[160];
+		const int list = pc_list_for_tab(&cat, ui.tab);
+		snprintf(query, sizeof(query), "v=%u&l=%s&i=%d&k=%s", (unsigned)cat.ver, pc_list_key(&cat, list), ui.sel,
+		         art_show == ART_SNAP ? "snap" : "title");
+		pa_want(&art, query, query, t);   /* the query names the row, so it is its own key */
+	}
+	else
+	{
+		pa_want(&art, 0, 0, t);
+	}
+
+	pa_tick(&art, t);
+
+	/* a picture that has just arrived */
+	if (art.pics != art_pics_seen)
+	{
+		art_pics_seen = art.pics;
+		if (!art_bg) art_bg = (uint8_t *)malloc(PA_BYTES);
+		if (art_bg)
+		{
+			ph_ui_dim(art_bg, pa_picture(&art), PA_BYTES, bg_dim);
+			art_shown = 1;
+			bg_apply();
+		}
+	}
+	/* the wanted row has none: back to the plain picture */
+	else if (pa_get_status(&art) == PA_NONE && art_shown)
+	{
+		art_shown = 0;
+		bg_apply();
+	}
+	/* the held picture is the wanted row's (the cursor came back to it), or art was switched off */
+	else if (pa_get_status(&art) == PA_READY && !art_shown && art_bg && art_show != ART_OFF)
+	{
+		art_shown = 1;
+		bg_apply();
+	}
+	if (art_show == ART_OFF && art_shown)
+	{
+		art_shown = 0;
+		bg_apply();
+	}
+
+	if (pa_take_stale(&art)) cat.want_info = 1;   /* the library changed under the cursor: fetch the new one */
+
+	/* the numbers on the settings page */
+	if (ui.view == PH_VIEW_SETTINGS && live_host[0] && (int32_t)(t - t_art_info) >= 0)
+	{
+		send_to(live_host, "ART:INFO");
+		t_art_info = t + (art_bulk ? 700 : 1500);
+	}
+}
+
+/* ---- the settings menu ---------------------------------------------------------------- */
+
+enum { SET_SHOW = 0, SET_FETCH, SET_ALL, SET_DIM, SET_LIST, SET_EDGES, SET_COUNT_PC, SET_SOURCE, SET_N };
+
+static const char *const art_show_names[3]  = { "Off", "Title screens", "Screenshots" };
+static const char *const art_fetch_names[4] = { "Never", "Title screens", "Screenshots", "Both" };
+
+static int list_seethrough(void) { return ((255 - bg_list) * 100 + 127) / 255; }
+
+static void settings_refresh(void)
+{
+	ph_set_row *r = ui.set_rows;
+	memset(r, 0, sizeof(ui.set_rows));
+
+	snprintf(r[SET_SHOW].label, sizeof(r[0].label), "Picture behind the menu");
+	snprintf(r[SET_SHOW].value, sizeof(r[0].value), "%s", art_show_names[art_show]);
+	r[SET_SHOW].kind = PH_SET_VALUE;
+
+	snprintf(r[SET_FETCH].label, sizeof(r[0].label), "Download pictures");
+	if (art_fetch >= 0) snprintf(r[SET_FETCH].value, sizeof(r[0].value), "%s", art_fetch_names[art_fetch]);
+	else                snprintf(r[SET_FETCH].value, sizeof(r[0].value), "%s", art_host_answers ? "?" : "(asking the PC...)");
+	r[SET_FETCH].kind = PH_SET_VALUE;
+
+	snprintf(r[SET_ALL].label, sizeof(r[0].label), "Download for every game");
+	if (art_bulk) snprintf(r[SET_ALL].value, sizeof(r[0].value), "Stop  (%d of %d)", art_bulk_done, art_bulk_total);
+	else          snprintf(r[SET_ALL].value, sizeof(r[0].value), "Start");
+	r[SET_ALL].kind = PH_SET_ACTION;
+
+	snprintf(r[SET_DIM].label, sizeof(r[0].label), "Picture brightness");
+	snprintf(r[SET_DIM].value, sizeof(r[0].value), "%d%%", bg_dim);
+	r[SET_DIM].kind = PH_SET_VALUE;
+
+	snprintf(r[SET_LIST].label, sizeof(r[0].label), "Game list see-through");
+	snprintf(r[SET_LIST].value, sizeof(r[0].value), "%d%%", list_seethrough());
+	r[SET_LIST].kind = PH_SET_VALUE;
+
+	snprintf(r[SET_EDGES].label, sizeof(r[0].label), "Screen edges");
+	snprintf(r[SET_EDGES].value, sizeof(r[0].value), "Adjust...");
+	r[SET_EDGES].kind = PH_SET_ACTION;
+
+	snprintf(r[SET_COUNT_PC].label, sizeof(r[0].label), "Pictures on the PC");
+	if (art_host_answers) snprintf(r[SET_COUNT_PC].value, sizeof(r[0].value), "%d titles, %d screenshots", art_have[0], art_have[1]);
+	r[SET_COUNT_PC].kind = PH_SET_INFO;
+
+	snprintf(r[SET_SOURCE].label, sizeof(r[0].label), "Pictures come from");
+	if (art_host_answers) snprintf(r[SET_SOURCE].value, sizeof(r[0].value), "%s", art_online ? "thumbnails.libretro.com" : "thumbnails.libretro.com - not reached");
+	r[SET_SOURCE].kind = PH_SET_INFO;
+
+	ui.set_count = SET_N;
+
+	static const char *const notes[SET_N] =
+	{
+		"Which picture sits behind the menu: the game's title screen or a screenshot of it.",
+		"What the PC may download from the internet as you browse. What it already has is always used.",
+		"Download a picture for every game in the library now, in the background.",
+		"How bright the picture is behind the menu.",
+		"How much of the picture shows through the game list.",
+		"Set how much of each edge of the picture your display hides.",
+		"", ""
+	};
+	snprintf(ui.set_note, sizeof(ui.set_note), "%s", ui.set_sel >= 0 && ui.set_sel < SET_N ? notes[ui.set_sel] : "");
+	ui.dirty = 1;
+}
+
+static void settings_open(void)
+{
+	settings_refresh();
+	ph_ui_settings_begin(&ui);
+	settings_refresh();               /* the note belongs to the line the cursor landed on */
+	t_art_info = 0;                   /* ask the PC for its numbers at once */
+}
+
+static void settings_close(void)
+{
+	ph_ui_settings_end(&ui);
+	phantom_save_config();
+}
+
+static void settings_move(int dy)
+{
+	if (ph_ui_settings_move(&ui, dy)) settings_refresh();
+}
+
+/* Left/Right on the selected line: one step either way. */
+static void settings_change(int dir)
+{
+	switch (ui.set_sel)
+	{
+	case SET_SHOW:
+		art_show = (art_show + (dir < 0 ? 2 : 1)) % 3;
+		if (art_show == ART_OFF && art_shown) { art_shown = 0; bg_apply(); }
+		break;
+	case SET_FETCH:
+		if (art_fetch < 0 || !live_host[0]) break;      /* the PC has not said what it does; nothing to change */
+		{
+			const int n = (art_fetch + (dir < 0 ? 3 : 1)) & 3;
+			char msg[24];
+			snprintf(msg, sizeof(msg), "ART:SET:%d", n);
+			send_to(live_host, msg);
+			art_fetch = n;                              /* shown at once; the PC's own answer follows */
+		}
+		break;
+	case SET_DIM:
+		bg_dim = clamp_int(bg_dim + 10 * (dir < 0 ? -1 : 1), 10, 100);
+		bg_redim();
+		break;
+	case SET_LIST:
+		{
+			const int pct = clamp_int(list_seethrough() + 10 * (dir < 0 ? -1 : 1), 0, 90);
+			bg_list = clamp_int(255 - pct * 255 / 100, 1, 255);
+			bg_apply();
+		}
+		break;
+	default:
+		return;
+	}
+	phantom_save_config();
+	settings_refresh();
+}
+
+/* A on the selected line: the lines that are actions do their thing, the others step forward. */
+static void settings_activate(void)
+{
+	if (ui.set_sel == SET_ALL)
+	{
+		if (live_host[0] && art_host_answers)
+		{
+			send_to(live_host, art_bulk ? "ART:ALL:0" : "ART:ALL:1");
+			art_bulk = !art_bulk;
+			if (art_bulk) art_bulk_done = art_bulk_total = 0;
+			t_art_info = now_ms() + 300;
+			settings_refresh();
+		}
+		return;
+	}
+	if (ui.set_sel == SET_EDGES)
+	{
+		ph_ui_adjust_begin(&ui);
+		return;
+	}
+	settings_change(1);
+}
+
 /* ---- socket ------------------------------------------------------------------- */
 
 static void sock_open(void)
@@ -793,9 +1069,17 @@ static void drain(void)
 			ui.host_port = cfg_port;
 			ui.host_state = PH_HOST_ONLINE;
 			ui.dirty = 1;
+			{
+				/* PHANTOM_HOST_ONLINE:<udp port>:<http port> - the pictures come over HTTP */
+				int up = 0, hp = 0;
+				if (sscanf(buf, "PHANTOM_HOST_ONLINE:%d:%d", &up, &hp) == 2 && hp > 0 && hp < 65536) http_port = hp;
+				pa_set_host(&art, live_host, http_port);
+			}
 			if (was != PH_HOST_ONLINE)
 			{
 				LOGP("host online at %s:%d\n", ip, cfg_port);
+				art_host_answers = 0;
+				art_fetch = -1;
 				request_library();
 			}
 		}
@@ -840,6 +1124,10 @@ static void drain(void)
 		         !strncmp(buf, "STALE:", 6))
 		{
 			on_cat_event(pc_on_reply(&cat, buf, (int)n));
+		}
+		else if (!strncmp(buf, "ART:", 4))
+		{
+			art_parse_info(buf);
 		}
 		else if (!strncmp(buf, "RESCAN:", 7))
 		{
@@ -982,6 +1270,7 @@ void phantom_init(void)
 
 	ph_ui_init(&ui, 0, PH_CANVAS_W, PH_CANVAS_H);
 
+	pa_init(&art);
 	load_config();
 	bg_load();
 	snprintf(ui.host_ip, sizeof(ui.host_ip), "%s", cfg_host);
@@ -1011,7 +1300,13 @@ void phantom_stop(void)
 	cat_paged = 0;
 	cat_host[0] = 0;
 	free(bg_buf);
+	free(bg_raw);
+	free(art_bg);
 	bg_buf = 0;
+	bg_raw = 0;
+	art_bg = 0;
+	art_shown = 0;
+	pa_free(&art);
 	inited = 0;
 }
 
@@ -1081,6 +1376,7 @@ void phantom_idle_leave(void)
 	owns_screen = 0;
 	awaiting_video = 0;
 	ui.view = PH_VIEW_LIST;
+	pa_want(&art, 0, 0, 0);   /* a stream is starting; the picture transfer has no business competing with it */
 	stream_was_live = 1;
 	guard_on = 0;
 	memset(rep_dir, 0, sizeof(rep_dir));   /* a held stick must not keep scrolling a hidden list */
@@ -1207,6 +1503,9 @@ void phantom_idle_poll(void)
 	/* The library: notice a rescan, and keep the rows around the cursor arriving. */
 	if (ui.host_state == PH_HOST_ONLINE) library_tick(t);
 
+	/* The picture for the row the cursor is on. */
+	art_tick(t);
+
 	if (!owns_screen) return;
 
 	/* A launch that never produced video. Saying so and going back to the list beats
@@ -1324,6 +1623,7 @@ int phantom_joystick(unsigned char joy, uint32_t mask)
 
 	uint32_t pressed = mask & ~prev;
 	const int adjusting = (ui.view == PH_VIEW_ADJUST);
+	const int in_settings = (ui.view == PH_VIEW_SETTINGS);
 
 	int dx, dy;
 	int held = nav_from(mask, &dx, &dy);
@@ -1334,18 +1634,20 @@ int phantom_joystick(unsigned char joy, uint32_t mask)
 	nav_from(pressed, &pdx, &pdy);
 	if (pdy)
 	{
-		if (adjusting) ph_ui_adjust_move(&ui, -pdy * 2);   /* up shrinks the box, down grows it */
-		else           ph_ui_move(&ui, pdy);
+		if (adjusting)         ph_ui_adjust_move(&ui, -pdy * 2);   /* up shrinks the box, down grows it */
+		else if (in_settings)  settings_move(pdy);
+		else                   ph_ui_move(&ui, pdy);
 		rep_at[joy] = now_ms() + PH_REP_DELAY;
-		rep_dir[joy] = pdy;
+		rep_dir[joy] = in_settings ? 0 : pdy;                   /* nine lines do not need a repeat */
 		rep_n[joy] = 0;
 	}
 	if (pdx)
 	{
-		if (adjusting) ph_ui_adjust_edge(&ui, pdx);
-		else           ph_ui_page(&ui, pdx);
+		if (adjusting)         ph_ui_adjust_edge(&ui, pdx);
+		else if (in_settings)  settings_change(pdx);
+		else                   ph_ui_page(&ui, pdx);
 		repx_at[joy] = now_ms() + REPX_DELAY;
-		repx_dir[joy] = adjusting ? 0 : pdx;               /* choosing an edge does not repeat */
+		repx_dir[joy] = (adjusting || in_settings) ? 0 : pdx;   /* choosing an edge or a setting does not repeat */
 		repx_n[joy] = 0;
 	}
 	if (!dy) rep_dir[joy] = 0;
@@ -1357,6 +1659,13 @@ int phantom_joystick(unsigned char joy, uint32_t mask)
 		if (pressed & GJ_A)      { ph_ui_adjust_end(&ui, 1); phantom_save_config(); }
 		else if (pressed & GJ_B) { ph_ui_adjust_end(&ui, 0); }
 		else if (pressed & GJ_Y) { ph_ui_adjust_reset(&ui); }
+		return 1;
+	}
+
+	if (in_settings)
+	{
+		if (pressed & GJ_A) settings_activate();
+		else if (pressed & (GJ_B | GJ_SELECT)) settings_close();
 		return 1;
 	}
 
@@ -1392,7 +1701,7 @@ int phantom_joystick(unsigned char joy, uint32_t mask)
 
 	if ((pressed & GJ_SELECT) && ui.view == PH_VIEW_LIST)
 	{
-		ph_ui_adjust_begin(&ui);
+		settings_open();
 		return 1;
 	}
 
@@ -1473,6 +1782,25 @@ int phantom_keyboard(uint16_t key, int press)
 		return 1;
 	}
 
+	if (ui.view == PH_VIEW_SETTINGS)
+	{
+		switch (key)
+		{
+		case KEY_UP:    settings_move(-1); break;
+		case KEY_DOWN:  settings_move(1); break;
+		case KEY_LEFT:  settings_change(-1); break;
+		case KEY_RIGHT: settings_change(1); break;
+		case KEY_ENTER:
+		case KEY_KPENTER:
+		case KEY_SPACE: settings_activate(); break;
+		case KEY_ESC:
+		case KEY_BACKSPACE:
+		case KEY_F2:    settings_close(); break;
+		default: break;
+		}
+		return 1;
+	}
+
 	switch (key)
 	{
 	case KEY_UP:
@@ -1501,7 +1829,7 @@ int phantom_keyboard(uint16_t key, int press)
 		break;
 
 	case KEY_F2:
-		if (ui.view == PH_VIEW_LIST) ph_ui_adjust_begin(&ui);
+		if (ui.view == PH_VIEW_LIST) settings_open();
 		break;
 
 	case KEY_F5:

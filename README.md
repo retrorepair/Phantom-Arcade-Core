@@ -160,7 +160,7 @@ The buttons are MiSTer's usual ones: A red, B yellow, X blue, Y green.
 | A | launch the highlighted game |
 | B | back out of a launch that is not going anywhere |
 | Y | look for new games (the PC rescans what changed) and refresh the list |
-| Select | the screen-adjust page: set how much of each edge your TV hides, and save it |
+| Select | the settings menu: the picture behind the menu, downloads, brightness, and the screen edges |
 | Start + Select, held 1.2 s | stop the game and come back to the launcher |
 
 To get back to the menu there is also **OSD → System → Phantom Arcade → Return to
@@ -174,11 +174,47 @@ was killed outright never sends `CMD_CLOSE` and the CRT would hold its last fram
 indefinitely.
 
 Keyboard equivalents: arrows, PgUp/PgDn, Q/E or Tab for platform, `,` and `.` for letters,
-Enter/Space, Esc, F2 for screen adjust, F5.
+Enter/Space, Esc, F2 for the settings menu, F5.
 
-Many TVs hide the edges of the picture (overscan). **Select** opens the screen-adjust page: Left/Right
-picks an edge, Up/Down moves it, A saves. Backgrounds still fill the screen; everything you read stays
-inside the margins.
+Many TVs hide the edges of the picture (overscan). **Select** opens the settings menu, and its **Screen edges**
+line opens the screen-adjust page: Left/Right picks an edge, Up/Down moves it, A saves (and returns to the menu), B
+cancels. Backgrounds still fill the screen; everything you read stays inside the margins.
+
+### The settings menu
+
+Select opens it; Up/Down choose a line, Left/Right change it (A on a line that is an action does it), B or Select
+closes it. Every change is saved at once.
+
+| Line | Does |
+|---|---|
+| Picture behind the menu | Off, the game's **title screen**, or a **screenshot** of it (default: title screens) |
+| Download pictures | what the PC may fetch from the internet as you browse: never, titles, screenshots, or both |
+| Download for every game | fetches a picture for the whole library now, in the background, with a running count |
+| Picture brightness | 10-100% (default 50%) |
+| Game list see-through | 0-90% (default 60%) |
+| Screen edges | the screen-adjust page |
+
+Below them it says how many pictures the PC holds and whether the picture server was reachable.
+
+### Pictures for every game
+
+With **Picture behind the menu** on, the picture behind the menu is the game under the cursor: rest on a row for a
+quarter of a second and its title screen (or screenshot) comes up; keep scrolling and nothing is asked for on the way.
+Games that have no picture show the fixed `phantom_bg.ppm` if there is one, or the plain menu.
+
+The pictures come from the public [libretro thumbnail server](https://thumbnails.libretro.com/), fetched **by the PC**,
+not the cabinet, and only for games in your own library: the PC asks the server for the one folder listing it needs for a
+system (MAME, FBNeo, PS2, Dreamcast, PS3, Xbox, GameCube/Wii and the RetroArch consoles), matches each game's title and
+file name against it (exactly, then ignoring case and punctuation, then by the same game's other release - USA before
+Europe before Japan), and downloads the matching PNG. Against a real library of 1,258 games that found a title screen for
+1,242 and a screenshot for 1,243, and the whole library took about four minutes at a polite three requests at a time and
+64 MB. Pictures are kept in `art\` next to the daemon (`art\pic\<title|snap>\<system>\<game id>.png`), so each is
+fetched once; a game the server has no picture for is remembered for a month, a server that cannot be reached is not.
+
+The daemon turns the picture into what the cabinet draws - a 4:3 frame fills the screen, a wider one is letter-boxed, a
+vertical arcade board pillar-boxed - and serves it to the cabinet over HTTP on the port it already uses (TCP 8088, covered
+by the same firewall rule as the rest of the daemon). `host/art_http.h` describes the protocol. A cabinet with the pictures
+turned off, or a daemon that has none, costs nothing: the menu is as it was.
 
 ### A picture behind the menu
 
@@ -282,13 +318,14 @@ The launcher's drawing and navigation have no hardware or socket dependencies
 ```bash
 gcc -O2 -Wall -Wextra -Ihps_linux/src/support/groovy \
     -o /tmp/t tools/phantom_ui_test.c hps_linux/src/support/groovy/phantom_ui.c && /tmp/t
-# 418 checks, 0 failures
+# 451 checks, 0 failures
 
 gcc -O2 -Ihps_linux/src/support/groovy -o /tmp/p \
     tools/phantom_preview.c hps_linux/src/support/groovy/phantom_ui.c
 /tmp/p out.ppm --busy          # render any screen to a file and look at it
 /tmp/p out.ppm --big 298765 --sel 123456 --have 0,123460   # a huge library, some rows still on their way
 /tmp/p out.ppm --bg picture.ppm   # the menu over a dimmed picture (720x480 P6), the game list 60% see-through
+/tmp/p out.ppm --settings --bg picture.ppm   # the settings menu over one
 tools/phantom_render_bench.c       # what a frame costs, flat and over a picture (build it for the ARM to measure the HPS)
 ```
 
@@ -298,13 +335,18 @@ loopback, including a 50,000-title library:
 
 ```bash
 wsl -- bash tools/run_phantom_cat_test.sh     # 82 checks
-wsl -- bash tools/run_phantom_input_test.sh   # the launcher end to end
+wsl -- bash tools/run_phantom_art_test.sh     # the picture client against a fake host: dribbled bodies, stalls, 202/404/409
+wsl -- bash tools/run_phantom_input_test.sh   # the launcher end to end, pictures and the settings menu included
 ```
 
 The PC side builds with MSVC and tests itself the same way: `host/game_index_test.cpp` (300,000
 games: order, letters, pages, the cache file), `host/rom_enum_test.cpp` (the folder walk against
 `std::filesystem`) and `host/library_scan_test.cpp` (the real scanner with stand-ins for MAME, counting
-how often each is asked — an unchanged library asks zero times).
+how often each is asked — an unchanged library asks zero times). The artwork has three more: `host/art_test.cpp` (names,
+listing markup, the match ladder, folders, URLs, aspect fitting and scaling), `host/art_store_test.cpp` (the store with a
+fake server: hits, misses, outages, priority, the whole-library run) and `host/art_http_test.cpp` (the `/art` request and the
+`ART:` datagrams against a real index); `host/art_win_test.cpp` checks WIC and WinHTTP, and with `--live <folder>` goes to the
+real server for a few games and writes what the cabinet would receive.
 
 On the MiSTer itself, the HPS and the FPGA share the board's DDR3, so what the core is
 actually displaying can be read straight out of memory — no capture card:

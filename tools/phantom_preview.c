@@ -10,7 +10,7 @@
  *       ../hps_linux/src/support/groovy/phantom_ui.c
  *   ./phantom_preview out.ppm [catalog.tsv] [--busy] [--empty] [--offline] [--tab N]
  *       [--big N [--have LO,HI]] [--scanning] [--loading]
- *       [--bg picture.ppm [--dim PERCENT] [--panels ALPHA] [--list ALPHA]]
+ *       [--bg picture.ppm [--dim PERCENT] [--panels ALPHA] [--list ALPHA]] [--settings [--setsel N]]
  *
  * --bg puts a 720x480 P6 picture behind the whole launcher, dimmed to --dim percent (default 50), with the
  * panels drawn over it at --panels opacity (0..255, default 200) and the game list at --list (default 102: 60% see-through).
@@ -155,6 +155,7 @@ int main(int argc, char **argv)
 	const char *out = argc > 1 ? argv[1] : "phantom_preview.ppm";
 	const char *tsv = 0;
 	int busy = 0, empty = 0, offline = 0, tab = 0, sel = 0;
+	int settings = 0, setsel = 0;
 	int adjust = 0, edge = 1, sl = -1, st = -1, sr = -1, sb = -1, scanning = 0, loading = 0;
 	const char *bgfile = 0;
 	int dim = 50, panels = PH_BG_PANEL_ALPHA, listalpha = PH_BG_LIST_ALPHA;
@@ -169,6 +170,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--sel") && i + 1 < argc) sel = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--time") && i + 1 < argc) t = (uint32_t)strtoul(argv[++i], 0, 10);
 		else if (!strcmp(argv[i], "--adjust")) adjust = 1;
+		else if (!strcmp(argv[i], "--settings")) settings = 1;
+		else if (!strcmp(argv[i], "--setsel") && i + 1 < argc) setsel = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--big") && i + 1 < argc) big_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--have") && i + 1 < argc) sscanf(argv[++i], "%d,%d", &have_lo, &have_hi);
 		else if (!strcmp(argv[i], "--bg") && i + 1 < argc) bgfile = argv[++i];
@@ -216,6 +219,31 @@ int main(int argc, char **argv)
 	if (adjust) { ph_ui_adjust_begin(&ui); ui.adj_edge = edge; }
 	ph_ui_reclamp(&ui, 0);
 	ph_ui_animate(&ui, t);
+
+	if (settings)
+	{
+		/* the lines the cabinet's menu has, with plausible values */
+		static const struct { const char *l, *v; int k; } rows[] = {
+			{ "Picture behind the menu", "Title screens", PH_SET_VALUE },
+			{ "Download pictures", "Both", PH_SET_VALUE },
+			{ "Download for every game", "Start", PH_SET_ACTION },
+			{ "Picture brightness", "50%", PH_SET_VALUE },
+			{ "Game list see-through", "60%", PH_SET_VALUE },
+			{ "Screen edges", "Adjust...", PH_SET_ACTION },
+			{ "Pictures on the PC", "1210 titles, 1198 screenshots", PH_SET_INFO },
+			{ "Pictures come from", "thumbnails.libretro.com", PH_SET_INFO },
+		};
+		for (int i = 0; i < 8; i++)
+		{
+			snprintf(ui.set_rows[i].label, sizeof(ui.set_rows[i].label), "%s", rows[i].l);
+			snprintf(ui.set_rows[i].value, sizeof(ui.set_rows[i].value), "%s", rows[i].v);
+			ui.set_rows[i].kind = rows[i].k;
+		}
+		ui.set_count = 8;
+		snprintf(ui.set_note, sizeof(ui.set_note), "%s", "Which picture sits behind the menu: the game's title screen or a screenshot of it.");
+		ph_ui_settings_begin(&ui);
+		if (setsel > 0) ui.set_sel = setsel;
+	}
 
 	if (busy)
 	{

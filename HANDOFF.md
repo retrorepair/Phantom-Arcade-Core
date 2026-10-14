@@ -232,14 +232,105 @@ the A9 and run on the board:** 7.0 ms a frame flat, 11.3 ms over a picture, agai
 no stream is running while the menu is up. Tests: 10 renderer checks (`test_background`) and harness section 9 (the real
 launcher reading a picture from disk: appears dimmed, a replaced one is picked up, a wrong-size file is ignored and the held
 one stays, removing it restores the flat menu, launching still works); the harness stub now keeps the last presented frame.
-**Waiting on the user's go-ahead (do not start without it): fetching titles/screens per game.** Their instruction: if they say go,
-prepare what is needed for fetching; if stuck, look at **where the misterzine frontend gets its images from** - it is installed
-on the MiSTer (`/media/fat/misterzine`, `/media/fat/misterzine-plex`, `menu_launcher.py`, `manager.py`), so its sources and
-matching rules can be read from there. My assessment, given to the user: the PC resizes and sends one image after the cursor
-rests (Imlib2/libpng and miniz are already linked into the cabinet build; or send deflated raw pixels), and the hard part is
-matching titles to pictures: ProgettoSNAPS packs for MAME/FBNeo (exact by set name), libretro-thumbnails for consoles (exact
-No-Intro/Redump names), ScreenScraper for odd names (the user's own account; I cannot create one), PS3 `ICON0.PNG`/`PIC1.PNG`
-beside `PARAM.SFO` for free. Each source needs the user's say-so before anything is downloaded.
+**Approved on 2026-10-14 ("definitely continue with the title/screen fetching"): fetching titles/screens per game.** That is the
+top item. Its design and status are in the "Artwork" section. misterzine's images come from a private CDN
+(`images.misterzine.fyi/snap/<mame set>.png`, 320x237) - **not used**; the sources are libretro-thumbnails, ProgettoSNAPS,
+and PS3 `ICON0`/`PIC1`, each fetched only with the user's say-so (given for titles and screens in general; ScreenScraper
+needs the user's own account, which I cannot create).
+
+## 2026-10-14 (late): PS2 "frames out of sync in chunks", and the review of Phantom-Arcade-Core PR #1
+
+### PS2 tearing: what could and could not be established
+The user saw PS2 (PCSX2) frames "vertically out of sync in chunks, like vsync off on a PC game" and asked for screenshots.
+Stream at the time: Burnout 3, 640x448, `interlace=2 fields-from-core`, NLC (`Codec=7`), `Pacing=0` (PCSX2 is the clock),
+`Readback=0`. Evidence gathered, in the order it was obtained:
+- **DDR snapshots** (`tools/mister_burst.py` + `tools/analyse_tearing.py`): 55 of 60 captures changed all the way down, 4 partly.
+  Inconclusive: an uncached read of the frame takes ~39 ms, so it cannot catch a few-millisecond tear.
+- **The core's own sync-loss counters** (`/tmp/groovynlc.log`, verbose 0): no `[SYNCLOSS]` and no `sync=0` status line over several
+  minutes. The core never ran out of pixels for the raster.
+- **Frame-number log** (`tools/mister_framelog.py`; the compressed-blit header is at DDR byte 32): 60.00 frames a second, every
+  step exactly +1 over 1800 frames - nothing dropped, repeated or reordered. But the *arrival* times are bunched: of 1800 gaps,
+  ~150 under 8 ms and ~105-125 over 26 ms around the 16.68 ms mean (worst ~32 ms).
+- **A/B of PCSX2 `Pacing` 0 -> 1** (MisterMaster, the CRT as the clock): the same histogram. So the jitter is not PCSX2's frame
+  limiter; it is introduced after it (encode time, the PC's send path, the network, or the HPS ingest). The setting was put back to 0.
+Reading `Groovy.sv`: with OSD "Volatile framebuffer: Off" (`hps_frameskip`), a frame that has not arrived when the raster needs
+its lines is replaced by the *previous frame's* lines from the framebuffer (`cmd_fskip` auto-blit), and the new frame is picked up
+mid-field when it lands (`PoC_frame_vram`, "frame arrives soon, finish blit last asap"). A late frame therefore shows as old above
+a line and new below it - the user's description. The 15% of frames that arrive 10+ ms off their slot fit that. **That is a
+hypothesis, not a measurement**: nothing here observed `vga_frameskip` itself (it is only logged at verbose 1+, which is an OSD
+option; the HPS could count its rising edges and log them next to `[HKGAP]` - the cheapest way to settle it). Cheap things for
+the user to try on the CRT: OSD "Volatile framebuffer: On" (late frames then show as a gap instead of a tear) and "Vsync overlay: On".
+Ideas if it is confirmed: jumbo frames (the client is at MTU 1500, so a frame is ~70 datagrams), a larger "Framebuffer lead", a
+sender-side pacing point that sends each frame at a fixed phase of the CRT's field instead of when the encode finishes.
+
+### Review of retrorepair/Phantom-Arcade-Core PR #1 (browser frame monitor)
+Draft; adds `api/browser_monitor.h` (240 lines), a hook in `CmdBlit` and `docs/BrowserMonitor.md`; serves the pre-compression
+frame on `http://<pc>:8765/` when `GM_BROWSER_MONITOR=1`. I built and ran its header against a synthetic 720x480 stream
+(`scratchpad/pr1src`, `bm_test.cpp`, `bm_client.py`). **It will not work as submitted:**
+1. The page asks for `/frame.bmp?t=<ms>` (a cache-buster) but the handler matches `"GET /frame.bmp "` with the trailing space,
+   so every request falls through to the 404 branch and the page sits on "Waiting for first frame" forever. Parse the path and
+   drop the query string.
+2. The server is one thread that does a blocking `recv()` on each client in turn with no timeout. A browser's speculative
+   pre-connect (or anything that connects and says nothing) blocks it for good. Needs a receive timeout or a thread per client.
+3. Red and blue are swapped: the wire format for RGB888/RGBA8888 is B,G,R (`GroovyMiSTerPixels.cpp`: `out[0] = in[2]`), the
+   converter reads R,G,B. (RGB565 is right.)
+4. In true-field mode (`interlace=1`) `m_RGBSize` is halved, so the monitor shows half-height fields; at 20 fps (every third
+   frame) they alternate parity and the picture bobs a line up and down. It needs weaving, or a fixed parity.
+Also: it is per-emulator-process, so every emulator exe needs its own inbound firewall allow (rules here are per exact path -
+the "user faff" the user wants to avoid) and two emulators fight over port 8765 (`SO_REUSEADDR` on Windows lets a second
+process bind the same port; use `SO_EXCLUSIVEADDRUSE`); the env var would have to be set by whatever starts the emulator; a
+32-bit BMP at 20 fps is ~28 MB/s on the LAN (JPEG via a single-header encoder, or a lower rate, is kinder to Wi-Fi); it binds
+`0.0.0.0` with no access control; and it shows what the PC *sent*, not what the CRT shows, so it cannot show the Phantom menu,
+a held frame, a failed launch, or a tear.
+**Recommended integration (least faff): serve the monitor from the MiSTer instead.** `MiSTer_phantom` already maps the core's
+DDR frame (what `tools/mister_fbdump.py` reads), knows the mode, and runs for every emulator and for the menu. It would answer
+`http://<mister>:8765/` with the PR's page and a frame fetched only while a viewer is connected, capped at a few frames a second
+(an uncached read of a whole frame is ~39 ms, so it costs the HPS and the DDR arbiter noticeable time; keep it off the hot
+thread and off by default, switchable from the new Phantom settings menu). No PC firewall rule, no environment variable, no
+emulator change, and it shows the true CRT frame - which is what the tearing question needed. The PC-side tap is still worth
+keeping, off by default, as the *pre-compression* source for encoder A/B (compare PC frame with CRT frame). Order: after artwork
+and the settings menu; fix items 1-4 either way before merging.
+
+## Artwork and the settings menu (2026-10-14)
+
+The user approved fetching titles/screens ("definitely continue") and asked for a settings menu on **Select** with, at minimum,
+what to fetch and which to display, the screen-boundary setting inside it, and the list at 60% see-through (settled).
+
+**What was built**
+- **PC** (`host/`): `art.h` (name rules, listing parser, the match ladder, folders per system, URLs, 4:3 fitting and
+  resampling - portable), `art_store.h` (disk cache, worker threads, priorities, back-off, whole-library run - portable,
+  HTTP/decoder injected), `art_http.h` (the `/art` request and the `ART:` datagrams - portable), `art_win.h` (WinHTTP + WIC).
+  The daemon's HTTP server (TCP 8088) was rewritten: one thread per connection with receive timeouts (it was a single thread
+  with a blocking read, so one silent client stopped everything - the same flaw found in the browser-monitor PR), routes
+  `/catalog.json`, `/` and `/art`. `--http-port N` lets a test copy run beside the real daemon. The "what may be downloaded"
+  setting lives in `art\settings.txt` (not `phantom_config.json`, which is rewritten from the window's controls).
+- **Cabinet** (`hps_linux/src/support/groovy/`): `phantom_art.c/.h` (non-blocking HTTP client: debounce 250 ms, one GET, a
+  megabyte over many polls, retries while the host says 202), a settings page in `phantom_ui.c` (`PH_VIEW_SETTINGS`; the model
+  is filled by `phantom.cpp`), and in `phantom.cpp` the picture logic (the fetched picture wins over `phantom_bg.ppm`, which
+  stays the fallback; both kept undimmed so brightness changes live), `ART_SHOW=off|title|snap` in `phantom.ini`, the
+  settings model and its input, and `ART:INFO` polling while the menu is open. The adjust page now returns to wherever it was
+  opened from.
+- **Wire**: `GET /art?v=&l=&i=&k=title|snap` -> 200 (720*480*3 B,G,R), 202 (fetching, ask again), 404, 409 (library changed),
+  400; `ART:INFO` / `ART:SET:<mask>` / `ART:ALL:<1|0>` over UDP. A 200/202 also prefetches the rows around it. The discovery
+  reply is `PHANTOM_HOST_ONLINE:<udp>:<http>` (the cabinet reads the HTTP port from it).
+
+**Source and matching.** libretro thumbnails (`thumbnails.libretro.com/<system>/Named_Titles|Named_Snaps/<name>.png`), named
+after the game as No-Intro/Redump/MAME/FBNeo spell it with `&*/:` etc. replaced by `_`. There is no search: the folder listing
+is the index, fetched once per system and kept (two weeks). Ladder: the same name -> the file name (Redump names for discs) ->
+same name ignoring case/punctuation/"Rev"="Revision"/a moved "The" -> the same game's other release, preferring the one whose
+bracketed words agree, then World > USA > Europe > Japan. On the live library: FBNeo 1,210 of 1,217 titles match, MAME 24 of 30
+(the rest are renamed or absent on the server); a whole-library download fetched 1,242 titles and 1,243 screenshots (64 MB,
+about 4 minutes at 3 requests at a time with 150 ms between each). 86Box machines and unknown systems have no pictures.
+misterzine's CDN (`images.misterzine.fyi`, private) is **not** used. ScreenScraper (needs the user's own account) and
+ProgettoSNAPS packs are not used; libretro covered the library.
+
+**Found while building it:** the PS3 `Named_Titles` folder on the server is empty (a valid empty index - handled as "no pictures"
+and kept, not as an outage); `windows.h` min/max macros clash with `std::min` (the headers parenthesise it); a Bash tool
+`/c` argument is rewritten to `C:\` by MSYS (use `cmd.exe //c`, and `MSYS_NO_PATHCONV=1` for `wsl -- bash /mnt/...`).
+
+**Not done / next:** a crossfade between pictures (it is a hard cut); ScreenScraper as a second source for what libretro lacks;
+a settings line for the picture dim of panels; per-system choice of title vs screenshot; the FBNeo ROM audit; the HPS-side
+browser monitor (see the PR #1 review above).
 
 ## Open
 

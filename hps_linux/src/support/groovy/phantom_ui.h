@@ -83,8 +83,26 @@ typedef enum
 {
 	PH_VIEW_LIST = 0,  /* browsing */
 	PH_VIEW_BUSY,      /* a LAUNCH has gone out; waiting for the host's first frame */
-	PH_VIEW_ADJUST     /* the screen-adjust page: set how much of each edge the display hides */
+	PH_VIEW_ADJUST,    /* the screen-adjust page: set how much of each edge the display hides */
+	PH_VIEW_SETTINGS   /* the settings menu, opened by Select */
 } ph_view;
+
+/* One line of the settings menu. The menu is a model the caller fills in (phantom.cpp knows what each line means and
+ * where its value lives); this module only draws it and moves the cursor. */
+#define PH_SET_MAX 10
+typedef enum
+{
+	PH_SET_VALUE = 0,  /* Left/Right change it; the value is shown between arrows */
+	PH_SET_ACTION,     /* A does it; the value is shown as is */
+	PH_SET_INFO        /* a line of text: never selected */
+} ph_set_kind;
+
+typedef struct
+{
+	char label[32];
+	char value[40];
+	int  kind;
+} ph_set_row;
 
 /* How many pixels of each edge of the 720x480 canvas the display may hide. A TV's overscan
  * is not symmetric - one that loses 20 lines at the top can lose 45 at the bottom - so each
@@ -151,6 +169,13 @@ typedef struct
 	ph_safe safe;
 	ph_safe safe_saved;   /* what to go back to if the adjust page is cancelled */
 	int     adj_edge;     /* 0 top, 1 bottom, 2 left, 3 right: the edge the adjust page is moving */
+	ph_view adj_return;   /* where the adjust page goes back to: the list, or the settings menu it was opened from */
+
+	/* the settings menu (PH_VIEW_SETTINGS) */
+	ph_set_row set_rows[PH_SET_MAX];
+	int        set_count;
+	int        set_sel;
+	char       set_note[96];   /* one line under the menu: what the selected line does, or what just happened */
 
 	/* host link, for the header */
 	ph_host_state host_state;
@@ -228,6 +253,13 @@ int  ph_ui_adjust_edge(ph_ui *u, int dir);          /* choose the edge to move *
 int  ph_ui_adjust_move(ph_ui *u, int delta);        /* move it: + is further in from the edge */
 void ph_ui_adjust_reset(ph_ui *u);                  /* back to the defaults */
 void ph_ui_adjust_end(ph_ui *u, int keep);          /* keep=0 restores what it was on entry */
+
+/* The settings menu. begin shows it with the cursor on the first line that can be selected; end goes back to the
+ * list. move steps to the next selectable line (INFO lines are skipped), wrapping. The caller keeps set_rows[] current
+ * - it is only drawn, never read back. */
+void ph_ui_settings_begin(ph_ui *u);
+void ph_ui_settings_end(ph_ui *u);
+int  ph_ui_settings_move(ph_ui *u, int dy);
 
 /* Advance animation only. Returns 1 if the frame would differ from the last one. */
 int ph_ui_animate(ph_ui *u, uint32_t tick_ms);

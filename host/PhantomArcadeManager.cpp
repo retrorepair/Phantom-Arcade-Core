@@ -46,6 +46,8 @@
 #include "fbneo_sets.h"
 #include "game_index.h"
 #include "library_scan.h"
+#include "art_win.h"
+#include "art_http.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -55,6 +57,8 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 namespace fs = std::filesystem;
 
@@ -196,6 +200,7 @@ std::atomic<bool> g_daemonRunning(false);
 std::atomic<DWORD> g_activePid(0);
 std::atomic<ULONGLONG> g_activeStart(0);   // that process's creation time, so a recycled pid is not mistaken for it
 std::atomic<int> g_configuredPort(1999);
+std::atomic<int> g_httpPort(8088);   // --http-port N changes it, so a test copy can run beside the real daemon
 SOCKET g_udpSocket = INVALID_SOCKET;
 SOCKET g_httpSocket = INVALID_SOCKET;
 HANDLE g_hDaemonThread = NULL;
@@ -1861,7 +1866,137 @@ bool LaunchGame(const std::string& gameId, const std::wstring& targetMisterIp) {
     return false;
 }
 
-// Background HTTP Worker Thread Function (Serves /catalog.json on TCP :8088)
+// ---- artwork ---------------------------------------------------------------------------------------------------
+//
+// The pictures behind the cabinet's menu: fetched from the libretro thumbnail server in the background, kept under
+// <app folder>\art, and handed to the cabinet over HTTP (see art_http.h for the protocol). The one setting that lives
+// here - which kinds may be downloaded - is kept in art\settings.txt rather than in phantom_config.json, because the
+// cabinet changes it over the network and the JSON file is rewritten from the window's controls.
+static std::mutex g_artMutex;
+static std::unique_ptr<phantom::art::Store> g_art;
+
+static fs::path ArtRoot() { return fs::path(GetAppDir()) / L"art"; }
+
+static int LoadArtMask() {
+    std::ifstream in(ArtRoot() / L"settings.txt");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("fetch=", 0) == 0) {
+            const int v = atoi(line.c_str() + 6);
+            if (v >= 0 && v <= 3) return v;
+        }
+    }
+    return 3;   // titles and screens: what the user asked for when they asked for artwork
+}
+
+static void SaveArtMask(int mask) {
+    std::error_code ec;
+    fs::create_directories(ArtRoot(), ec);
+    std::ofstream out(ArtRoot() / L"settings.txt", std::ios::trunc);
+    out << "fetch=" << mask << "\n";
+}
+
+static phantom::art::Store& Art() {
+    std::lock_guard<std::mutex> lk(g_artMutex);
+    if (!g_art) {
+        g_art.reset(new phantom::art::Store(ArtRoot(), phantom::art::WindowsServices()));
+        g_art->SetFetchMask(LoadArtMask());
+    }
+    return *g_art;
+}
+
+// ---- the HTTP server (TCP :8088 unless --http-port says otherwise) -------------------------------------------------------------------------------
+//
+// Two things are served: the library as JSON (/catalog.json, and / for the older tools that asked for the root) and
+// the pictures (/art). One thread per connection, each with a receive timeout: this used to be a single thread
+// doing a blocking read on each client in turn, so one client that connected and said nothing - which a browser's
+// speculative connection does - stopped every other request for good.
+static std::atomic<int> g_httpClients(0);
+
+static bool HttpSendAll(SOCKET s, const char* p, size_t n) {
+    while (n) {
+        const int k = send(s, p, (int)std::min<size_t>(n, 1u << 20), 0);
+        if (k <= 0) return false;
+        p += k;
+        n -= (size_t)k;
+    }
+    return true;
+}
+
+// The first line of the request is all that is needed; the headers after it are not read.
+static bool HttpReadRequestLine(SOCKET s, std::string& head) {
+    char buf[2048];
+    while (head.size() < 8192) {
+        const int r = recv(s, buf, sizeof(buf), 0);
+        if (r <= 0) return false;
+        head.append(buf, (size_t)r);
+        if (head.find('\n') != std::string::npos) return true;
+    }
+    return true;
+}
+
+static void HttpServeCatalog(SOCKET clientSock) {
+    // Streamed in pieces and ended by closing the connection: a library of hundreds of thousands is far too big to
+    // build as one string first.
+    const std::string head = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+                             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+    HttpSendAll(clientSock, head.c_str(), head.length());
+
+    std::shared_ptr<const phantom::Index> ix = CurrentIndex();
+    std::string chunk = "{\"games\":[";
+    auto flush = [&]() {
+        const bool ok = HttpSendAll(clientSock, chunk.data(), chunk.size());
+        chunk.clear();
+        return ok;
+    };
+    bool ok = true;
+    if (ix) {
+        for (size_t i = 0; i < ix->Total() && ok; i++) {
+            const phantom::Rec& r = ix->recs[ix->lists[0][i]];
+            const char* rom = ix->Rom(r);
+            const char* slash = strrchr(rom, '/');
+            if (i) chunk += ",";
+            chunk += "{\"id\":\"" + JsonEscape(ix->Id(r)) + "\",\"title\":\"" + JsonEscape(ix->Title(r)) +
+                     "\",\"system\":\"" + JsonEscape(ix->sys[r.sys].key) + "\",\"systemName\":\"" +
+                     JsonEscape(ix->sys[r.sys].name) + "\",\"romName\":\"" + JsonEscape(slash ? slash + 1 : rom) +
+                     "\",\"romPath\":\"" + JsonEscape(rom) + "\",\"videoMode\":\"" + JsonEscape(ix->Str(r.mode)) +
+                     "\",\"year\":\"" + JsonEscape(ix->Str(r.year)) + "\",\"manufacturer\":\"" +
+                     JsonEscape(ix->Str(r.maker)) + "\",\"resolution\":\"" + JsonEscape(ix->Str(r.mode)) + "\"}";
+            if (chunk.size() > (1u << 18)) ok = flush();
+        }
+    }
+    chunk += "]}";
+    if (ok) flush();
+}
+
+static void HttpServeClient(SOCKET clientSock) {
+    DWORD rcv = 3000, snd = 20000;
+    setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcv, sizeof(rcv));
+    setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&snd, sizeof(snd));
+
+    std::string head;
+    if (HttpReadRequestLine(clientSock, head)) {
+        const phantom::art::HttpRequest req = phantom::art::ParseRequest(head);
+        if (!req.ok || req.method != "GET") {
+            static const char bad[] = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            HttpSendAll(clientSock, bad, sizeof(bad) - 1);
+        } else if (req.path == "/catalog.json" || req.path == "/") {
+            HttpServeCatalog(clientSock);
+        } else if (req.path == "/art") {
+            const phantom::art::ArtReply r = phantom::art::HandleArtRequest(Art(), CurrentIndex(), req.query);
+            const std::string h = phantom::art::ReplyHead(r);
+            if (HttpSendAll(clientSock, h.data(), h.size()) && !r.body.empty())
+                HttpSendAll(clientSock, (const char*)r.body.data(), r.body.size());
+        } else {
+            static const char nf[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            HttpSendAll(clientSock, nf, sizeof(nf) - 1);
+        }
+    }
+    shutdown(clientSock, SD_SEND);
+    closesocket(clientSock);
+}
+
+// Background HTTP worker: accepts connections on TCP :8088 and hands each to its own thread.
 DWORD WINAPI HttpThreadProc(LPVOID lpParam) {
     g_httpSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (g_httpSocket == INVALID_SOCKET) return 1;
@@ -1871,7 +2006,7 @@ DWORD WINAPI HttpThreadProc(LPVOID lpParam) {
 
     sockaddr_in bindAddr = { 0 };
     bindAddr.sin_family = AF_INET;
-    bindAddr.sin_port = htons(8088);
+    bindAddr.sin_port = htons((u_short)g_httpPort.load());
     bindAddr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(g_httpSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
@@ -1879,7 +2014,7 @@ DWORD WINAPI HttpThreadProc(LPVOID lpParam) {
         return 1;
     }
 
-    listen(g_httpSocket, 5);
+    listen(g_httpSocket, 16);
 
     while (g_daemonRunning) {
         sockaddr_in clientAddr;
@@ -1887,56 +2022,20 @@ DWORD WINAPI HttpThreadProc(LPVOID lpParam) {
         SOCKET clientSock = accept(g_httpSocket, (sockaddr*)&clientAddr, &clientLen);
         if (clientSock == INVALID_SOCKET) break;
 
-        char buf[2048];
-        int r = recv(clientSock, buf, sizeof(buf) - 1, 0);
-        if (r > 0) {
-            buf[r] = 0;
-            std::string req(buf);
-            if (req.find("GET /catalog.json") != std::string::npos || req.find("GET / ") != std::string::npos) {
-                // Streamed in pieces and ended by closing the connection: a library of hundreds of thousands is
-                // far too big to build as one string first.
-                const std::string head = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
-                                         "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
-                send(clientSock, head.c_str(), (int)head.length(), 0);
-
-                std::shared_ptr<const phantom::Index> ix = CurrentIndex();
-                std::string chunk = "{\"games\":[";
-                auto flush = [&]() {
-                    const char* p = chunk.data();
-                    size_t n = chunk.size();
-                    while (n) {
-                        int k = send(clientSock, p, (int)std::min<size_t>(n, 1u << 20), 0);
-                        if (k <= 0) { chunk.clear(); return false; }
-                        p += k;
-                        n -= (size_t)k;
-                    }
-                    chunk.clear();
-                    return true;
-                };
-                bool ok = true;
-                if (ix) {
-                    for (size_t i = 0; i < ix->Total() && ok; i++) {
-                        const phantom::Rec& r = ix->recs[ix->lists[0][i]];
-                        const char* rom = ix->Rom(r);
-                        const char* slash = strrchr(rom, '/');
-                        if (i) chunk += ",";
-                        chunk += "{\"id\":\"" + JsonEscape(ix->Id(r)) + "\",\"title\":\"" + JsonEscape(ix->Title(r)) +
-                                 "\",\"system\":\"" + JsonEscape(ix->sys[r.sys].key) + "\",\"systemName\":\"" +
-                                 JsonEscape(ix->sys[r.sys].name) + "\",\"romName\":\"" + JsonEscape(slash ? slash + 1 : rom) +
-                                 "\",\"romPath\":\"" + JsonEscape(rom) + "\",\"videoMode\":\"" + JsonEscape(ix->Str(r.mode)) +
-                                 "\",\"year\":\"" + JsonEscape(ix->Str(r.year)) + "\",\"manufacturer\":\"" +
-                                 JsonEscape(ix->Str(r.maker)) + "\",\"resolution\":\"" + JsonEscape(ix->Str(r.mode)) + "\"}";
-                        if (chunk.size() > (1u << 18)) ok = flush();
-                    }
-                }
-                chunk += "]}";
-                if (ok) flush();
-            } else {
-                std::string notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                send(clientSock, notFound.c_str(), (int)notFound.length(), 0);
-            }
+        if (g_httpClients.load() >= 24) {   // a flood is not a cabinet; shed it rather than grow without bound
+            closesocket(clientSock);
+            continue;
         }
-        closesocket(clientSock);
+        g_httpClients++;
+        try {
+            std::thread([clientSock]() {
+                HttpServeClient(clientSock);
+                g_httpClients--;
+            }).detach();
+        } catch (...) {
+            g_httpClients--;
+            closesocket(clientSock);
+        }
     }
     closesocket(g_httpSocket);
     return 0;
@@ -2025,7 +2124,7 @@ DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
             NoteMisterAddress(misterClientIp);
 
             if (msg.rfind("DISCOVER_PHANTOM", 0) == 0) {
-                std::string reply = "PHANTOM_HOST_ONLINE:" + std::to_string(port) + ":8088";
+                std::string reply = "PHANTOM_HOST_ONLINE:" + std::to_string(port) + ":" + std::to_string(g_httpPort.load());
                 sendto(g_udpSocket, reply.c_str(), (int)reply.length(), 0, (sockaddr*)&clientAddr, clientLen);
             } else if (msg == "GET_CATALOG") {
                 // The older cabinets' way: the whole list in one datagram. They get a compact one, the small
@@ -2127,6 +2226,10 @@ DWORD WINAPI DaemonThreadProc(LPVOID lpParam) {
                 g_activePid = 0;
                 const char* reply = "ACK:KILL:OK";
                 sendto(g_udpSocket, reply, (int)strlen(reply), 0, (sockaddr*)&clientAddr, clientLen);
+            } else if (msg.rfind("ART:", 0) == 0) {
+                // The settings menu: what may be downloaded, a whole-library download, and the numbers for the screen.
+                const std::string reply = phantom::art::HandleArtCommand(Art(), CurrentIndex(), msg, [](int m) { SaveArtMask(m); });
+                if (!reply.empty()) sendto(g_udpSocket, reply.c_str(), (int)reply.length(), 0, (sockaddr*)&clientAddr, clientLen);
             } else if (msg == "PING") {
                 const char* reply = "PONG";
                 sendto(g_udpSocket, reply, (int)strlen(reply), 0, (sockaddr*)&clientAddr, clientLen);
@@ -2177,7 +2280,7 @@ void ToggleDaemon() {
         g_hHttpThread = CreateThread(NULL, 0, HttpThreadProc, NULL, 0, NULL);
 
         SetWindowText(hBtnToggleDaemon, L"Stop Background Daemon");
-        std::wstring status = L"Status: Background Daemon RUNNING on UDP :" + std::to_wstring(port) + L" & HTTP :8088. Waiting for MiSTer...";
+        std::wstring status = L"Status: Background Daemon RUNNING on UDP :" + std::to_wstring(port) + L" & HTTP :" + std::to_wstring(g_httpPort.load()) + L". Waiting for MiSTer...";
         SetWindowText(hStaticStatus, status.c_str());
     } else {
         g_daemonRunning = false;
@@ -2393,6 +2496,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
     // Initial scan and start daemon immediately
     // --no-firewall: a second copy run for testing must not raise the elevation prompt again.
     if (!wcsstr(lpCmdLine, L"--no-firewall")) EnsureFirewallRules();
+    if (const wchar_t* hp = wcsstr(lpCmdLine, L"--http-port")) {
+        const int v = _wtoi(hp + 11);
+        if (v > 0 && v < 65536) g_httpPort = v;
+    }
     LoadCachedLibrary();     // the cabinet can be answered from the first moment
     ToggleDaemon();
     StartLibraryScan(false); // and anything new is found behind it, without freezing this window

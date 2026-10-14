@@ -729,6 +729,123 @@ static void test_background(void)
 	CHECK(fb[(300 * PH_CANVAS_W + 4) * 3] == 0x12, "taking the picture away restores the plain background");
 }
 
+static void set_row(int i, const char *label, const char *value, int kind)
+{
+	snprintf(ui.set_rows[i].label, sizeof(ui.set_rows[i].label), "%s", label);
+	snprintf(ui.set_rows[i].value, sizeof(ui.set_rows[i].value), "%s", value);
+	ui.set_rows[i].kind = kind;
+	if (i >= ui.set_count) ui.set_count = i + 1;
+}
+
+/* where the first menu line is drawn: tab strip's place + its height + gaps, from the safe area (see layout()) */
+static int settings_row_y(int i)
+{
+	return ui.safe.t + 48 + 28 + 4 + 4 + 28 * i;
+}
+
+static void test_settings(void)
+{
+	reset();
+	set_row(0, "Picture", "Title screens", PH_SET_VALUE);
+	set_row(1, "Download", "Both", PH_SET_VALUE);
+	set_row(2, "Download all", "Start", PH_SET_ACTION);
+	set_row(3, "On the PC", "12 titles", PH_SET_INFO);
+	set_row(4, "Brightness", "50%", PH_SET_VALUE);
+	set_row(5, "Source", "reachable", PH_SET_INFO);
+
+	ph_ui_settings_begin(&ui);
+	CHECK(ui.view == PH_VIEW_SETTINGS && ui.set_sel == 0, "the menu opens on the first line");
+	CHECK(ph_ui_settings_move(&ui, 1) == 1 && ui.set_sel == 1, "Down goes to the next line");
+	ph_ui_settings_move(&ui, 1);
+	CHECK(ui.set_sel == 2, "and the next");
+	ph_ui_settings_move(&ui, 1);
+	CHECK(ui.set_sel == 4, "an information line is stepped over (got %d)", ui.set_sel);
+	ph_ui_settings_move(&ui, 1);
+	CHECK(ui.set_sel == 0, "and so is the one at the end, wrapping to the top (got %d)", ui.set_sel);
+	ph_ui_settings_move(&ui, -1);
+	CHECK(ui.set_sel == 4, "Up from the top wraps to the last selectable line (got %d)", ui.set_sel);
+	CHECK(ph_ui_settings_move(&ui, 0) == 0, "no direction, no move");
+
+	/* an information line first: the cursor starts on the first line that can be selected */
+	reset();
+	set_row(0, "Heading", "", PH_SET_INFO);
+	set_row(1, "Thing", "x", PH_SET_VALUE);
+	ph_ui_settings_begin(&ui);
+	CHECK(ui.set_sel == 1, "an information line first is skipped on opening (got %d)", ui.set_sel);
+
+	/* nothing selectable, or nothing at all, must not loop or fault */
+	reset();
+	set_row(0, "Only info", "", PH_SET_INFO);
+	ph_ui_settings_begin(&ui);
+	CHECK(ph_ui_settings_move(&ui, 1) == 0 && ph_ui_settings_move(&ui, -1) == 0, "a menu of only information has nowhere to go");
+	ph_ui_render(&ui);
+	reset();
+	ph_ui_settings_begin(&ui);
+	CHECK(ph_ui_settings_move(&ui, 1) == 0, "an empty menu has nowhere to go");
+	ph_ui_render(&ui);
+	ph_ui_settings_end(&ui);
+	CHECK(ui.view == PH_VIEW_LIST, "end goes back to the list");
+
+	/* the page is drawn, the cursor line carries the amber bar, and it stays inside the safe area */
+	reset();
+	set_row(0, "Picture behind the menu", "Title screens", PH_SET_VALUE);
+	set_row(1, "Download pictures", "Both", PH_SET_VALUE);
+	set_row(2, "Download for every game", "Stop  (1234 of 5678)", PH_SET_ACTION);
+	snprintf(ui.set_note, sizeof(ui.set_note), "%s", "What the PC may download.");
+	ph_ui_settings_begin(&ui);
+	ph_ui_settings_move(&ui, 1);
+	ph_ui_render(&ui);
+	CHECK(ui.dirty == 0, "rendering clears the dirty flag");
+	const int amber_x = ui.safe.l + 2;
+	const uint8_t *p = &fb[((size_t)(settings_row_y(1) + 4) * PH_CANVAS_W + amber_x) * 3];
+	CHECK(p[0] == 0x20 && p[1] == 0xA0 && p[2] == 0xF0, "the selected line has the amber bar (%02X %02X %02X)", p[0], p[1], p[2]);
+	p = &fb[((size_t)(settings_row_y(0) + 4) * PH_CANVAS_W + amber_x) * 3];
+	CHECK(!(p[0] == 0x20 && p[1] == 0xA0 && p[2] == 0xF0), "and the others do not");
+	p = &fb[((size_t)300 * PH_CANVAS_W + 4) * 3];
+	CHECK(p[0] == 0x12 && p[1] == 0x0C && p[2] == 0x0B, "nothing is drawn in the left margin (%02X %02X %02X)", p[0], p[1], p[2]);
+
+	/* and over a picture the bar is still solid while the rows are see-through */
+	static uint8_t pic[PH_CANVAS_W * PH_CANVAS_H * 3];
+	memset(pic, 100, sizeof(pic));
+	ui.bg = pic;
+	ui.bg_alpha = PH_BG_PANEL_ALPHA;
+	ui.bg_list_alpha = PH_BG_LIST_ALPHA;
+	ui.dirty = 1;
+	ph_ui_render(&ui);
+	p = &fb[((size_t)(settings_row_y(1) + 4) * PH_CANVAS_W + amber_x) * 3];
+	CHECK(p[0] == 0x20 && p[1] == 0xA0 && p[2] == 0xF0, "over a picture the bar is still solid amber (%02X %02X %02X)", p[0], p[1], p[2]);
+	p = &fb[((size_t)300 * PH_CANVAS_W + 4) * 3];
+	CHECK(p[0] == 100 && p[1] == 100 && p[2] == 100, "and the picture shows in the margin (%d)", p[0]);
+	ui.bg = 0;
+
+	/* the longest labels and values the structure holds, at the largest margins: drawn without overrunning anything */
+	reset();
+	char lbl[32], val[40];
+	memset(lbl, 'W', sizeof(lbl) - 1); lbl[sizeof(lbl) - 1] = 0;
+	memset(val, 'M', sizeof(val) - 1); val[sizeof(val) - 1] = 0;
+	for (int i = 0; i < PH_SET_MAX; i++) set_row(i, lbl, val, i % 3);
+	ph_ui_set_safe(&ui, PH_SAFE_MAX_X, PH_SAFE_MAX_Y, PH_SAFE_MAX_X, PH_SAFE_MAX_Y);
+	ph_ui_settings_begin(&ui);
+	for (int i = 0; i < PH_SET_MAX + 2; i++) { ph_ui_render(&ui); ph_ui_settings_move(&ui, 1); }
+	CHECK(ui.set_count == PH_SET_MAX, "a full menu renders at the largest margins");
+
+	/* the adjust page opened from the menu goes back to it; from the list, to the list */
+	reset();
+	set_row(0, "Screen edges", "Adjust...", PH_SET_ACTION);
+	ph_ui_settings_begin(&ui);
+	ph_ui_adjust_begin(&ui);
+	CHECK(ui.view == PH_VIEW_ADJUST, "the adjust page opens from the menu");
+	ph_ui_adjust_end(&ui, 1);
+	CHECK(ui.view == PH_VIEW_SETTINGS, "and saving comes back to the menu");
+	ph_ui_adjust_begin(&ui);
+	ph_ui_adjust_end(&ui, 0);
+	CHECK(ui.view == PH_VIEW_SETTINGS, "so does cancelling");
+	ph_ui_settings_end(&ui);
+	ph_ui_adjust_begin(&ui);
+	ph_ui_adjust_end(&ui, 1);
+	CHECK(ui.view == PH_VIEW_LIST, "opened from the list it goes back to the list");
+}
+
 int main(void)
 {
 	test_safe_defaults_and_rows();
@@ -745,6 +862,7 @@ int main(void)
 	test_source_states();
 	test_source_shrinks();
 	test_background();
+	test_settings();
 
 	test_empty();
 	test_wrap();

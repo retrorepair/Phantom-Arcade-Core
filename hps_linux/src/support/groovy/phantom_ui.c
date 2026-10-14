@@ -720,6 +720,7 @@ void ph_ui_adjust_begin(ph_ui *u)
 {
 	u->safe_saved = u->safe;
 	u->adj_edge = 1;       /* the bottom is the edge a TV most often hides too much of */
+	u->adj_return = (u->view == PH_VIEW_SETTINGS) ? PH_VIEW_SETTINGS : PH_VIEW_LIST;
 	u->view = PH_VIEW_ADJUST;
 	u->dirty = 1;
 }
@@ -761,8 +762,48 @@ void ph_ui_adjust_reset(ph_ui *u)
 void ph_ui_adjust_end(ph_ui *u, int keep)
 {
 	if (!keep) u->safe = u->safe_saved;
-	u->view = PH_VIEW_LIST;
+	u->view = (u->adj_return == PH_VIEW_SETTINGS) ? PH_VIEW_SETTINGS : PH_VIEW_LIST;
 	ph_ui_set_safe(u, u->safe.l, u->safe.t, u->safe.r, u->safe.b);   /* re-clamp the scroll */
+}
+
+/* ---- the settings menu ------------------------------------------------------------ */
+
+static int set_selectable(const ph_ui *u, int i)
+{
+	return i >= 0 && i < u->set_count && u->set_rows[i].kind != PH_SET_INFO;
+}
+
+void ph_ui_settings_begin(ph_ui *u)
+{
+	u->view = PH_VIEW_SETTINGS;
+	u->set_sel = 0;
+	for (int i = 0; i < u->set_count; i++)
+		if (set_selectable(u, i)) { u->set_sel = i; break; }
+	u->dirty = 1;
+}
+
+void ph_ui_settings_end(ph_ui *u)
+{
+	u->view = PH_VIEW_LIST;
+	u->dirty = 1;
+}
+
+int ph_ui_settings_move(ph_ui *u, int dy)
+{
+	if (u->set_count <= 0 || !dy) return 0;
+	const int step = dy < 0 ? -1 : 1;
+	int i = u->set_sel;
+	for (int n = 0; n < u->set_count; n++)
+	{
+		i = (i + step + u->set_count) % u->set_count;
+		if (set_selectable(u, i))
+		{
+			u->set_sel = i;
+			u->dirty = 1;
+			return 1;
+		}
+	}
+	return 0;
 }
 
 int ph_ui_animate(ph_ui *u, uint32_t tick_ms)
@@ -1249,7 +1290,7 @@ static int lg_width(int it)
 	case LG_LETTER:  return (ntw("L2") + 12) + 4 + (ntw("R2") + 12) + 6 + ntw("A-Z");
 	case LG_LAUNCH:  return 18 + 6 + ntw("LAUNCH");
 	case LG_REFRESH: return 18 + 6 + ntw("REFRESH");
-	default:         return (ntw("SEL") + 12) + 6 + ntw("SCREEN");
+	default:         return (ntw("SEL") + 12) + 6 + ntw("MENU");
 	}
 }
 
@@ -1290,7 +1331,7 @@ static int lg_draw(ph_ui *u, int it, int x, int y)
 	default:
 	{
 		int a = keycap(u, x, y, "SEL");
-		text_n(u, x + a + 6, y + 1, "SCREEN", C_TEXT_DIM);
+		text_n(u, x + a + 6, y + 1, "MENU", C_TEXT_DIM);
 		break;
 	}
 	}
@@ -1410,6 +1451,59 @@ static void draw_adjust(ph_ui *u)
 	badge(u, kx, ky, C_BTN_Y, 'Y');  text_n(u, kx + 24, ky + 1, "RESET", C_TEXT_DIM);
 }
 
+/* ---- the settings page --------------------------------------------------------- */
+
+#define SET_ROW_H 28
+
+static void draw_settings(ph_ui *u)
+{
+	LAYOUT;
+	draw_header(u);
+
+	/* The title strip stands where the tabs are. */
+	rect(u, 0, L.tab_y, u->w, TAB_H, C_TABBAR);
+	text_n(u, L.l, L.tab_y + 6, "SETTINGS", C_AMBER_HI);
+	rect(u, 0, L.tab_y + TAB_H, u->w, 2, C_BORDER);
+
+	const int x0 = L.l, x1 = u->w - L.r;
+	int y = L.list_y + 4;
+	for (int i = 0; i < u->set_count && i < PH_SET_MAX; i++)
+	{
+		const ph_set_row *r = &u->set_rows[i];
+		if (r->kind == PH_SET_INFO)
+		{
+			text_n_clip(u, x0 + 14, y + 3, r->label, C_TEXT_MUTE, x1 - x0 - 28 - (r->value[0] ? ntw(r->value) + 16 : 0));
+			if (r->value[0]) text_n_right(u, x1 - 14, y + 3, r->value, C_TEXT_DIM);
+			y += SET_ROW_H;
+			continue;
+		}
+		const int sel = (i == u->set_sel);
+		rect(u, x0, y, x1 - x0, SET_ROW_H - 4, sel ? C_ROW_SEL : ((i & 1) ? C_ROW_B : C_ROW_A));
+		if (sel) OPAQUE(u, rect(u, x0, y, 6, SET_ROW_H - 4, C_AMBER));
+		text_n(u, x0 + 18, y + 3, r->label, sel ? C_AMBER_HI : C_TEXT);
+
+		char v[56];
+		if (r->kind == PH_SET_VALUE && sel) snprintf(v, sizeof(v), "< %s >", r->value);
+		else                                snprintf(v, sizeof(v), "%s", r->value);
+		text_n_right(u, x1 - 14, y + 3, v, sel ? C_AMBER_HI : C_TEXT_DIM);
+		y += SET_ROW_H;
+	}
+
+	/* What the selected line does, in the detail band. */
+	rect(u, 0, L.detail_y, u->w, DETAIL_H, C_PANEL_DK);
+	if (u->set_note[0]) text_n_clip(u, L.l, L.detail_y + 4, u->set_note, C_CYAN, u->w - L.l - L.r);
+
+	/* This page's key. */
+	rect(u, 0, L.foot_y, u->w, u->h - L.foot_y, C_PANEL_DK);
+	rect(u, 0, L.foot_y, u->w, 2, C_BORDER);
+	enum { GAP = 14 };
+	int ky = L.foot_y + 6, kx = L.l;
+	dpad(u, kx, ky, 1);               text_n(u, kx + 26, ky + 1, "CHOOSE", C_TEXT_DIM);   kx += 20 + 6 + ntw("CHOOSE") + GAP;
+	dpad(u, kx, ky, 0);               text_n(u, kx + 26, ky + 1, "CHANGE", C_TEXT_DIM);   kx += 20 + 6 + ntw("CHANGE") + GAP;
+	badge(u, kx, ky, C_BTN_A, 'A');   text_n(u, kx + 24, ky + 1, "DO", C_TEXT);           kx += 18 + 6 + ntw("DO") + GAP;
+	badge(u, kx, ky, C_BTN_B, 'B');   text_n(u, kx + 24, ky + 1, "BACK", C_TEXT_DIM);
+}
+
 /* The busy overlay. There is deliberately no percentage and no countdown: the core
  * cannot know how long the host will take to start an emulator, and Phantom Arcade's
  * original fixed delay is exactly the guess this integration removes. The launcher
@@ -1484,6 +1578,13 @@ void ph_ui_render(ph_ui *u)
 	else
 	{
 		rect(u, 0, 0, u->w, u->h, C_BG);
+	}
+
+	if (u->view == PH_VIEW_SETTINGS)
+	{
+		draw_settings(u);
+		u->dirty = 0;
+		return;
 	}
 
 	draw_header(u);

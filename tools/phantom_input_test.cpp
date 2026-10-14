@@ -114,6 +114,16 @@ static std::atomic<int> g_drop_lists{0}; /* swallow this many LIST requests, to 
 static std::atomic<int> g_scanning{0};
 static std::atomic<int> g_fail_launch{0}; /* answer the next LAUNCH with a LAUNCHFAIL, as the PC does when an emulator will not start */
 
+/* The pictures. Off until section 11, so every earlier section sees a host that has none (as an older daemon does):
+ * the HTTP port is not announced and ART: datagrams go unanswered. */
+static std::atomic<int> g_art_on{0};
+static std::atomic<int> g_http_port{0};
+static std::atomic<int> g_art_none_row{-1};   /* this row has no picture (404) */
+static std::atomic<int> g_art_stale{0};       /* answer the next picture request with 409 */
+static std::atomic<int> g_art_mask{3};
+static std::atomic<int> g_art_bulk{0};
+static std::vector<std::string> g_http_rx;    /* the request lines the picture server has seen */
+
 static std::shared_ptr<const phantom::Index> cur_ix()
 {
     std::lock_guard<std::mutex> lk(g_ix_mx);
@@ -182,7 +192,19 @@ static void host_thread(int fd)
             g_rx.push_back(m);
         }
         if (m == "DISCOVER_PHANTOM" || m == "PING") {
-            const char *r = "PHANTOM_HOST_ONLINE";
+            std::string r = "PHANTOM_HOST_ONLINE";
+            if (g_art_on)
+                r += ":" + std::to_string(TEST_PORT) + ":" + std::to_string(g_http_port.load());
+            sendto(fd, r.data(), r.size(), 0, (sockaddr *) &from, fl);
+        } else if (g_art_on && m.rfind("ART:", 0) == 0) {
+            if (m.rfind("ART:SET:", 0) == 0)
+                g_art_mask = std::atoi(m.c_str() + 8) & 3;
+            else if (m == "ART:ALL:1")
+                g_art_bulk = 1;
+            else if (m == "ART:ALL:0")
+                g_art_bulk = 0;
+            char r[96];
+            std::snprintf(r, sizeof(r), "ART:INFO:%d:%d:%d:0:1:%d:%d:%d", g_art_mask.load(), 120, 80, g_art_bulk.load(), g_art_bulk ? 30 : 0, g_art_bulk ? 100 : 0);
             sendto(fd, r, strlen(r), 0, (sockaddr *) &from, fl);
         } else if (m == "GET_CATALOG") {
             std::string body = g_host_paged ? phantom::CompactCatalogJson(*cur_ix()) : std::string(CATALOG);
@@ -219,6 +241,74 @@ static void host_thread(int fd)
                 sendto(fd, r, strlen(r), 0, (sockaddr *) &from, fl);
         }
     }
+}
+
+/* A picture server on loopback: 720*480*3 bytes of one colour, chosen by the row and the kind asked for, so what the
+ * cabinet drew can be told from the pixel. Row n, title: B=40 G=8n R=200 (half that once dimmed); a screenshot is B=160. */
+static void http_thread(int lfd)
+{
+    while (!g_stop) {
+        int fd = accept(lfd, nullptr, nullptr);
+        if (fd < 0)
+            continue; /* accept timeout */
+        char    buf[1024];
+        ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+        if (n > 0) {
+            buf[n] = 0;
+            std::string req(buf);
+            req = req.substr(0, req.find('\r'));
+            {
+                std::lock_guard<std::mutex> lk(g_mx);
+                g_http_rx.push_back(req);
+            }
+            int         row  = -1;
+            const char *i    = std::strstr(buf, "i=");
+            if (i)
+                row = std::atoi(i + 2);
+            const bool snap = std::strstr(buf, "k=snap") != nullptr;
+            std::string head;
+            std::vector<uint8_t> body;
+            if (g_art_stale > 0) {
+                g_art_stale--;
+                head = "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            } else if (row == g_art_none_row) {
+                head = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            } else {
+                body.resize(720 * 480 * 3);
+                for (size_t p = 0; p < body.size(); p += 3) {
+                    body[p]     = snap ? 160 : 40;
+                    body[p + 1] = (uint8_t) ((row * 8) & 0xFF);
+                    body[p + 2] = 200;
+                }
+                head = "HTTP/1.1 200 OK\r\nContent-Length: 1036800\r\nConnection: close\r\n\r\n";
+            }
+            send(fd, head.data(), head.size(), MSG_NOSIGNAL);
+            size_t off = 0;
+            while (off < body.size()) {
+                ssize_t k = send(fd, body.data() + off, body.size() - off, MSG_NOSIGNAL);
+                if (k <= 0)
+                    break;
+                off += (size_t) k;
+            }
+        }
+        close(fd);
+    }
+}
+
+static int count_http(const char *needle)
+{
+    std::lock_guard<std::mutex> lk(g_mx);
+    int                         n = 0;
+    for (auto &s : g_http_rx)
+        if (s.find(needle) != std::string::npos)
+            n++;
+    return n;
+}
+
+static std::string last_http()
+{
+    std::lock_guard<std::mutex> lk(g_mx);
+    return g_http_rx.empty() ? std::string() : g_http_rx.back();
 }
 
 static int count_rx(const char *prefix)
@@ -359,7 +449,26 @@ int main()
         setsockopt(hfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
     set_ix(make_small(41));
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    {
+        int on = 1;
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        sockaddr_in a {};
+        a.sin_family      = AF_INET;
+        a.sin_addr.s_addr = inet_addr("127.0.0.1");
+        a.sin_port        = 0;
+        if (bind(lfd, (sockaddr *) &a, sizeof(a)) < 0 || listen(lfd, 8) < 0) {
+            std::perror("bind fake picture server");
+            return 2;
+        }
+        socklen_t l = sizeof(a);
+        getsockname(lfd, (sockaddr *) &a, &l);
+        g_http_port = ntohs(a.sin_port);
+        timeval tv { 0, 100000 };
+        setsockopt(lfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
     std::thread host(host_thread, hfd);
+    std::thread http(http_thread, lfd);
 
     phantom_init();
     phantom_idle_enter(); /* first idle screen after boot: no stream has run yet */
@@ -481,7 +590,7 @@ int main()
     check(phantom_owns_screen() == 0, "and the game kept the screen");
 
     /* ---------------------------------------------------------------------------- */
-    section("5c. Y refreshes; Select opens the screen-adjust page, which saves, cancels and resets");
+    section("5c. Y refreshes; Select opens the menu, whose Screen edges line is the adjust page: it saves, cancels and resets");
     phantom_idle_enter();
     pump(2200); /* past the takeover guard */
 
@@ -492,30 +601,43 @@ int main()
     check(count_rx("CATINFO") > info0, "...and for its library again");
 
     launches_before = count_rx("LAUNCH:");
-    tap(GJ_SELECT); /* adjust page opens with the bottom edge selected */
+    /* Select opens the menu; Screen edges is its sixth line (five Downs from the first), and A on it opens the adjust page
+     * with the bottom edge selected. Saving or cancelling comes back to the menu, which B then closes. */
+    auto open_adjust = [&]() {
+        tap(GJ_SELECT);
+        for (int i = 0; i < 5; i++)
+            tap(JOY_DOWN);
+        tap(JOY_BTN1);
+    };
+    auto close_menu = [&]() { tap(JOY_BTN2); };
+    open_adjust();
     for (int i = 0; i < 6; i++)
         tap(JOY_UP); /* up shrinks the box: +2 each */
     tap(JOY_BTN1);   /* A saves */
+    close_menu();
     check(count_rx("LAUNCH:") == launches_before, "A on the adjust page saved rather than launching a game");
     check(ini_has("SAFE_B=36"), "six presses of Up moved the bottom margin from 24 to 36 and saved it");
     check(ini_has("SAFE_T=24") && ini_has("SAFE_L=36") && ini_has("SAFE_R=36"), "the other edges are untouched");
 
-    tap(GJ_SELECT);
+    open_adjust();
     for (int i = 0; i < 5; i++)
         tap(JOY_UP);
     tap(JOY_BTN2); /* B cancels */
+    close_menu();
     check(ini_has("SAFE_B=36"), "cancelling leaves the saved margins as they were");
 
-    tap(GJ_SELECT);
+    open_adjust();
     tap(JOY_RIGHT); /* next edge: left */
     for (int i = 0; i < 4; i++)
         tap(JOY_UP);
     tap(JOY_BTN1);
+    close_menu();
     check(ini_has("SAFE_L=44") && ini_has("SAFE_B=36"), "Right chose the left edge; 4 x Up made it 44 (bottom stays 36)");
 
-    tap(GJ_SELECT);
+    open_adjust();
     tap(GJ_Y); /* Y resets to the defaults */
     tap(JOY_BTN1);
+    close_menu();
     check(ini_has("SAFE_L=36") && ini_has("SAFE_T=24") && ini_has("SAFE_R=36") && ini_has("SAFE_B=24"),
           "Y then A restores the default margins");
     check(count_rx("LAUNCH:") == launches_before, "none of that launched a game");
@@ -883,8 +1005,169 @@ int main()
         tap(JOY_BTN2, 30);
     }
 
+
+    /* ---------------------------------------------------------------------------- */
+    section("11. the game's own picture behind the menu, and the settings menu that controls it");
+    {
+        const char *bgpath = TEST_DIR "/bg.ppm";
+        unlink(bgpath);
+        auto margin = [&](int &b, int &g, int &r) { /* a pixel in the left margin: no panel covers it */
+            const uint8_t *p = &g_canvas[(300 * 720 + 4) * 3];
+            b = p[0]; g = p[1]; r = p[2];
+        };
+        auto row_of_last = [&]() { /* the row the last picture request named */
+            const std::string s = last_http();
+            const size_t      p = s.find("i=");
+            return p == std::string::npos ? -1 : std::atoi(s.c_str() + p + 2);
+        };
+        int b, g, r;
+
+        /* The host starts to announce its picture server, and answers ART:. */
+        phantom_idle_leave();
+        g_art_on = 1;
+        pump(50);
+        phantom_idle_enter();
+        phantom_request_refresh();
+        pump(2500);
+        const int http0 = count_http("GET /art?");
+        check(http0 >= 1, "once the host announces its picture port, the cursor's row is asked for (%d requests)", http0);
+        check(last_http().find("k=title") != std::string::npos, "a title screen by default: %s", last_http().c_str());
+        int row = row_of_last();
+        margin(b, g, r);
+        check(b == 20 && g == (row * 8 & 0xFF) / 2 && r == 100, "and it is drawn behind the menu, dimmed to half (B%d G%d R%d for row %d)", b, g, r, row);
+
+        /* a held button crossing the list asks for nothing on the way */
+        const int n0 = count_http("GET /art?");
+        for (int i = 0; i < 6; i++)
+            tap(JOY_DOWN, 15);
+        pump(100);
+        check(count_http("GET /art?") == n0, "scrolling six rows asked for no pictures on the way (%d)", count_http("GET /art?") - n0);
+        pump(900);
+        check(count_http("GET /art?") == n0 + 1, "only the row it stopped on was asked for (%d)", count_http("GET /art?") - n0);
+        const int row2 = row_of_last();
+        check(row2 == row + 6, "...and it is that row (%d, expected %d)", row2, row + 6);
+        margin(b, g, r);
+        check(g == (row2 * 8 & 0xFF) / 2, "and its picture replaced the last (G%d)", g);
+
+        /* a row with no picture goes back to the plain background (there is no file picture) */
+        g_art_none_row = row2 + 1;
+        tap(JOY_DOWN, 20);
+        pump(1100);
+        margin(b, g, r);
+        check(b == 0x12 && g == 0x0C && r == 0x0B, "a row the host has no picture for shows the plain menu (%02X %02X %02X)", b, g, r);
+        g_art_none_row = -1;
+        tap(JOY_DOWN, 20);
+        pump(1100);
+        margin(b, g, r);
+        check(b == 20 && r == 100, "and the next row's picture comes back (B%d R%d)", b, r);
+
+        /* a library that changed under the cursor: 409, and the cabinet asks the host for the new one */
+        const int info0 = count_rx("CATINFO");
+        g_art_stale = 1;
+        tap(JOY_DOWN, 20);
+        pump(1500);
+        check(count_rx("CATINFO") > info0, "a 409 sent the cabinet back for the library's version (%d new CATINFO)", count_rx("CATINFO") - info0);
+
+        /* ---- the menu ---- */
+        const int launches = count_rx("LAUNCH:");
+        tap(GJ_SELECT);
+        pump(400);
+        check(count_rx("ART:INFO") >= 1, "opening the menu asks the host for its numbers");
+        tap(JOY_BTN1);   /* A on "Picture behind the menu" steps it: title -> screenshots */
+        check(ini_has("ART_SHOW=snap"), "A on the first line moved it on to screenshots, and saved it");
+        pump(900);
+        check(last_http().find("k=snap") != std::string::npos, "and the next request is for a screenshot: %s", last_http().c_str());
+        margin(b, g, r);
+        check(b == 80, "which is drawn behind the menu (B%d)", b);
+
+        tap(JOY_RIGHT);  /* screenshots -> off */
+        check(ini_has("ART_SHOW=off"), "Right moved it on to off");
+        pump(200);
+        margin(b, g, r);
+        check(b == 0x12 && g == 0x0C && r == 0x0B, "off: the plain menu (%02X %02X %02X)", b, g, r);
+        const int n1 = count_http("GET /art?");
+        pump(900);
+        check(count_http("GET /art?") == n1, "and nothing more is asked for");
+        tap(JOY_LEFT);   /* off -> screenshots */
+        tap(JOY_LEFT);   /* -> title screens */
+        check(ini_has("ART_SHOW=title"), "Left twice is back to title screens");
+        pump(900);
+        margin(b, g, r);
+        check(b == 20, "and the title picture is behind the menu again (B%d)", b);
+
+        tap(JOY_DOWN);   /* Download pictures: the host says Both */
+        const int sets0 = count_rx("ART:SET:");
+        tap(JOY_LEFT);   /* both -> screenshots only */
+        pump(100);
+        check(count_rx("ART:SET:") == sets0 + 1 && last_rx("ART:SET:") == "ART:SET:2", "Left on Download pictures told the host: %s", last_rx("ART:SET:").c_str());
+        tap(JOY_RIGHT);
+        pump(100);
+        check(last_rx("ART:SET:") == "ART:SET:3", "and Right put it back: %s", last_rx("ART:SET:").c_str());
+
+        tap(JOY_DOWN);   /* Download for every game */
+        tap(JOY_BTN1);
+        pump(300);
+        check(count_rx("ART:ALL:1") == 1, "A on Download for every game started it on the host");
+        tap(JOY_BTN1);
+        pump(100);
+        check(count_rx("ART:ALL:0") == 1, "and A again stopped it");
+
+        tap(JOY_DOWN);   /* Picture brightness */
+        tap(JOY_LEFT);
+        check(ini_has("BG_DIM=40"), "Left on Picture brightness took it from 50%% to 40%% and saved it");
+        pump(100);
+        margin(b, g, r);
+        check(b == 15, "and the picture behind the menu is dimmer at once (B%d, expected 15: 40 x 40%%)", b);
+        tap(JOY_RIGHT);
+        tap(JOY_RIGHT);
+        check(ini_has("BG_DIM=60"), "Right twice made it 60%%");
+        tap(JOY_LEFT);
+        check(ini_has("BG_DIM=50"), "and back to 50%%");
+
+        tap(JOY_DOWN);   /* Game list see-through */
+        tap(JOY_RIGHT);
+        check(ini_has("BG_LIST=77"), "Right on Game list see-through took it from 60%% to 70%% (BG_LIST=77)");
+        tap(JOY_LEFT);
+        tap(JOY_LEFT);
+        check(ini_has("BG_LIST=128"), "and Left twice to 50%% (BG_LIST=128)");
+        tap(JOY_RIGHT);
+        check(ini_has("BG_LIST=102"), "and back to 60%% (BG_LIST=102)");
+
+        check(count_rx("LAUNCH:") == launches, "none of that launched a game (%d)", count_rx("LAUNCH:") - launches);
+
+        tap(JOY_BTN2);   /* B closes the menu */
+        pump(200);
+        tap(JOY_BTN1, 30);
+        check(count_rx("LAUNCH:") == launches + 1, "B closed the menu: A launches again");
+        tap(JOY_BTN2, 30);
+
+        /* the keyboard reaches the same menu: F2 opens it, Esc closes it */
+        phantom_keyboard(KEY_F2, 1);
+        phantom_keyboard(KEY_F2, 0);
+        pump(100);
+        phantom_keyboard(KEY_RIGHT, 1);
+        phantom_keyboard(KEY_RIGHT, 0);
+        check(ini_has("ART_SHOW=snap"), "F2 opened the menu and Right changed the first line");
+        phantom_keyboard(KEY_ESC, 1);
+        phantom_keyboard(KEY_ESC, 0);
+        pump(100);
+        const int l2 = count_rx("LAUNCH:");
+        phantom_keyboard(KEY_ENTER, 1);
+        phantom_keyboard(KEY_ENTER, 0);
+        pump(100);
+        check(count_rx("LAUNCH:") == l2 + 1, "Esc closed it: Enter launches again");
+        tap(JOY_BTN2, 30);
+
+        /* back to the way it was for the rest of the run */
+        tap(GJ_SELECT);
+        tap(JOY_LEFT);
+        tap(JOY_BTN2);
+        g_art_on = 0;
+    }
+
     g_stop = true;
     host.join();
+    http.join();
     std::printf("\n%d check(s) failed\n", g_fail);
     return g_fail;
 }
