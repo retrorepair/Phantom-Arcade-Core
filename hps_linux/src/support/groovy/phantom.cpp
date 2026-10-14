@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -63,6 +64,11 @@ int      groovy_ps2_inputs_enabled(void);
 #endif
 #ifndef PH_CACHE
 #define PH_CACHE     "/media/fat/config/phantom_catalog.tsv"
+#endif
+/* An optional picture behind the whole launcher: a 720x480 binary PPM (P6). If the file is there it is used, every
+ * time the launcher comes up; take it away and the launcher is as it always was. */
+#ifndef PH_BG
+#define PH_BG        "/media/fat/config/phantom_bg.ppm"
 #endif
 
 #define PH_DEF_PORT  1999
@@ -207,6 +213,12 @@ static void trim(char *s)
 /* The display's overscan margins, left/top/right/bottom, as saved by the screen-adjust page. */
 static int safe_cfg[4] = { PH_SAFE_DEF_L, PH_SAFE_DEF_T, PH_SAFE_DEF_R, PH_SAFE_DEF_B };
 
+/* How the picture behind the menu is shown: the brightness it is dimmed to, and how solid the panels are over it
+ * (the list, which is the part to see through, and everything else). See phantom_ui.h. */
+static int bg_dim = 50, bg_panels = PH_BG_PANEL_ALPHA, bg_list = PH_BG_LIST_ALPHA;
+
+static int clamp_int(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
 static void load_config(void)
 {
 	FILE *f = fopen(PH_INI, "r");
@@ -249,6 +261,9 @@ static void load_config(void)
 		else if (!strcmp(key, "SAFE_T")) safe_cfg[1] = atoi(val);
 		else if (!strcmp(key, "SAFE_R")) safe_cfg[2] = atoi(val);
 		else if (!strcmp(key, "SAFE_B")) safe_cfg[3] = atoi(val);
+		else if (!strcmp(key, "BG_DIM"))    bg_dim    = clamp_int(atoi(val), 0, 100);
+		else if (!strcmp(key, "BG_PANELS")) bg_panels = clamp_int(atoi(val), 1, 255);
+		else if (!strcmp(key, "BG_LIST"))   bg_list   = clamp_int(atoi(val), 1, 255);
 	}
 	fclose(f);
 
@@ -273,7 +288,80 @@ void phantom_save_config(void)
 	        idle_mode == PHANTOM_IDLE_OFF  ? "off"  : "launcher");
 	fprintf(f, "EXIT_HOTKEY=%s\n", exit_hotkey ? "on" : "off");
 	fprintf(f, "SAFE_L=%d\nSAFE_T=%d\nSAFE_R=%d\nSAFE_B=%d\n", ui.safe.l, ui.safe.t, ui.safe.r, ui.safe.b);
+	fprintf(f, "BG_DIM=%d\nBG_PANELS=%d\nBG_LIST=%d\n", bg_dim, bg_panels, bg_list);
 	fclose(f);
+}
+
+/* ---- the picture behind the menu ----------------------------------------------- */
+
+static uint8_t *bg_buf   = 0;
+static time_t   bg_mtime = 0;
+static long     bg_mtime_ns = 0;
+static off_t    bg_size  = 0;
+
+/* Pick up phantom_bg.ppm: loaded when it appears or changes, dropped when it goes. Called as the launcher comes up,
+ * which is cheap (one stat) and means a new picture is seen the next time the menu returns, with nothing to restart. */
+static void bg_load(void)
+{
+	struct stat st;
+	if (stat(PH_BG, &st) != 0)
+	{
+		if (bg_buf)
+		{
+			free(bg_buf);
+			bg_buf = 0;
+			LOGP("background picture removed\n");
+		}
+		ui.bg = 0;
+		ui.dirty = 1;
+		return;
+	}
+
+	if (bg_buf && st.st_mtime == bg_mtime && st.st_mtim.tv_nsec == bg_mtime_ns && st.st_size == bg_size)
+	{
+		ui.bg = bg_buf;                  /* still the picture we hold; ph_ui_init may have cleared the pointer */
+		ui.bg_alpha = bg_panels;
+		ui.bg_list_alpha = bg_list;
+		return;
+	}
+
+	FILE *f = fopen(PH_BG, "rb");
+	if (!f) return;
+	char magic[3] = { 0 };
+	int w = 0, h = 0, mx = 0;
+	if (fscanf(f, "%2s %d %d %d", magic, &w, &h, &mx) != 4 || strcmp(magic, "P6") || w != PH_CANVAS_W || h != PH_CANVAS_H || mx != 255)
+	{
+		LOGP("%s is not a %dx%d binary PPM; ignored\n", PH_BG, PH_CANVAS_W, PH_CANVAS_H);
+		fclose(f);
+		return;
+	}
+	fgetc(f);                            /* the one whitespace after the header */
+
+	const size_t n = (size_t)PH_CANVAS_W * PH_CANVAS_H * 3;
+	uint8_t *p = (uint8_t *)malloc(n);
+	if (!p || fread(p, 1, n, f) != n)
+	{
+		LOGP("could not read the picture in %s\n", PH_BG);
+		free(p);
+		fclose(f);
+		return;
+	}
+	fclose(f);
+
+	/* a PPM is R,G,B and the canvas is B,G,R */
+	for (size_t i = 0; i < n; i += 3) { uint8_t r = p[i]; p[i] = p[i + 2]; p[i + 2] = r; }
+	ph_ui_dim(p, p, n, bg_dim);
+
+	free(bg_buf);
+	bg_buf = p;
+	bg_mtime = st.st_mtime;
+	bg_mtime_ns = st.st_mtim.tv_nsec;
+	bg_size = st.st_size;
+	ui.bg = bg_buf;
+	ui.bg_alpha = bg_panels;
+	ui.bg_list_alpha = bg_list;
+	ui.dirty = 1;
+	LOGP("background picture loaded from %s (dimmed to %d%%)\n", PH_BG, bg_dim);
 }
 
 /* ---- catalog cache ------------------------------------------------------------ */
@@ -884,6 +972,7 @@ void phantom_init(void)
 	ph_ui_init(&ui, 0, PH_CANVAS_W, PH_CANVAS_H);
 
 	load_config();
+	bg_load();
 	snprintf(ui.host_ip, sizeof(ui.host_ip), "%s", cfg_host);
 	ui.host_port = cfg_port;
 	ui.host_state = PH_HOST_SEARCHING;
@@ -910,6 +999,8 @@ void phantom_stop(void)
 	pc_reset(&cat);
 	cat_paged = 0;
 	cat_host[0] = 0;
+	free(bg_buf);
+	bg_buf = 0;
 	inited = 0;
 }
 
@@ -936,6 +1027,7 @@ int phantom_idle_enter(void)
 	ui.fb = shadow;
 	owns_screen = 1;
 	awaiting_video = 0;
+	bg_load();   /* a picture put on the card while a game was running is there when the menu comes back */
 
 	/* Taking the screen from a running stream means whatever the user is doing with the
 	 * pad right now is aimed at a game, not at this menu. A session can end under them

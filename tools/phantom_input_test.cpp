@@ -72,6 +72,8 @@
 /* ---- the six hooks phantom.cpp expects groovy.cpp to provide ------------------------- */
 
 static int g_forwarded = 0; /* pad events the launcher did NOT consume = events the emulator got */
+static uint8_t g_canvas[720 * 480 * 3]; /* the last frame presented, BGR888 */
+static int     g_presents = 0;
 static std::atomic<int> g_closes{0};      /* times the core was told to really close the session */
 static std::atomic<int> g_status_mode{0}; /* what the fake host says to STATUS: 0 nothing (an old
                                            * host), 1 RUNNING, 2 IDLE */
@@ -79,7 +81,11 @@ static std::atomic<int> g_status_mode{0}; /* what the fake host says to STATUS: 
 extern "C" {
 uint32_t groovy_idle_canvas_bytes(void) { return 720u * 480u * 3u; }
 int      groovy_idle_begin(void) { return 1; }
-void     groovy_idle_present(const uint8_t *) {}
+void     groovy_idle_present(const uint8_t *canvas)
+{
+    memcpy(g_canvas, canvas, sizeof(g_canvas)); /* what the launcher just drew, for the picture tests */
+    g_presents++;
+}
 void     groovy_idle_end(void) {}
 int      groovy_ps2_inputs_enabled(void) { return 0; }
 
@@ -776,6 +782,78 @@ int main()
         g_host_paged = 1;
         pump(4000);
         check(phantom_title_count() == 48000, "and found again when it speaks the paged catalog (%d titles)", phantom_title_count());
+    }
+
+    /* ---------------------------------------------------------------------------- */
+    section("9. a picture behind the menu");
+    {
+        auto write_ppm = [](const char *path, int r, int g, int b, int w = 720, int h = 480) {
+            FILE *f = fopen(path, "wb");
+            std::fprintf(f, "P6\n%d %d\n255\n", w, h);
+            for (int i = 0; i < w * h; i++) {
+                fputc(r, f);
+                fputc(g, f);
+                fputc(b, f);
+            }
+            fclose(f);
+        };
+        auto margin = [&](int &b, int &g, int &r) { /* a pixel in the left margin: no panel covers it */
+            const uint8_t *p = &g_canvas[(300 * 720 + 4) * 3];
+            b = p[0]; g = p[1]; r = p[2];
+        };
+        const char *bgpath = TEST_DIR "/bg.ppm";
+        unlink(bgpath);
+
+        phantom_idle_leave();
+        pump(50);
+        phantom_idle_enter();
+        int b, g, r;
+        margin(b, g, r);
+        check(b == 0x12 && g == 0x0C && r == 0x0B, "with no picture the menu is on its flat background (%02X %02X %02X)", b, g, r);
+
+        phantom_idle_leave();
+        write_ppm(bgpath, 200, 100, 40);
+        pump(50);
+        phantom_idle_enter();
+        margin(b, g, r);
+        check(b == 20 && g == 50 && r == 100, "a picture appears behind the menu, dimmed to half (B%d G%d R%d, expected 20 50 100)", b, g, r);
+
+        /* a picture swapped for another is picked up the next time the menu comes back, with nothing restarted */
+        phantom_idle_leave();
+        write_ppm(bgpath, 10, 240, 120);
+        pump(50);
+        phantom_idle_enter();
+        margin(b, g, r);
+        check(b == 60 && g == 120 && r == 5, "a replaced picture is picked up (B%d G%d R%d, expected 60 120 5)", b, g, r);
+
+        /* a file that is not a 720x480 PPM is ignored, and the one already held stays */
+        phantom_idle_leave();
+        write_ppm(bgpath, 1, 2, 3, 100, 100);
+        pump(50);
+        phantom_idle_enter();
+        margin(b, g, r);
+        check(b == 60 && g == 120 && r == 5, "a picture of the wrong size is ignored and the one already held stays (B%d G%d R%d)", b, g, r);
+        check(phantom_owns_screen() == 1, "and the launcher is up (%d)", phantom_owns_screen());
+
+        /* take the picture away: the menu is as it always was */
+        phantom_idle_leave();
+        unlink(bgpath);
+        pump(50);
+        phantom_idle_enter();
+        margin(b, g, r);
+        check(b == 0x12 && g == 0x0C && r == 0x0B, "without the file the menu is flat again (%02X %02X %02X)", b, g, r);
+
+        /* and the menu is still usable with a picture behind it */
+        write_ppm(bgpath, 90, 90, 90);
+        phantom_idle_leave();
+        pump(50);
+        phantom_idle_enter();
+        pump(2200);
+        int l0 = count_rx("LAUNCH:");
+        tap(JOY_BTN1, 30);
+        check(count_rx("LAUNCH:") == l0 + 1, "launching works with a picture behind the menu");
+        tap(JOY_BTN2, 30);
+        unlink(bgpath);
     }
 
     g_stop = true;

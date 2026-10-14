@@ -6,7 +6,7 @@ exit exposed it, FBNeo was built from the fork for the first time, every build t
 deployed and put on GitHub as a release - and then the launcher was reworked for TVs that
 overscan (screen-adjust page, MiSTer-standard button colours and controls) and for libraries of
 hundreds of thousands of games (paged catalog, fast incremental scan). Everything below is
-committed and pushed; the last release is `v2026.10.13.7`.
+committed and pushed; the last release is `v2026.10.14`.
 
 ## State of the repos and releases
 
@@ -15,7 +15,7 @@ All verified against `retrorepair`, not `origin` — in the emulator forks `orig
 
 | Repo | Branch | Head | Release `v2026.10.13` asset |
 |---|---|---|---|
-| Phantom-Arcade-Core | `main` | `838bcc6` | **`v2026.10.13.7`**: `MiSTer_phantom`, `PhantomArcadeManager.exe`, `Phantom_Arcade.rbf`, `SHA256SUMS.txt` (every earlier `v2026.10.13*` is marked superseded) |
+| Phantom-Arcade-Core | `main` | see `git log` | **`v2026.10.14`**: `MiSTer_phantom`, `PhantomArcadeManager.exe`, `Phantom_Arcade.rbf`, `SHA256SUMS.txt` (every earlier `v2026.10.13*` is marked superseded) |
 | retrorepair/dolphin | `groovy-nlc` | `b9d320863` | `Dolphin-GroovyNLC-…-win64.zip` |
 | retrorepair/86Box | `groovy-nlc` | `5593d3c24` | `86Box-GroovyNLC-…-win64.zip` |
 | retrorepair/pcsx2 | `groovy-upstream-sync` | `a445baeb2` | `PCSX2-GroovyNLC-…-win64.zip` |
@@ -37,10 +37,11 @@ from the client's `emulator\fbneo` folder, not the repo. See `memory/fightcade-c
 
 ## Deploy state (verified by md5 against the repo)
 
-- **MiSTer card:** one `/media/fat/MiSTer_phantom` (md5 `9326e12818c0`, = `build_output\` = the
-  `.7` release asset), one `_Utility/Phantom_Arcade.rbf` (the unmodified upstream bitstream); the
+- **MiSTer card:** one `/media/fat/MiSTer_phantom` (md5 `90cf8e4de76a`, = `build_output\` = the
+  `v2026.10.14` release asset), one `_Utility/Phantom_Arcade.rbf` (the unmodified upstream bitstream); the
   only other thing is `MiSTer.ini.prephantom`, a backup of the user's own ini. `phantom.ini` holds
-  the user's saved screen margins (`SAFE_L/T/R/B`) - leave it alone.
+  the user's saved screen margins (`SAFE_L/T/R/B`) - leave it alone. `config/phantom_bg.ppm` is their
+  chosen background picture (see above).
   **Deploying a new `MiSTer_phantom` over a running one reboots the board when the core is reloaded**
   (seen five times). Not a launcher bug: `fpga_load_rbf` ends in `app_restart`, which `execl`s
   `/proc/self/exe`; after `mv` replaces the file that link reads `... (deleted)`, the `execl` fails and
@@ -50,7 +51,7 @@ from the client's `emulator\fbneo` folder, not the repo. See `memory/fightcade-c
   cleared by that reboot. Standing rule from the user: leave the card clean and startable from the menu, not
   dependent on my scripts, and release every build — `memory/deploy-standard-user-reachable.md`.
 - **PC:** `C:\PhantomArcade\PhantomArcadeManager.exe` (md5 `38f28e1107f3`) = `build_output\` = the
-  `.7` release asset. The daemon is running with the user's own `phantom_config.json` (checked
+  `v2026.10.14` release asset. The daemon is running with the user's own `phantom_config.json` (checked
   byte-for-byte after a test that swapped it for a synthetic-library config and back). New files it
   keeps beside the exe: `phantom_index.bin` (the last scan), `fbneo_sets.cache` (FBNeo's supported
   list, keyed by its exe), `mame_rejects.txt` (sets MAME rejected, keyed by a fingerprint of its
@@ -190,22 +191,30 @@ duplicates are the user's to clean up (needs admin). `--no-firewall` skips the c
 
 Not done / ideas: the cabinet shows no per-tab counts in the tab strip; there is no type-to-search; MAME's
 own first-time verification of a huge new set is as slow as `mame -verifyroms`; the user asked, for fun, about a
-dimmed game snapshot behind a translucent menu and downloading title/snap images per game. **The look has a
-working prototype in the renderer, not on the cabinet:** `ph_ui.bg` (a 720x480 BGR888 picture, dimmed with
-`ph_ui_dim`) makes the canvas start as the picture and every panel a translucent layer over it (`rect()` blends
-when `ph_ui.alpha` is set; text, the amber rules, the cursor and the button badges are drawn solid; the screen-adjust
-page ignores the picture). The header/tab strip/detail line/legend are 200/255 opaque (`PH_BG_PANEL_ALPHA`) and the
-game list is 128/255, i.e. **50% see-through, which is what the user asked for** (`PH_BG_LIST_ALPHA`; 60% was tried and
-read fine too). It is exercised by `phantom_ui_test.c` (10 checks) and `tools/phantom_preview.c --bg picture.ppm [--dim N]
-[--panels A] [--list A]`; the mockup the user saw was the user's own SSF2T ranking screen captured from the running emulator
-window (`grab_running.ps1`-style: GetClientRect + CopyFromScreen, resized to 720x480), nothing downloaded. **Not done:**
-`phantom.cpp` does not load a picture yet (the obvious next step is a file such as `/media/fat/config/phantom_bg.ppm`
-read at idle-enter, which would let the user judge it on their TV), nothing is deployed or released for it, and the picture
-for each game would come from the PC on request. Assessment given for the rest: transport is moderate (the PC resizes and
-sends one image after the cursor rests; Imlib2/libpng and miniz are already linked into the cabinet build), and the hard part
-is matching titles to pictures: ProgettoSNAPS packs for MAME/FBNeo (exact by set name), libretro-thumbnails for consoles
-(exact No-Intro/Redump names), ScreenScraper for odd names (the user's own account; I cannot create one), PS3
-`ICON0.PNG`/`PIC1.PNG` beside `PARAM.SFO` for free. Each source needs the user's say-so before anything is downloaded.
+dimmed game snapshot behind a translucent menu and downloading title/snap images per game. **The look is on the cabinet (v2026.10.14).**
+`phantom.cpp` loads `/media/fat/config/phantom_bg.ppm` (a 720x480 P6 PPM) whenever the menu comes up, if it is there and has
+changed (modification time to the nanosecond, so replacing it needs no restart); `ph_ui.bg` is the picture dimmed with
+`ph_ui_dim`, the canvas starts as it, and every panel is a translucent layer over what is already drawn (`rect()` blends when
+`ph_ui.alpha` is set; text, the amber rules, the cursor and the button badges are solid; the screen-adjust page ignores the
+picture). Header/tab strip/detail line/legend are 200/255 opaque (`PH_BG_PANEL_ALPHA`), the game list 128/255 = **50%
+see-through, which is what the user asked for** (`PH_BG_LIST_ALPHA`; they first said 60%, then 50%). `phantom.ini [LAUNCHER]`
+takes `BG_DIM` (default 50), `BG_PANELS`, `BG_LIST`, and `phantom_save_config()` writes them back so a save does not drop them.
+**What is on the user's card now:** their own Super Street Fighter II Turbo ranking screen, captured from the running emulator
+window on this PC (GetClientRect + CopyFromScreen, 720x480), at `/media/fat/config/phantom_bg.ppm` - persistent across
+reboots, which is what they asked for ("just make it persistent for now"). The picture is not in the repo (it is a game frame).
+`tools/make_bg.ps1` makes the file from any image. **Cost on the HPS, measured with `tools/phantom_render_bench.c` built for
+the A9 and run on the board:** 7.0 ms a frame flat, 11.3 ms over a picture, against a 16.7 ms field; it only runs on redraw and
+no stream is running while the menu is up. Tests: 10 renderer checks (`test_background`) and harness section 9 (the real
+launcher reading a picture from disk: appears dimmed, a replaced one is picked up, a wrong-size file is ignored and the held
+one stays, removing it restores the flat menu, launching still works); the harness stub now keeps the last presented frame.
+**Waiting on the user's go-ahead (do not start without it): fetching titles/screens per game.** Their instruction: if they say go,
+prepare what is needed for fetching; if stuck, look at **where the misterzine frontend gets its images from** - it is installed
+on the MiSTer (`/media/fat/misterzine`, `/media/fat/misterzine-plex`, `menu_launcher.py`, `manager.py`), so its sources and
+matching rules can be read from there. My assessment, given to the user: the PC resizes and sends one image after the cursor
+rests (Imlib2/libpng and miniz are already linked into the cabinet build; or send deflated raw pixels), and the hard part is
+matching titles to pictures: ProgettoSNAPS packs for MAME/FBNeo (exact by set name), libretro-thumbnails for consoles (exact
+No-Intro/Redump names), ScreenScraper for odd names (the user's own account; I cannot create one), PS3 `ICON0.PNG`/`PIC1.PNG`
+beside `PARAM.SFO` for free. Each source needs the user's say-so before anything is downloaded.
 
 ## Open
 
