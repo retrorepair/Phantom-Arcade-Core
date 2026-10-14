@@ -6,7 +6,7 @@ exit exposed it, FBNeo was built from the fork for the first time, every build t
 deployed and put on GitHub as a release - and then the launcher was reworked for TVs that
 overscan (screen-adjust page, MiSTer-standard button colours and controls) and for libraries of
 hundreds of thousands of games (paged catalog, fast incremental scan). Everything below is
-committed and pushed; the last release is `v2026.10.14.1`.
+committed and pushed; the last release is `v2026.10.14.2` (pictures behind the menu and the Select settings menu).
 
 ## State of the repos and releases
 
@@ -15,7 +15,7 @@ All verified against `retrorepair`, not `origin` — in the emulator forks `orig
 
 | Repo | Branch | Head | Release `v2026.10.13` asset |
 |---|---|---|---|
-| Phantom-Arcade-Core | `main` | see `git log` | **`v2026.10.14.1`**: `MiSTer_phantom`, `PhantomArcadeManager.exe`, `Phantom_Arcade.rbf`, `SHA256SUMS.txt` (every earlier `v2026.10.13*` is marked superseded) |
+| Phantom-Arcade-Core | `main` | see `git log` | **`v2026.10.14.2`**: `MiSTer_phantom`, `PhantomArcadeManager.exe`, `Phantom_Arcade.rbf`, `SHA256SUMS.txt` (every earlier release is marked superseded) |
 | retrorepair/dolphin | `groovy-nlc` | `b9d320863` | `Dolphin-GroovyNLC-…-win64.zip` |
 | retrorepair/86Box | `groovy-nlc` | `5593d3c24` | `86Box-GroovyNLC-…-win64.zip` |
 | retrorepair/pcsx2 | `groovy-upstream-sync` | `a445baeb2` | `PCSX2-GroovyNLC-…-win64.zip` |
@@ -37,8 +37,8 @@ from the client's `emulator\fbneo` folder, not the repo. See `memory/fightcade-c
 
 ## Deploy state (verified by md5 against the repo)
 
-- **MiSTer card:** one `/media/fat/MiSTer_phantom` (md5 `e0fb484c8dda`, = `build_output\` = the
-  `v2026.10.14.1` release asset), one `_Utility/Phantom_Arcade.rbf` (the unmodified upstream bitstream); the
+- **MiSTer card:** one `/media/fat/MiSTer_phantom` (md5 `19235d082634`, = `build_output\` = the
+  `v2026.10.14.2` release asset), one `_Utility/Phantom_Arcade.rbf` (the unmodified upstream bitstream); the
   only other thing is `MiSTer.ini.prephantom`, a backup of the user's own ini. `phantom.ini` holds
   the user's saved screen margins (`SAFE_L/T/R/B`) - leave it alone. `config/phantom_bg.ppm` is their
   chosen background picture (see above).
@@ -50,12 +50,13 @@ from the client's `emulator\fbneo` folder, not the repo. See `memory/fightcade-c
   harmless). An earlier note here saying "no reboot is needed" was wrong. `/tmp` on the board is
   cleared by that reboot. Standing rule from the user: leave the card clean and startable from the menu, not
   dependent on my scripts, and release every build — `memory/deploy-standard-user-reachable.md`.
-- **PC:** `C:\PhantomArcade\PhantomArcadeManager.exe` (md5 `38f28e1107f3`) = `build_output\` = the
-  `v2026.10.14.1` release asset. The daemon is running with the user's own `phantom_config.json` (checked
+- **PC:** `C:\PhantomArcade\PhantomArcadeManager.exe` (md5 `ba3836aefefc`) = `build_output\` = the
+  `v2026.10.14.2` release asset. The daemon is running with the user's own `phantom_config.json` (checked
   byte-for-byte after a test that swapped it for a synthetic-library config and back). New files it
   keeps beside the exe: `phantom_index.bin` (the last scan), `fbneo_sets.cache` (FBNeo's supported
   list, keyed by its exe), `mame_rejects.txt` (sets MAME rejected, keyed by a fingerprint of its
-  folder). `games_catalog.json` / `games_catalog_cabinet.json` there are stale leftovers; nothing
+  folder), and `art\` (the picture cache: `lists\`, `pic\<title|snap>\<system>\<id>.png`, `settings.txt`; seeded with
+  the whole live library's pictures, 64 MB). `games_catalog.json` / `games_catalog_cabinet.json` there are stale leftovers; nothing
   reads them any more.
 - **FBNeo:** `C:\Emulators\fbneo\fcadefbneo.exe` is the new build, with Fightcade's DLLs copied in
   (from the official package, never run) and `config\fcadefbneo.ini` seeded with
